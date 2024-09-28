@@ -1,1 +1,11 @@
-# Add content here
+# config/exchange_config.yaml
+
+exchange:
+  name: "binance"
+  api_key: "${env:BINANCE_API_KEY}"
+  api_secret: "${env:BINANCE_API_SECRET}"
+  trading_pairs:
+    - "BTC/USDT"
+    - "ETH/USDT"
+  timeframe: "1m"  # Timeframe for candlestick data (e.g., 1m, 5m, 1h)
+  rate_limit: 1200  # API rate limit as per exchange specifications

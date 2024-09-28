@@ -1,1 +1,11 @@
-# Add content here
+# config/base_config.yaml
+
+base:
+  log_level: "INFO"
+  seed: 42
+  data_path: "./data/processed/"
+  model_save_path: "./models/checkpoints/"
+  feature_save_path: "./data/features/"
+  experiment_tracking:
+    enabled: true
+    tool: "wandb"  # Options: wandb, mlflow, etc.

@@ -1,1 +1,33 @@
-# Add content here
+# config/features.yaml
+
+features:
+  indicators:
+    SMA:
+      enabled: true
+      timeperiod: 20
+    EMA:
+      enabled: true
+      timeperiod: 20
+    RSI:
+      enabled: true
+      timeperiod: 14
+    MACD:
+      enabled: true
+      fastperiod: 12
+      slowperiod: 26
+      signalperiod: 9
+    ATR:
+      enabled: true
+      timeperiod: 14
+  custom_features:
+    pct_change:
+      enabled: true
+      window: 1
+    volatility:
+      enabled: true
+      window: 20
+  feature_selection:
+    enabled: true
+    method: "SelectFromModel"  # Options: SelectFromModel, RFE, etc.
+    threshold: 0.01
+    max_features: 10

@@ -1,1 +1,15 @@
-# Add content here
+# config/model_config.yaml
+
+model:
+  type: "LSTM"  # Options: LSTM, Transformer, etc.
+  input_size: 10  # Number of input features
+  hidden_size: 64
+  num_layers: 2
+  output_size: 3  # Actions: Hold, Buy, Sell
+  learning_rate: 0.001
+  optimizer: "Adam"  # Options: Adam, SGD, etc.
+  loss_function: "MSE"  # Options: MSE, CrossEntropy, etc.
+  batch_size: 32
+  epochs: 50
+  dropout: 0.2
+  device: "cuda"  # Options: cuda, cpu

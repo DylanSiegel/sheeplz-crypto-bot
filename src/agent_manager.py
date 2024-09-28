@@ -5,6 +5,7 @@ import ray
 from environments.crypto_trading_env import CryptoTradingEnv
 from models.model import TradingModel
 from src.rewards import RewardFunction
+import torch
 
 @ray.remote
 class TradingAgent:
@@ -26,26 +27,23 @@ class TradingAgent:
 
             while not done:
                 # Get action from model
-                action = self.model(torch.from_numpy(state).float().unsqueeze(0)).argmax().item()
+                state_tensor = torch.from_numpy(state).float().unsqueeze(0)
+                with torch.no_grad():
+                    output = self.model(state_tensor)
+                    action = torch.argmax(output, dim=1).item()
 
                 # Take action in environment
                 next_state, reward, done, _ = self.env.step(action)
 
-                # Update model (simplified, you might want to use a proper RL algorithm here)
-                # This is a placeholder for the actual training logic
-                loss = torch.nn.functional.mse_loss(
-                    self.model(torch.from_numpy(state).float().unsqueeze(0)).squeeze(),
-                    torch.tensor([reward]).float()
-                )
-                loss.backward()
-                # Perform optimization step (omitted for brevity)
+                # Accumulate reward
+                episode_reward += reward
 
                 state = next_state
-                episode_reward += reward
 
             total_reward += episode_reward
 
-        return total_reward / num_episodes
+        average_reward = total_reward / num_episodes
+        return average_reward
 
 class AgentManager:
     """
@@ -62,6 +60,8 @@ class AgentManager:
 
 # Example usage
 # ray.init()
-# agents = [TradingAgent.remote(env, model, reward_function) for _ in range(4)]  # Create 4 agents
-# agent_manager = AgentManager(agents)
+# env = CryptoTradingEnv(data_provider, reward_function)
+# model = TradingModel(...)
+# agent = TradingAgent.remote(env, model, reward_function)
+# agent_manager = AgentManager([agent])
 # results = agent_manager.train_agents(num_episodes=100)
