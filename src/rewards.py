@@ -1,21 +1,11 @@
-# File: src/rewards.py
-
-from abc import ABC, abstractmethod
 import numpy as np
+from typing import List
 
-class RewardFunction(ABC):
-    """Abstract base class for reward functions."""
-
-    @abstractmethod
+class RewardFunction:
     def calculate_reward(self, action: int, current_price: float, next_price: float, portfolio_value: float) -> float:
-        """
-        Calculates the reward for a given action and market state.
-        """
         pass
 
 class ProfitReward(RewardFunction):
-    """Reward function based on realized profit."""
-
     def calculate_reward(self, action: int, current_price: float, next_price: float, portfolio_value: float) -> float:
         if action == 1:  # Buy
             return (next_price - current_price) / current_price
@@ -25,25 +15,32 @@ class ProfitReward(RewardFunction):
             return 0
 
 class SharpeRatioReward(RewardFunction):
-    """Reward function based on Sharpe ratio."""
-
-    def __init__(self, risk_free_rate: float = 0.0):
+    def __init__(self, risk_free_rate: float = 0.0, window_size: int = 20):
         self.risk_free_rate = risk_free_rate
+        self.window_size = window_size
         self.returns = []
 
     def calculate_reward(self, action: int, current_price: float, next_price: float, portfolio_value: float) -> float:
-        # Calculate portfolio return
-        return_ = (portfolio_value - self.prev_portfolio_value) / self.prev_portfolio_value if hasattr(self, 'prev_portfolio_value') else 0
+        return_ = (next_price - current_price) / current_price
         self.returns.append(return_)
-        self.prev_portfolio_value = portfolio_value
 
-        # Calculate Sharpe ratio (if enough data is available)
-        if len(self.returns) > 2:
-            sharpe_ratio = (np.mean(self.returns) - self.risk_free_rate) / np.std(self.returns)
-            return sharpe_ratio
-        else:
+        if len(self.returns) < self.window_size:
             return 0
 
-# Example usage
-# reward_function = ProfitReward()
-# reward = reward_function.calculate_reward(action=1, current_price=100, next_price=110, portfolio_value=1000)
+        returns_array = np.array(self.returns[-self.window_size:])
+        excess_returns = returns_array - self.risk_free_rate
+        sharpe_ratio = np.sqrt(252) * np.mean(excess_returns) / np.std(excess_returns)
+
+        return sharpe_ratio
+
+class CombinedReward(RewardFunction):
+    def __init__(self, profit_weight: float = 0.5, sharpe_weight: float = 0.5):
+        self.profit_reward = ProfitReward()
+        self.sharpe_reward = SharpeRatioReward()
+        self.profit_weight = profit_weight
+        self.sharpe_weight = sharpe_weight
+
+    def calculate_reward(self, action: int, current_price: float, next_price: float, portfolio_value: float) -> float:
+        profit = self.profit_reward.calculate_reward(action, current_price, next_price, portfolio_value)
+        sharpe = self.sharpe_reward.calculate_reward(action, current_price, next_price, portfolio_value)
+        return self.profit_weight * profit + self.sharpe_weight * sharpe
