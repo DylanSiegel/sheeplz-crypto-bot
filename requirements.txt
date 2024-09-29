@@ -1,7 +1,43 @@
-matplotlib==3.5.2
+# Deep Learning and Reinforcement Learning
+torch==1.9.0
+tensorflow==2.6.0
+gym==0.21.0
+
+# Data Processing and Analysis
+pandas==1.3.3
+numpy==1.21.2
+scipy==1.7.1
+
+# Financial Data and Technical Indicators
+yfinance==0.1.63
+TA-Lib==0.4.21
+
+# Time Series Processing
+statsmodels==0.12.2
+
+# Machine Learning
+scikit-learn==0.24.2
+
+# Visualization
+matplotlib==3.4.3
 seaborn==0.11.2
-pandas==1.4.3
-numpy==1.23.1
-torch==1.12.0
-scikit-learn==1.1.1
-# Add any other packages your project needs
+
+# Natural Language Processing
+nltk==3.6.3
+transformers==4.11.3
+
+# API Interactions
+ccxt==1.60.9
+
+# Hyperparameter Optimization
+optuna==2.10.0
+
+# Experiment Tracking
+mlflow==1.20.2
+
+# Configuration Management
+hydra-core==1.1.1
+
+# Additional Useful Libraries
+tqdm==4.62.3
+joblib==1.0.1
