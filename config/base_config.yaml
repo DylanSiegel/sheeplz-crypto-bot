@@ -1,11 +1,46 @@
 # config/base_config.yaml
+defaults:
+  - _self_
+  - exchange: exchange_config.yaml
+  - features: features.yaml
+  - model: model_config.yaml
+  - trading: trading_config.yaml
+  - override hydra/job_logging: joblib_logging
+  - override hydra/hydra_logging: hydra_debug
 
+# Base configurations (can be overridden by other config files or CLI)
 base:
-  log_level: "INFO"
+  log_level: INFO  # Default log level
   seed: 42
-  data_path: "./data/processed/"
-  model_save_path: "./models/checkpoints/"
-  feature_save_path: "./data/features/"
+  data_path: ./data/processed/
+  model_save_path: ./models/checkpoints/
+  feature_save_path: ./data/features/
   experiment_tracking:
     enabled: true
-    tool: "wandb"  # Options: wandb, mlflow, etc.
+    tool: wandb # Options: wandb, mlflow, etc.
+  mode: train # Default mode
+
+# Hydra configurations
+hydra:
+  run:
+    dir: ./outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}  # Organize outputs by date and time
+  job_logging:
+    version: 1
+    formatters:
+      simple:
+        format: "%(message)s"
+    handlers:
+      console:
+        class: logging.StreamHandler
+        formatter: simple
+        stream: ext://sys.stdout
+  hydra_logging:
+    version: 1
+    formatters:
+      simple:
+        format: "HYDRA: %(message)s"
+    handlers:
+      console:
+        class: logging.StreamHandler
+        formatter: simple
+        stream: ext://sys.stdout
