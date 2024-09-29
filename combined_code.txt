@@ -30,14 +30,15 @@ paths:
 // File: config\exchange_config.yaml
 # config/exchange_config.yaml
 exchange:
-  name: binance
-  api_key: "${env:BINANCE_API_KEY}" # Load from environment variable
-  api_secret: "${env:BINANCE_API_SECRET}" # Load from environment variable
+  name: mexc
+  api_key: ${env:MEXC_API_KEY}
+  api_secret: ${env:MEXC_API_SECRET}
   trading_pairs:
     - BTC/USDT
     - ETH/USDT
   timeframe: 1m # Default timeframe
   rate_limit: 1200
+
 
 // File: config\features_config.yaml
 # config/features.yaml
@@ -95,10 +96,6 @@ model:
   dropout: 0.2
   device: "cuda"  # Options: cuda, cpu
 
-
-// File: config\secrets.env
-BINANCE_API_KEY=YOUR_ACTUAL_API_KEY
-BINANCE_API_SECRET=YOUR_ACTUAL_API_SECRET
 
 // File: config\trading_config.yaml
 # config/trading_config.yaml
@@ -2136,396 +2133,42 @@ class Visualization:
 // File: src\visualization\__init__.py
 
 
-// File: tests\test_agent_manager.py
-# File: tests/test_agent_manager.py
-
-import unittest
-from unittest.mock import MagicMock
-from src.agent_manager import TradingAgent, AgentManager
-from environments.crypto_trading_env import CryptoTradingEnv
-from models.model import TradingModel
-from src.rewards.rewards import ProfitReward
-
-class TestAgentManager(unittest.TestCase):
-
-    def setUp(self):
-        # Mock environment, model, and reward function
-        self.mock_env = MagicMock(spec=CryptoTradingEnv)
-        self.mock_model = MagicMock(spec=TradingModel)
-        self.mock_reward_function = MagicMock(spec=ProfitReward)
-
-        # Create a TradingAgent instance
-        self.agent = TradingAgent(self.mock_env, self.mock_model, self.mock_reward_function)
-
-        # Initialize AgentManager with a list of agents
-        self.agent_manager = AgentManager([self.agent])
-
-    def test_train_agents(self):
-        # Setup mock behavior
-        self.mock_env.reset.return_value = [1,2,3]
-        self.mock_env.step.return_value = ([4,5,6], 1.0, True, {})
-        self.mock_model.return_value = MagicMock(argmax=MagicMock(return_value=1))
-
-        # Execute training
-        results = self.agent_manager.train_agents(num_episodes=1)
-
-        # Assertions
-        self.assertEqual(len(results), 1)
-        self.assertEqual(results[0], 1.0)  # Assuming total_reward per episode is 1.0
-
-if __name__ == '__main__':
-    unittest.main()
-
-
 // File: tests\test_data_acquisition.py
-# File: tests/test_data_acquisition.py
-
 import unittest
-from unittest.mock import patch
-from src.data.data_acquisition import BinanceDataProvider
 import pandas as pd
+from src.data.data_acquisition import BinanceDataProvider 
 
 class TestBinanceDataProvider(unittest.TestCase):
 
-    @patch('ccxt.binance')
-    def test_get_data(self, mock_binance):
-        # Setup mock response
-        mock_exchange = mock_binance.return_value
-        mock_exchange.fetch_ohlcv.return_value = [
-            [1609459200000, 29000, 29500, 28800, 29400, 350],
-            [1609462800000, 29400, 29600, 29300, 29500, 200]
-        ]
-
-        provider = BinanceDataProvider(api_key="test_key", api_secret="test_secret")
-        df = provider.get_data(symbol="BTC/USDT", timeframe="1h", start_date="2021-01-01", end_date="2021-01-02")
-
-        # Assertions
-        self.assertEqual(len(df), 2)
-        self.assertListEqual(list(df.columns), ['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        self.assertEqual(df.iloc[0]['close'], 29400)
-        self.assertEqual(df.iloc[1]['volume'], 200)
-
-if __name__ == '__main__':
-    unittest.main()
-
-
-// File: tests\test_environment.py
-# File: tests/test_environment.py
-
-import unittest
-from unittest.mock import MagicMock
-from environments.crypto_trading_env import CryptoTradingEnv
-from src.data.data_acquisition import DataProvider
-from src.rewards.rewards import RewardFunction
-import numpy as np
-
-class TestCryptoTradingEnv(unittest.TestCase):
-
     def setUp(self):
-        # Mock DataProvider and RewardFunction
-        self.mock_data_provider = MagicMock(spec=DataProvider)
-        self.mock_reward_function = MagicMock(spec=RewardFunction)
-        self.mock_data_provider.get_data.return_value = MagicMock(
-            iloc=MagicMock(side_effect=[
-                pd.Series({'close': 100, 'SMA_20': 95, 'RSI': 30, 'MACD': 1, 'ATR': 0.5, 'pct_change': 0.01, 'volatility': 0.02}),
-                pd.Series({'close': 105, 'SMA_20': 96, 'RSI': 32, 'MACD': 1.2, 'ATR': 0.55, 'pct_change': 0.02, 'volatility': 0.025}),
-            ]),
-            __len__=MagicMock(return_value=2)
-        )
-        self.env = CryptoTradingEnv(
-            data_provider=self.mock_data_provider,
-            reward_function=self.mock_reward_function,
-            initial_balance=1000
-        )
+        """Set up for test methods."""
+        self.api_key = 'YOUR_API_KEY'  
+        self.api_secret = 'YOUR_API_SECRET' 
+        self.data_provider = BinanceDataProvider(self.api_key, self.api_secret)
 
-    def test_reset(self):
-        state = self.env.reset()
-        self.assertIsInstance(state, np.ndarray)
-        self.assertEqual(state.shape[0], 10)
+    def test_get_data(self):
+        """Test fetching data from Binance."""
+        symbol = 'BTC/USDT'
+        timeframe = '1h'
+        start_date = '2024-01-01'
+        end_date = '2024-01-10'  # Fetch a small amount of data for testing
 
-    def test_step_buy(self):
-        self.mock_reward_function.calculate_reward.return_value = 0.05
-        self.env.reset()
-        observation, reward, done, info = self.env.step(1)  # Buy
-        self.assertEqual(observation.shape[0], 10)
-        self.assertEqual(reward, 0.05)
-        self.assertFalse(done)
+        df = self.data_provider.get_data(symbol, timeframe, start_date, end_date)
 
-    def test_step_sell(self):
-        self.mock_reward_function.calculate_reward.return_value = -0.03
-        self.env.reset()
-        self.env.step(1)  # Buy
-        observation, reward, done, info = self.env.step(2)  # Sell
-        self.assertEqual(reward, -0.03)
-        self.assertTrue(done)
+        # Assertions to validate the data
+        self.assertIsInstance(df, pd.DataFrame)
+        self.assertFalse(df.empty)
+        self.assertGreater(len(df), 0)
+        self.assertIn('timestamp', df.columns)
+        self.assertIn('open', df.columns)
+        self.assertIn('high', df.columns)
+        self.assertIn('low', df.columns)
+        self.assertIn('close', df.columns)
+        self.assertIn('volume', df.columns)
+
+    # Add more test methods for other functionalities
+    # in BinanceDataProvider (e.g., get_account_balance, place_order).
 
 if __name__ == '__main__':
     unittest.main()
-
-
-// File: tests\test_feature_engineering.py
-# File: tests/test_feature_engineering.py
-
-import unittest
-import pandas as pd
-from src.feature_engineering import FeatureEngineer
-
-class TestFeatureEngineer(unittest.TestCase):
-
-    def setUp(self):
-        # Sample data
-        data = {
-            'timestamp': pd.date_range(start='2021-01-01', periods=5, freq='H'),
-            'open': [100, 102, 101, 103, 104],
-            'high': [105, 106, 103, 107, 108],
-            'low': [99, 101, 100, 102, 103],
-            'close': [104, 105, 102, 106, 107],
-            'volume': [1000, 1500, 1200, 1300, 1400]
-        }
-        self.df = pd.DataFrame(data)
-
-    def test_add_technical_indicators(self):
-        feature_engineer = FeatureEngineer()
-        df = feature_engineer.add_technical_indicators(self.df)
-        self.assertIn('SMA_20', df.columns)
-        self.assertIn('RSI', df.columns)
-        self.assertIn('MACD', df.columns)
-        self.assertIn('ATR', df.columns)
-        self.assertTrue(df['SMA_20'].isnull().all())
-
-    def test_add_custom_features(self):
-        feature_engineer = FeatureEngineer()
-        df = feature_engineer.add_custom_features(self.df)
-        self.assertIn('pct_change', df.columns)
-        self.assertIn('volatility', df.columns)
-        self.assertEqual(df['pct_change'].iloc[1], 0.02)
-        self.assertEqual(df['volatility'].iloc[2], 0.02)
-
-if __name__ == '__main__':
-    unittest.main()
-
-
-// File: tests\test_feature_selection.py
-# File: tests/test_feature_selection.py
-
-import unittest
-import pandas as pd
-from src.feature_selection import FeatureSelector
-
-class TestFeatureSelector(unittest.TestCase):
-
-    def setUp(self):
-        # Sample data
-        self.X = pd.DataFrame({
-            'SMA_20': [95, 96, 97, 98, 99],
-            'EMA': [90, 91, 92, 93, 94],
-            'RSI': [30, 32, 31, 33, 34],
-            'MACD': [1, 1.2, 1.1, 1.3, 1.4],
-            'ATR': [0.5, 0.55, 0.6, 0.65, 0.7],
-            'pct_change': [0.01, 0.02, -0.01, 0.03, 0.04],
-            'volatility': [0.02, 0.025, 0.03, 0.035, 0.04]
-        })
-        self.y = pd.Series([0, 1, 0, 1, 0])
-
-    def test_selectfrommodel(self):
-        selector = FeatureSelector(method="SelectFromModel", threshold=0.1)
-        X_selected = selector.fit_transform(self.X, self.y)
-        self.assertTrue(len(X_selected.columns) <= 10)
-
-    def test_rfe(self):
-        selector = FeatureSelector(method="RFE", max_features=3)
-        X_selected = selector.fit_transform(self.X, self.y)
-        self.assertEqual(len(X_selected.columns), 3)
-
-    def test_invalid_method(self):
-        selector = FeatureSelector(method="InvalidMethod")
-        with self.assertRaises(ValueError):
-            selector.fit_transform(self.X, self.y)
-
-if __name__ == '__main__':
-    unittest.main()
-
-
-// File: tests\test_model.py
-# File: tests/test_model.py
-
-import unittest
-import torch
-from models.model import TradingModel
-
-class TestTradingModel(unittest.TestCase):
-
-    def setUp(self):
-        self.model = TradingModel(input_size=7, hidden_size=64, num_layers=2, output_size=3, dropout=0.2)
-
-    def test_forward(self):
-        # Create a dummy input tensor
-        input_tensor = torch.randn(1, 7)
-        output = self.model(input_tensor)
-        self.assertEqual(output.shape, (1, 3))
-
-    def test_parameters(self):
-        # Check if model parameters are correctly initialized
-        self.assertEqual(self.model.hidden_size, 64)
-        self.assertEqual(self.model.num_layers, 2)
-        self.assertEqual(self.model.output_size, 3)
-
-if __name__ == '__main__':
-    unittest.main()
-
-
-// File: tests\test_trading.py
-# File: tests/test_trading.py
-
-import unittest
-import pandas as pd
-from src.trading import TradingExecutor
-from src.rewards.rewards import ProfitReward
-
-class TestTradingExecutor(unittest.TestCase):
-
-    def setUp(self):
-        # Sample data
-        data = {
-            'close': [100, 105, 102, 106, 107],
-            'SMA_20': [95, 96, 97, 98, 99],
-            'EMA': [90, 91, 92, 93, 94],
-            'RSI': [30, 32, 31, 33, 34],
-            'MACD': [1, 1.2, 1.1, 1.3, 1.4],
-            'ATR': [0.5, 0.55, 0.6, 0.65, 0.7],
-            'pct_change': [0.01, 0.02, -0.01, 0.03, 0.04],
-            'volatility': [0.02, 0.025, 0.03, 0.035, 0.04]
-        }
-        self.df = pd.DataFrame(data)
-        self.features = self.df[['SMA_20', 'EMA', 'RSI', 'MACD', 'ATR', 'pct_change', 'volatility']]
-        self.target = pd.Series([0, 1, 0, 1, 0])
-        self.reward_function = ProfitReward()
-        self.executor = TradingExecutor(initial_balance=1000, transaction_fee=0.001, slippage=0.0005)
-
-    def test_execute_backtest(self):
-        trade_history = self.executor.execute_backtest(self.df, self.features, self.target, self.reward_function)
-        self.assertEqual(len(trade_history), len(self.features) - 1)
-        self.assertIn('action', trade_history.columns)
-        self.assertIn('balance', trade_history.columns)
-        self.assertIn('position', trade_history.columns)
-        self.assertIn('portfolio_value', trade_history.columns)
-        self.assertIn('reward', trade_history.columns)
-
-    def test_execute_live_trading(self):
-        # Mock model's eval and prediction
-        class MockModel:
-            def eval(self):
-                pass
-            def __call__(self, x):
-                # Always predict 'Hold'
-                return torch.tensor([[0.0, 0.0, 1.0]])
-
-        mock_model = MockModel()
-        trade_history = self.executor.execute_live_trading(self.df, self.features, mock_model, self.reward_function)
-        self.assertEqual(len(trade_history), len(self.features) - 1)
-        self.assertTrue(all(trade_history['action'] == 'Hold'))
-
-if __name__ == '__main__':
-    unittest.main()
-
-
-// File: tests\test_trainer.py
-# File: tests/test_trainer.py
-
-import unittest
-from unittest.mock import MagicMock
-import pandas as pd
-from models.trainer import train_model
-from models.model import TradingModel
-from src.feature_selection import FeatureSelector
-
-class TestTrainer(unittest.TestCase):
-
-    def setUp(self):
-        # Sample data
-        self.train_df = pd.DataFrame({
-            'SMA_20': [95, 96, 97, 98, 99],
-            'EMA': [90, 91, 92, 93, 94],
-            'RSI': [30, 32, 31, 33, 34],
-            'MACD': [1, 1.2, 1.1, 1.3, 1.4],
-            'ATR': [0.5, 0.55, 0.6, 0.65, 0.7],
-            'pct_change': [0.01, 0.02, -0.01, 0.03, 0.04],
-            'volatility': [0.02, 0.025, 0.03, 0.035, 0.04]
-        })
-        self.target_df = pd.Series([0, 1, 0, 1, 0])
-
-    def test_train_model(self):
-        # Mock config
-        config = {
-            'feature_selection': {
-                'threshold': 0.01,
-                'max_features': 10
-            },
-            'model': {
-                'batch_size': 2,
-                'hidden_size': 64,
-                'output_size': 3,
-                'learning_rate': 0.001,
-                'epochs': 1,
-                'model_save_path': './models/checkpoints/'
-            }
-        }
-
-        # Mock FeatureSelector
-        selector = FeatureSelector(threshold=0.01, max_features=10)
-        selector.fit_transform = MagicMock(return_value=self.train_df)
-        selector.get_selected_features = MagicMock(return_value=self.train_df.columns.tolist())
-
-        with unittest.mock.patch('models.trainer.FeatureSelector', return_value=selector):
-            # Mock TradingDataset and DataLoader
-            with unittest.mock.patch('models.trainer.TradingDataset') as mock_dataset:
-                mock_dataset.return_value = MagicMock()
-                with unittest.mock.patch('torch.save') as mock_save:
-                    # Mock model
-                    with unittest.mock.patch('models.trainer.TradingModel', return_value=MagicMock()):
-                        # Run training
-                        train_model(config, self.train_df, self.target_df)
-                        mock_save.assert_called()
-
-if __name__ == '__main__':
-    unittest.main()
-
-
-// File: tests\test_utils.py
-# File: tests/test_utils.py
-
-import unittest
-import logging
-from utils.utils import setup_logging, get_logger
-import os
-
-class TestUtils(unittest.TestCase):
-
-    def test_setup_logging_console(self):
-        setup_logging(log_level="DEBUG")
-        logger = get_logger()
-        self.assertEqual(logger.level, logging.DEBUG)
-
-    def test_setup_logging_file(self):
-        log_file = 'logs/test.log'
-        if os.path.exists(log_file):
-            os.remove(log_file)
-        setup_logging(log_level="INFO", log_file=log_file)
-        logger = get_logger()
-        logger.info("Test log message.")
-        self.assertTrue(os.path.exists(log_file))
-        with open(log_file, 'r') as f:
-            content = f.read()
-            self.assertIn("Test log message.", content)
-        os.remove(log_file)
-
-if __name__ == '__main__':
-    unittest.main()
-
-
-// File: tests\__init__.py
-# File: tests/__init__.py
-
-# This file can be left empty or include package-level imports if necessary.
-
 

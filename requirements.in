@@ -1,0 +1,16 @@
+ccxt
+gym
+hydra-core
+matplotlib
+numpy
+omegaconf
+optuna
+pandas
+plotly
+pytorch-lightning
+ray
+scikit-learn
+seaborn
+streamlit
+ta
+torch

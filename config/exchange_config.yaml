@@ -1,8 +1,8 @@
 # config/exchange_config.yaml
 exchange:
-  name: binance
-  api_key: "${env:BINANCE_API_KEY}" # Load from environment variable
-  api_secret: "${env:BINANCE_API_SECRET}" # Load from environment variable
+  name: mexc
+  api_key: ${env:MEXC_API_KEY}
+  api_secret: ${env:MEXC_API_SECRET}
   trading_pairs:
     - BTC/USDT
     - ETH/USDT
