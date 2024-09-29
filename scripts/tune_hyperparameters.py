@@ -1,7 +1,7 @@
 # scripts/tune_hyperparameters.py
 
 import argparse
-import optuna
+import optuna  # Make sure Optuna is installed: pip install optuna
 from models.trainer import train_model
 from src.data_acquisition import BinanceDataProvider
 from src.feature_engineering import FeatureEngineer
@@ -11,6 +11,14 @@ from src.rewards import ProfitReward, SharpeRatioReward
 from models.evaluator import Evaluator
 from src.utils import setup_logging, get_logger
 import pandas as pd
+
+# *** Add these imports ***
+from models.model import TradingModel
+from models.trainer import TradingLitModel
+import torch
+from torch.utils.data import DataLoader
+import pytorch_lightning as pl
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Hyperparameter Tuning with Optuna")

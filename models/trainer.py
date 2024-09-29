@@ -3,8 +3,9 @@
 import pytorch_lightning as pl
 import torch
 from torch.utils.data import DataLoader, Dataset
+import pandas as pd  # Import pandas here
 from src.data_loader import TradingDataset
-from .model import TradingModel  # Ensure this import is correct
+from .model import TradingModel
 from src.utils import get_logger
 from src.feature_selection import FeatureSelector
 

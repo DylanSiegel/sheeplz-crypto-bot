@@ -14,3 +14,6 @@ This repository contains an AI-powered cryptocurrency trading bot built using de
 * **Experiment Tracking (with MLflow or WandB):** Log experiments, track metrics, and compare configurations.
 * **Hydra Configuration Management:** Uses Hydra for flexible and organized configuration management.
 * **PyTorch for Model Training:** Leverages PyTorch for building and training DRL models.
+
+Disclaimer
+This project is for educational and research purposes only. Trading cryptocurrencies involves significant risk. Do not use for live trading without a thorough understanding of the risks involved. The developers are not responsible for any financial losses.
