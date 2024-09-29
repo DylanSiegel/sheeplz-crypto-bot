@@ -5,6 +5,9 @@ import seaborn as sns
 import pandas as pd
 import numpy as np
 from typing import List
+from utils.utils import get_logger
+
+logger = get_logger()
 
 class Evaluator:
     """

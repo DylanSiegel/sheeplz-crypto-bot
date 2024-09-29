@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 from src.agent_manager import TradingAgent, AgentManager
 from environments.crypto_trading_env import CryptoTradingEnv
 from models.model import TradingModel
-from src.rewards import ProfitReward
+from src.rewards.rewards import ProfitReward
 
 class TestAgentManager(unittest.TestCase):
 

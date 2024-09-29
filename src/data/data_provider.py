@@ -1,4 +1,4 @@
-# File: src/data_acquisition.py
+# File: src/data/data_provider.py
 
 from abc import ABC, abstractmethod
 import ccxt

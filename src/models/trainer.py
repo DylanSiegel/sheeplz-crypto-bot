@@ -4,10 +4,10 @@ import pytorch_lightning as pl
 import torch
 from torch.utils.data import DataLoader
 import pandas as pd
-from src.data.data_loader import TradingDataset  # Corrected import
-from src.models.lstm_model import TradingModel  # Assuming TradingModel is in lstm_model.py
-from src.utils.utils import get_logger           # Corrected import
-from src.features.feature_selector import FeatureSelector # Corrected import
+from src.data.data_loader import TradingDataset
+from src.models.base_model import TradingModel
+from src.utils.utils import get_logger
+from src.features.feature_selector import FeatureSelector
 
 logger = get_logger()
 

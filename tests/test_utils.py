@@ -2,7 +2,7 @@
 
 import unittest
 import logging
-from src.utils import setup_logging, get_logger
+from utils.utils import setup_logging, get_logger
 import os
 
 class TestUtils(unittest.TestCase):

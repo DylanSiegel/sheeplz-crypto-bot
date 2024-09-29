@@ -1,11 +1,11 @@
 import hydra
 from omegaconf import DictConfig
-from src.agents.agent_manager import AgentManager 
-from src.environments.crypto_trading_env import CryptoTradingEnv 
+from agents.agent_manager import AgentManager
+from environments.crypto_trading_env import CryptoTradingEnv
 from src.data.data_acquisition import BinanceDataProvider
-from src.features.feature_engineer import FeatureEngineer
-from src.features.feature_selector import FeatureSelector 
-from src.utils.utils import setup_logging, get_logger
+from src.feature_engineering import FeatureEngineer
+from src.feature_selection import FeatureSelector
+from utils.utils import setup_logging, get_logger
 import pandas as pd
 
 @hydra.main(config_path="../config", config_name="base_config", version_base=None)

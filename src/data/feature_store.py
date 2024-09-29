@@ -1,4 +1,4 @@
-# File: src/feature_store.py
+# File: src/data/feature_store.py
 
 import pandas as pd
 import os

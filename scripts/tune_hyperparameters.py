@@ -1,24 +1,21 @@
 # scripts/tune_hyperparameters.py
 
 import argparse
-import optuna  # Make sure Optuna is installed: pip install optuna
-from models.trainer import train_model
-from src.data_acquisition import BinanceDataProvider
-from src.feature_engineering import FeatureEngineer
-from src.feature_selection import FeatureSelector
-from src.trading import TradingExecutor
-from src.rewards import ProfitReward, SharpeRatioReward
-from models.evaluator import Evaluator
-from src.utils import setup_logging, get_logger
+import optuna
+from src.models.trainer import train_model  # Corrected import
+from src.data.data_acquisition import BinanceDataProvider
+from src.features.feature_engineer import FeatureEngineer  # Corrected import
+from src.features.feature_selector import FeatureSelector
+from src.trading.trading_executor import TradingExecutor 
+from src.models.evaluator import Evaluator # Corrected import
+from src.rewards.rewards import ProfitReward, SharpeRatioReward
+from src.utils.utils import setup_logging, get_logger # Corrected import
 import pandas as pd
-
-# *** Add these imports ***
-from models.model import TradingModel
-from models.trainer import TradingLitModel
+from src.models.lstm_model import TradingModel # Corrected import (Assuming it's in lstm_model.py)
+from src.models.trainer import TradingLitModel 
 import torch
 from torch.utils.data import DataLoader
 import pytorch_lightning as pl
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Hyperparameter Tuning with Optuna")

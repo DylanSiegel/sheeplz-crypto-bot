@@ -39,7 +39,7 @@ exchange:
   timeframe: 1m # Default timeframe
   rate_limit: 1200
 
-// File: config\features.yaml
+// File: config\features_config.yaml
 # config/features.yaml
 
 features:
@@ -75,6 +75,9 @@ features:
     max_features: 10
 
 
+// File: config\logging_config.yaml
+
+
 // File: config\model_config.yaml
 # config/model_config.yaml
 
@@ -94,7 +97,8 @@ model:
 
 
 // File: config\secrets.env
-
+BINANCE_API_KEY=YOUR_ACTUAL_API_KEY
+BINANCE_API_SECRET=YOUR_ACTUAL_API_SECRET
 
 // File: config\trading_config.yaml
 # config/trading_config.yaml
@@ -111,409 +115,19 @@ trading:
   trade_history_limit: 1000  # Number of past trades to keep
 
 
-// File: docs\conf.py
-# docs/conf.py
-
-import os
-import sys
-sys.path.insert(0, os.path.abspath('../src'))
-
-project = 'AI-Powered Crypto Trading Bot'
-author = 'Your Name'
-release = '0.1.0'
-
-extensions = [
-    'sphinx.ext.autodoc',
-    'sphinx.ext.napoleon',
-    'sphinx.ext.viewcode',
-]
-
-templates_path = ['_templates']
-exclude_patterns = []
-
-html_theme = 'sphinx_rtd_theme'
-html_static_path = ['_static']
-
-
-// File: docs\index.rst
-.. AI-Powered Crypto Trading Bot documentation master file, created by
-   sphinx-quickstart on Wed Apr 14 2021.
-   You can adapt this file completely to your liking, but it should at least
-   contain the root `toctree` directive.
-
-Welcome to AI-Powered Crypto Trading Bot's documentation!
-==========================================================
-
-Contents:
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Contents:
-
-Introduction
-Installation
-Usage
-Modules
-API Reference
-
-Indices and tables
-==================
-
-* :ref:`genindex`
-* :ref:`modindex`
-* :ref:`search`
-
-
-// File: environments\crypto_trading_env.py
-# File: environments/crypto_trading_env.py
-
-import gym
-from gym import spaces
-import numpy as np
-import pandas as pd
-from typing import Dict, Any, Tuple
-from rewards.reward_functions import RewardFunction
-
-class CryptoTradingEnv(gym.Env):
-    """Custom Gym environment for cryptocurrency trading."""
-
-    def __init__(self, data: pd.DataFrame, processed_features: pd.DataFrame, reward_function: RewardFunction, **kwargs):
-        super(CryptoTradingEnv, self).__init__()
-
-        self.data = data
-        self.processed_features = processed_features
-        self.reward_function = reward_function
-        self.initial_balance = kwargs.get('initial_balance', 10000)
-        self.transaction_fee = kwargs.get('transaction_fee', 0.001)
-        self.slippage = kwargs.get('slippage', 0.001)
-        self.max_position = kwargs.get('max_position', 1.0)
-
-        # Define action and observation space
-        self.action_space = spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32)
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(processed_features.shape[1] + 2,), dtype=np.float32)
-
-        self.reset()
-
-    def reset(self) -> np.ndarray:
-        self.current_step = 0
-        self.balance = self.initial_balance
-        self.position = 0
-        self.done = False
-        return self._get_observation()
-
-    def step(self, action: float) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
-        if self.done:
-            raise RuntimeError("Episode is done")
-
-        self.current_step += 1
-        current_price = self._get_current_price()
-        
-        # Execute trade
-        trade_amount = action * self.max_position
-        if trade_amount > 0:  # Buy
-            cost = trade_amount * current_price * (1 + self.slippage)
-            if cost <= self.balance:
-                self.balance -= cost * (1 + self.transaction_fee)
-                self.position += trade_amount
-        elif trade_amount < 0:  # Sell
-            revenue = abs(trade_amount) * current_price * (1 - self.slippage)
-            if abs(trade_amount) <= self.position:
-                self.balance += revenue * (1 - self.transaction_fee)
-                self.position -= abs(trade_amount)
-
-        # Calculate reward
-        next_price = self._get_next_price()
-        reward = self.reward_function(
-            state=self._get_observation(),
-            action=action,
-            reward=self._calculate_profit(),
-            next_state=self._get_next_observation(),
-            done=self.done
-        )
-
-        # Check if done
-        self.done = self.current_step >= len(self.data) - 1
-
-        return self._get_observation(), reward, self.done, self._get_info()
-
-    def _get_observation(self) -> np.ndarray:
-        features = self.processed_features.iloc[self.current_step].values
-        return np.concatenate([features, [self.balance, self.position]])
-
-    def _get_next_observation(self) -> np.ndarray:
-        next_step = min(self.current_step + 1, len(self.data) - 1)
-        features = self.processed_features.iloc[next_step].values
-        return np.concatenate([features, [self.balance, self.position]])
-
-    def _get_current_price(self) -> float:
-        return self.data.iloc[self.current_step]['close']
-
-    def _get_next_price(self) -> float:
-        next_step = min(self.current_step + 1, len(self.data) - 1)
-        return self.data.iloc[next_step]['close']
-
-    def _calculate_profit(self) -> float:
-        current_price = self._get_current_price()
-        portfolio_value = self.balance + self.position * current_price
-        return (portfolio_value - self.initial_balance) / self.initial_balance
-
-    def _get_info(self) -> Dict[str, Any]:
-        return {
-            "balance": self.balance,
-            "position": self.position,
-            "current_price": self._get_current_price(),
-            "profit": self._calculate_profit()
-        }
-
-
-// File: models\evaluator.py
-# models/evaluator.py
-
-import matplotlib.pyplot as plt
-import seaborn as sns
-import pandas as pd
-import numpy as np
-from typing import List
-
-class Evaluator:
-    """
-    Evaluates trading strategies based on various performance metrics.
-    """
-
-    def __init__(self, trade_history: pd.DataFrame):
-        """
-        Initializes the evaluator with trade history data.
-
-        Args:
-            trade_history (pd.DataFrame): DataFrame containing trade details.
-        """
-        self.trade_history = trade_history
-
-    def calculate_sharpe_ratio(self, risk_free_rate: float = 0.0) -> float:
-        """
-        Calculates the Sharpe Ratio of the trading strategy.
-
-        Args:
-            risk_free_rate (float): The risk-free rate. Defaults to 0.0.
-
-        Returns:
-            float: Sharpe Ratio.
-        """
-        returns = self.trade_history['returns']
-        excess_returns = returns - risk_free_rate
-        sharpe_ratio = excess_returns.mean() / excess_returns.std()
-        return sharpe_ratio
-
-    def calculate_max_drawdown(self) -> float:
-        """
-        Calculates the Maximum Drawdown of the trading strategy.
-
-        Returns:
-            float: Maximum Drawdown.
-        """
-        cumulative_returns = (1 + self.trade_history['returns']).cumprod()
-        peak = cumulative_returns.expanding(min_periods=1).max()
-        drawdown = (cumulative_returns - peak) / peak
-        max_drawdown = drawdown.min()
-        return max_drawdown
-
-    def calculate_total_return(self) -> float:
-        """
-        Calculates the Total Return of the trading strategy.
-
-        Returns:
-            float: Total Return.
-        """
-        total_return = (self.trade_history['portfolio_value'].iloc[-1] / self.trade_history['portfolio_value'].iloc[0]) - 1
-        return total_return
-
-    def plot_equity_curve(self):
-        """
-        Plots the equity curve of the trading strategy.
-        """
-        cumulative_returns = (1 + self.trade_history['returns']).cumprod()
-        plt.figure(figsize=(12, 6))
-        plt.plot(cumulative_returns, label='Equity Curve')
-        plt.xlabel('Trade Number')
-        plt.ylabel('Cumulative Returns')
-        plt.title('Equity Curve')
-        plt.legend()
-        plt.grid(True)
-        plt.show()
-
-    def plot_drawdown(self):
-        """
-        Plots the drawdown over time.
-        """
-        cumulative_returns = (1 + self.trade_history['returns']).cumprod()
-        peak = cumulative_returns.expanding(min_periods=1).max()
-        drawdown = (cumulative_returns - peak) / peak
-        plt.figure(figsize=(12, 6))
-        plt.plot(drawdown, label='Drawdown', color='red')
-        plt.xlabel('Trade Number')
-        plt.ylabel('Drawdown')
-        plt.title('Drawdown Over Time')
-        plt.legend()
-        plt.grid(True)
-        plt.show()
-
-    def summary(self):
-        """
-        Prints a summary of key performance metrics.
-        """
-        sharpe = self.calculate_sharpe_ratio()
-        max_dd = self.calculate_max_drawdown()
-        total_ret = self.calculate_total_return()
-
-        print(f"Sharpe Ratio: {sharpe:.2f}")
-        print(f"Maximum Drawdown: {max_dd:.2%}")
-        print(f"Total Return: {total_ret:.2%}")
-
-# Example usage
-# evaluator = Evaluator(trade_history=trade_history_df)
-# evaluator.summary()
-# evaluator.plot_equity_curve()
-# evaluator.plot_drawdown()
-
-
-// File: models\model.py
-# File: models/model.py
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-class TradingModel(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout=0.2):
-        super(TradingModel, self).__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
-        self.fc = nn.Linear(hidden_size, output_size)
-        self.dropout = nn.Dropout(dropout)
-    
-    def forward(self, x):
-        # Assuming x shape: (batch, seq_length, input_size)
-        lstm_out, _ = self.lstm(x)
-        # Taking the output of the last time step
-        last_output = lstm_out[:, -1, :]
-        out = self.dropout(last_output)
-        out = self.fc(out)
-        return out
-
-    def get_action(self, state):
-        with torch.no_grad():
-            q_values = self(torch.FloatTensor(state).unsqueeze(0))
-            return q_values.argmax().item()
-
-    def update(self, state, action, reward, next_state, done):
-        # Implement your update logic here (e.g., Q-learning updates)
-        pass
-
-
-// File: models\timesnet.py
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-class TimesBlock(nn.Module):
-    def __init__(self, input_size, hidden_size):
-        super(TimesBlock, self).__init__()
-        self.conv1 = nn.Conv1d(input_size, hidden_size, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv1d(hidden_size, hidden_size, kernel_size=3, padding=1)
-        self.ln = nn.LayerNorm(hidden_size)
-
-    def forward(self, x):
-        residual = x
-        x = self.conv1(x.transpose(1, 2)).transpose(1, 2)
-        x = F.relu(x)
-        x = self.conv2(x.transpose(1, 2)).transpose(1, 2)
-        x = self.ln(x + residual)
-        return x
-
-class TimesNet(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, output_size):
-        super(TimesNet, self).__init__()
-        self.blocks = nn.ModuleList([TimesBlock(input_size if i == 0 else hidden_size, hidden_size) for i in range(num_layers)])
-        self.fc = nn.Linear(hidden_size, output_size)
-
-    def forward(self, x):
-        for block in self.blocks:
-            x = block(x)
-        x = x.mean(dim=1)  # Global average pooling
-        return self.fc(x)
-
-class TimesNetTradingModel(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, output_size):
-        super(TimesNetTradingModel, self).__init__()
-        self.timesnet = TimesNet(input_size, hidden_size, num_layers, output_size)
-
-    def forward(self, x):
-        return self.timesnet(x)
-
-    def get_action(self, state):
-        with torch.no_grad():
-            q_values = self(torch.FloatTensor(state).unsqueeze(0))
-            return q_values.argmax().item()
-
-    def update(self, state, action, reward, next_state, done):
-        # Implement your update logic here
-        pass
-
-// File: models\trading_model.py
-# File: models/trading_model.py
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-
-class TradingModel(nn.Module):
-    def __init__(self, input_size: int, hidden_size: int, num_layers: int, output_size: int, dropout: float = 0.2):
-        super(TradingModel, self).__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
-        self.fc = nn.Linear(hidden_size, output_size)
-        self.optimizer = torch.optim.Adam(self.parameters())
-        self.criterion = nn.MSELoss()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        lstm_out, _ = self.lstm(x)
-        return self.fc(lstm_out[:, -1, :])
-
-    def get_action(self, state: np.ndarray) -> float:
-        with torch.no_grad():
-            state_tensor = torch.FloatTensor(state).unsqueeze(0).unsqueeze(0)
-            q_values = self(state_tensor)
-            return q_values.squeeze().item()
-
-    def update(self, state: np.ndarray, action: float, reward: float, next_state: np.ndarray, done: bool):
-        state_tensor = torch.FloatTensor(state).unsqueeze(0).unsqueeze(0)
-        next_state_tensor = torch.FloatTensor(next_state).unsqueeze(0).unsqueeze(0)
-        action_tensor = torch.FloatTensor([action])
-        reward_tensor = torch.FloatTensor([reward])
-        done_tensor = torch.FloatTensor([float(done)])
-
-        q_values = self(state_tensor)
-        next_q_values = self(next_state_tensor)
-
-        target = reward_tensor + (1 - done_tensor) * 0.99 * torch.max(next_q_values)
-        loss = self.criterion(q_values.squeeze(), target)
-
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-
-        return loss.item()
-
 // File: models\trainer.py
 # models/trainer.py
 
 import pytorch_lightning as pl
 import torch
-from torch.utils.data import DataLoader, Dataset
-import pandas as pd  # Import pandas here
-from src.data_loader import TradingDataset
-from .model import TradingModel
-from src.utils import get_logger
-from src.feature_selection import FeatureSelector
+from torch.utils.data import DataLoader
+import pandas as pd
+from src.data.data_loader import TradingDataset  # Corrected import
+from src.models.lstm_model import TradingModel  # Assuming TradingModel is in lstm_model.py
+from src.utils.utils import get_logger           # Corrected import
+from src.features.feature_selector import FeatureSelector # Corrected import
+
+logger = get_logger()
 
 logger = get_logger()
 
@@ -590,13 +204,6 @@ def train_model(config, train_df: pd.DataFrame, target_df: pd.Series):
 
 
 // File: models\__init__.py
-# models/__init__.py
-
-from .model import TradingModel
-from .trainer import train_model
-from .evaluator import Evaluator
-
-__all__ = ['TradingModel', 'train_model', 'Evaluator']
 
 
 // File: scripts\backtest.py
@@ -604,13 +211,13 @@ __all__ = ['TradingModel', 'train_model', 'Evaluator']
 
 import argparse
 import pandas as pd
-from src.data_acquisition import BinanceDataProvider
-from src.feature_engineering import FeatureEngineer
-from src.feature_selection import FeatureSelector
-from src.trading import TradingExecutor
-from models.evaluator import Evaluator
-from src.rewards import ProfitReward, SharpeRatioReward
-from src.utils import setup_logging, get_logger
+from src.data.data_acquisition import BinanceDataProvider
+from src.features.feature_engineer import FeatureEngineer
+from src.features.feature_selector import FeatureSelector  # Corrected
+from src.trading.trading_executor import TradingExecutor  # Corrected
+from src.models.evaluator import Evaluator
+from src.rewards.rewards import ProfitReward, SharpeRatioReward
+from src.utils.utils import setup_logging, get_logger
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Backtest Trading Strategies")
@@ -668,10 +275,10 @@ if __name__ == "__main__":
 # scripts/download_data.py
 
 import argparse
-from src.data_acquisition import BinanceDataProvider
-from src.feature_engineering import FeatureEngineer
 import pandas as pd
-from src.utils import setup_logging, get_logger
+from src.data.data_acquisition import BinanceDataProvider  
+from src.features.feature_engineer import FeatureEngineer  # Corrected import
+from src.utils.utils import setup_logging, get_logger  # Corrected import
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Download Historical Data")
@@ -716,14 +323,75 @@ if __name__ == "__main__":
     main()
 
 
+// File: scripts\live_trading.py
+import hydra
+from omegaconf import DictConfig
+from agents.agent_manager import AgentManager
+from environments.crypto_trading_env import CryptoTradingEnv
+from src.data.data_acquisition import BinanceDataProvider
+from src.feature_engineering import FeatureEngineer
+from src.feature_selection import FeatureSelector
+from utils.utils import setup_logging, get_logger
+import pandas as pd
+
+@hydra.main(config_path="../config", config_name="base_config", version_base=None)
+def main(cfg: DictConfig):
+    setup_logging(log_level=cfg.logging.log_level, log_file=f"logs/trading_bot_{cfg.base.mode}.log")
+    logger = get_logger()
+    logger.info(f"Running in {cfg.base.mode} mode")
+
+    # Initialize Data Provider and fetch data
+    data_provider = BinanceDataProvider(api_key=cfg.exchange.api_key, api_secret=cfg.exchange.api_secret)
+    data = {}
+    for symbol in cfg.exchange.trading_pairs:
+        df = data_provider.get_data(symbol=symbol, timeframe=cfg.exchange.timeframe, start_date=cfg.data.start_date, end_date=cfg.data.end_date)
+        data[symbol] = df
+
+    # Feature Engineering and Selection
+    feature_engineer = FeatureEngineer()
+    feature_selector = FeatureSelector(threshold=cfg.features.feature_selection.threshold, max_features=cfg.features.feature_selection.max_features)
+    
+    processed_data = {}
+    for symbol, df in data.items():
+        df = feature_engineer.process_features(df)
+        X = df[cfg.features.feature_columns]
+        y = (df['close'].shift(-1) > df['close']).astype(int).fillna(0)
+        X_selected = feature_selector.fit_transform(X, y)
+        processed_data[symbol] = (X_selected, y)
+
+    # Initialize environments for each timeframe
+    environments = {
+        timeframe: CryptoTradingEnv(
+            data=data[cfg.exchange.trading_pairs[0]],  # Using the first trading pair for simplicity
+            processed_features=processed_data[cfg.exchange.trading_pairs[0]][0],
+            reward_function=cfg.trading.reward_function,
+            **cfg.environment
+        ) for timeframe in cfg.trading.timeframes
+    }
+
+    # Initialize AgentManager
+    agent_manager = AgentManager(agent_configs=cfg.agents, environments=environments)
+
+    if cfg.base.mode == 'train':
+        results = agent_manager.train_agents(num_episodes=cfg.training.num_episodes)
+        logger.info(f"Training completed. Results: {results}")
+        agent_manager.save_agents(cfg.paths.model_save_path)
+    elif cfg.base.mode == 'test':
+        agent_manager.load_agents(cfg.paths.model_save_path)
+        evaluation_results = agent_manager.evaluate_agents(num_episodes=cfg.evaluation.num_episodes)
+        logger.info(f"Evaluation completed. Results: {evaluation_results}")
+
+if __name__ == "__main__":
+    main()
+
 // File: scripts\preprocess_data.py
 # scripts/preprocess_data.py
 
 import argparse
 import pandas as pd
-from src.feature_engineering import FeatureEngineer
-from src.feature_selection import FeatureSelector
-from src.utils import setup_logging, get_logger
+from src.features.feature_engineer import FeatureEngineer  # Corrected import
+from src.features.feature_selector import FeatureSelector  # Corrected import
+from src.utils.utils import setup_logging, get_logger  # Corrected import
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Preprocess Raw Data")
@@ -777,178 +445,88 @@ if __name__ == "__main__":
 
 
 // File: scripts\run.py
-# scripts/run.py
-
 import hydra
 from omegaconf import DictConfig
-import logging
-
-from src.utils import setup_logging, get_logger
-from src.data_acquisition import BinanceDataProvider
-from src.feature_engineering import FeatureEngineer
-from src.feature_selection import FeatureSelector
-from src.feature_store import FeatureStore
-from src.trading import TradingExecutor
-from src.rewards import ProfitReward, SharpeRatioReward
-from models.trainer import TradingLitModel
-from models.model import TradingModel  # Corrected import
-from models.evaluator import Evaluator
+from src.agents.agent_manager import AgentManager 
+from src.environments.crypto_trading_env import CryptoTradingEnv 
+from src.data.data_acquisition import BinanceDataProvider
+from src.features.feature_engineer import FeatureEngineer
+from src.features.feature_selector import FeatureSelector 
+from src.utils.utils import setup_logging, get_logger
 import pandas as pd
-import torch
-from torch.utils.data import DataLoader
-import pytorch_lightning as pl
-from src.data_loader import TradingDataset
-
-
 
 @hydra.main(config_path="../config", config_name="base_config", version_base=None)
 def main(cfg: DictConfig):
-    # Setup logging (using Hydra's logging)
-    setup_logging(log_level=cfg.base.log_level, log_file=f"logs/trading_bot_{cfg.base.mode}.log")
+    setup_logging(log_level=cfg.logging.log_level, log_file=f"logs/trading_bot_{cfg.base.mode}.log")
     logger = get_logger()
     logger.info(f"Running in {cfg.base.mode} mode")
 
-    # Access configurations
-    api_key = cfg.exchange.api_key
-    api_secret = cfg.exchange.api_secret
-    timeframe = cfg.exchange.timeframe
-    learning_rate = cfg.model.learning_rate
-    # ... other config access ...
+    # Initialize Data Provider and fetch data
+    data_provider = BinanceDataProvider(api_key=cfg.exchange.api_key, api_secret=cfg.exchange.api_secret)
+    data = {}
+    for symbol in cfg.exchange.trading_pairs:
+        df = data_provider.get_data(symbol=symbol, timeframe=cfg.exchange.timeframe, start_date=cfg.data.start_date, end_date=cfg.data.end_date)
+        data[symbol] = df
 
-    # Initialize Data Provider
-    data_provider = BinanceDataProvider(api_key=api_key, api_secret=api_secret)
-    logger.info(f"Fetching historical data...")  # More general message
-
-    # Fetch data (adapt for multiple pairs if needed)
-    symbol = cfg.exchange.trading_pairs[0] #  Get the first trading pair
-    df = data_provider.get_data(symbol=symbol, timeframe=timeframe, start_date='2023-01-01', end_date='2023-12-31')
-
-    # Feature Engineering
+    # Feature Engineering and Selection
     feature_engineer = FeatureEngineer()
-    df = feature_engineer.add_technical_indicators(df)
-    df = feature_engineer.add_custom_features(df)
-    df = df.dropna()
-    logger.info("Feature engineering completed.")
-
-
-    # Feature Selection
-    feature_selector = FeatureSelector(threshold=cfg.features.feature_selection.threshold,
-                                       max_features=cfg.features.feature_selection.max_features)
+    feature_selector = FeatureSelector(threshold=cfg.features.feature_selection.threshold, max_features=cfg.features.feature_selection.max_features)
     
-    # Define your target variable (you'll need to adjust this based on your reward function and strategy)
-    target = (df['close'].shift(-1) > df['close']).astype(int).fillna(0).astype(int)  # Example target: predict price increase/decrease
-    
-    # Select relevant features for feature selection (important: include the raw price data if your model needs it)
-    feature_columns = ['open', 'high', 'low', 'close', 'volume', 'SMA_20', 'EMA', 'RSI', 'MACD', 'ATR', 'pct_change', 'volatility']
-    X = df[feature_columns]  # These are the features you will use for training
-    
-    X_selected = feature_selector.fit_transform(X, target) # Perform feature selection
-    logger.info(f"Selected features: {X_selected.columns.tolist()}")
+    processed_data = {}
+    for symbol, df in data.items():
+        df = feature_engineer.process_features(df)
+        X = df[cfg.features.feature_columns]
+        y = (df['close'].shift(-1) > df['close']).astype(int).fillna(0)
+        X_selected = feature_selector.fit_transform(X, y)
+        processed_data[symbol] = (X_selected, y)
 
+    # Initialize environments for each timeframe
+    environments = {
+        timeframe: CryptoTradingEnv(
+            data=data[cfg.exchange.trading_pairs[0]],  # Using the first trading pair for simplicity
+            processed_features=processed_data[cfg.exchange.trading_pairs[0]][0],
+            reward_function=cfg.trading.reward_function,
+            **cfg.environment
+        ) for timeframe in cfg.trading.timeframes
+    }
 
+    # Initialize AgentManager
+    agent_manager = AgentManager(agent_configs=cfg.agents, environments=environments)
 
     if cfg.base.mode == 'train':
-        # === Training Logic ===
-
-        # Initialize Model (Using config parameters)
-        model = TradingModel(input_size=X_selected.shape[1],
-                             hidden_size=cfg.model.hidden_size,
-                             num_layers=cfg.model.num_layers,
-                             output_size=cfg.model.output_size,
-                             dropout=cfg.model.dropout)
-
-        # Initialize Trainer
-        trainer = pl.Trainer(max_epochs=cfg.model.epochs,
-                             gpus=1 if torch.cuda.is_available() and cfg.model.device == 'cuda' else 0,
-                             logger=True)
-
-        # Prepare Dataset and DataLoader (using TradingDataset)
-        dataset = TradingDataset(X_selected, target)
-        dataloader = DataLoader(dataset, batch_size=cfg.model.batch_size, shuffle=True)
-
-        # Initialize Lightning Module
-        lit_model = TradingLitModel(model=model,
-                                    learning_rate=cfg.model.learning_rate,
-                                    loss_fn=torch.nn.MSELoss(),
-                                    optimizer_cls=getattr(torch.optim, cfg.model.optimizer))
-
-        # Train
-        logger.info("Starting model training...")
-        trainer.fit(lit_model, dataloader)
-        logger.info("Model training completed.")
-
-        # Save the trained model
-        torch.save(model.state_dict(), cfg.base.model_save_path + "trading_model.pth")
-        logger.info(f"Model saved to {cfg.base.model_save_path}trading_model.pth")
-
-
-
+        results = agent_manager.train_agents(num_episodes=cfg.training.num_episodes)
+        logger.info(f"Training completed. Results: {results}")
+        agent_manager.save_agents(cfg.paths.model_save_path)
     elif cfg.base.mode == 'test':
-        # === Testing Logic ===
-        # Load trained model
-        model = TradingModel(input_size=X_selected.shape[1],  # Use the same input size as training!
-                             hidden_size=cfg.model.hidden_size,
-                             num_layers=cfg.model.num_layers,
-                             output_size=cfg.model.output_size,
-                             dropout=cfg.model.dropout) # VERY IMPORTANT to include dropout here too!
-
-
-        model.load_state_dict(torch.load(cfg.base.model_save_path + "trading_model.pth"))
-        model.eval()  # Set the model to evaluation mode
-        logger.info("Trained model loaded.")
-
-        # Initialize Reward Function (Example: ProfitReward)
-        reward_function = ProfitReward() # Or SharpeRatioReward(), etc.
-
-
-        # Initialize Trading Executor
-        trading_executor = TradingExecutor(initial_balance=cfg.trading.initial_balance,
-                                           transaction_fee=cfg.trading.transaction_fee,
-                                           slippage=cfg.trading.slippage)
-
-
-        # Execute Backtesting (You'll likely want to use a separate dataset for testing)
-        # Make sure 'df' below is your TEST data, not the training data used above.
-        trade_history = trading_executor.execute_backtest(df, X_selected, target, reward_function)
-
-
-
-        #Evaluate Performance
-        evaluator = Evaluator(trade_history)
-        evaluator.summary()
-        evaluator.plot_equity_curve()
-        evaluator.plot_drawdown()
-
-
-
-
-
+        agent_manager.load_agents(cfg.paths.model_save_path)
+        evaluation_results = agent_manager.evaluate_agents(num_episodes=cfg.evaluation.num_episodes)
+        logger.info(f"Evaluation completed. Results: {evaluation_results}")
 
 if __name__ == "__main__":
     main()
+
+// File: scripts\run_visualization.py
+
 
 // File: scripts\tune_hyperparameters.py
 # scripts/tune_hyperparameters.py
 
 import argparse
-import optuna  # Make sure Optuna is installed: pip install optuna
-from models.trainer import train_model
-from src.data_acquisition import BinanceDataProvider
-from src.feature_engineering import FeatureEngineer
-from src.feature_selection import FeatureSelector
-from src.trading import TradingExecutor
-from src.rewards import ProfitReward, SharpeRatioReward
-from models.evaluator import Evaluator
-from src.utils import setup_logging, get_logger
+import optuna
+from src.models.trainer import train_model  # Corrected import
+from src.data.data_acquisition import BinanceDataProvider
+from src.features.feature_engineer import FeatureEngineer  # Corrected import
+from src.features.feature_selector import FeatureSelector
+from src.trading.trading_executor import TradingExecutor 
+from src.models.evaluator import Evaluator # Corrected import
+from src.rewards.rewards import ProfitReward, SharpeRatioReward
+from src.utils.utils import setup_logging, get_logger # Corrected import
 import pandas as pd
-
-# *** Add these imports ***
-from models.model import TradingModel
-from models.trainer import TradingLitModel
+from src.models.lstm_model import TradingModel # Corrected import (Assuming it's in lstm_model.py)
+from src.models.trainer import TradingLitModel 
 import torch
 from torch.utils.data import DataLoader
 import pytorch_lightning as pl
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Hyperparameter Tuning with Optuna")
@@ -1055,20 +633,335 @@ if __name__ == "__main__":
 # This file can be left empty or include package-level imports if necessary.
 
 
-// File: src\agent_manager.py
-# File: agents/agent_manager.py
+// File: src\app.py
+# File: app.py
 
-import ray
-from typing import List, Dict, Any
+import streamlit as st
+from src.visualization.visualization import Visualization
+from src.data.data_acquisition import BinanceDataProvider 
+from src.features.feature_engineer import FeatureEngineer
+from src.models.lstm_model import TradingModel  # Or your preferred model
+import torch
+import os 
+from dotenv import load_dotenv
+from omegaconf import OmegaConf # For loading your config
+
+# Load environment variables 
+load_dotenv(os.path.join(os.path.dirname(__file__), '../../config/secrets.env'))
+
+# Load config
+cfg = OmegaConf.load(os.path.join(os.path.dirname(__file__), '../../config/base_config.yaml')) 
+
+# Instantiate classes
+visualization = Visualization()
+data_provider = BinanceDataProvider(api_key=cfg.exchange.api_key, api_secret=cfg.exchange.api_secret)
+feature_engineer = FeatureEngineer()
+
+# Load your trained model
+model = TradingModel(input_size=len(feature_engineer.get_feature_names()), 
+                    hidden_size=cfg.model.hidden_size, 
+                    num_layers=cfg.model.num_layers, 
+                    output_size=3) # Assuming 3 output actions
+model.load_state_dict(torch.load(cfg.paths.model_save_path))
+model.eval() # Set to evaluation mode
+
+# Fetch Data (Replace with your actual data loading)
+df = data_provider.get_data(cfg.exchange.symbol, cfg.exchange.timeframe, 
+                                start_date=cfg.data.start_date, end_date=cfg.data.end_date)
+
+# Placeholder for performance and order history data (Replace with actual data)
+performance_data = {
+    'portfolio_value': [], # Update in your trading logic
+    'returns': [] # Update in your trading logic
+}
+order_history = [] # Update in your trading logic
+
+# Streamlit App
+st.title("Crypto Trading Bot Dashboard")
+
+# Price Chart
+st.header("Price Chart")
+visualization.plot_price_chart(df)
+
+# Performance Metrics
+st.header("Performance Metrics")
+visualization.plot_performance_metrics(performance_data)
+
+# Order History
+st.header("Order History")
+visualization.display_order_history(order_history)
+
+# ... (Add other Streamlit components and interactions) ...
+
+if __name__ == '__main__':
+    st.write("Starting Streamlit app...")
+    # st.experimental_rerun() # Optional: Uncomment for auto-refresh
+
+// File: src\main.py
+import hydra
+from omegaconf import DictConfig
+import torch
+import pandas as pd
 import numpy as np
+from typing import Dict
+import time
+from src.data.data_acquisition import BinanceDataProvider
+from src.features.feature_engineer import FeatureEngineer
+from src.models.lstm_model import TradingModel
+from src.agents.agent_manager import AgentManager
+from src.environments.crypto_trading_env import CryptoTradingEnv
+from src.rewards.rewards import get_reward_function
+from utils.utils import setup_logging, get_logger
+from dotenv import load_dotenv  # For loading environment variables
+import os
+from src.visualization.visualization import Visualization # Import for visualizations
+
+logger = get_logger(__name__)
+
+# Load environment variables from .env file
+load_dotenv(os.path.join(os.path.dirname(__file__), '../../config/secrets.env'))
+
+def preprocess_data(data: pd.DataFrame, feature_engineer: FeatureEngineer) -> pd.DataFrame:
+    processed_data = feature_engineer.process_features(data)
+    return processed_data.fillna(0)  # Fill NaN values with 0 to avoid issues
+
+def create_environment(data: pd.DataFrame, config: DictConfig) -> CryptoTradingEnv:
+    reward_function = get_reward_function(config.trading.reward_function)
+    return CryptoTradingEnv(data, initial_balance=config.trading.initial_balance, 
+                            transaction_fee=config.trading.transaction_fee, 
+                            reward_function=reward_function)
+
+def train_model(model: TradingModel, env: CryptoTradingEnv, config: DictConfig, visualization: Visualization):
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.model.learning_rate)
+    criterion = torch.nn.MSELoss()
+    training_data = [] # Initialize for training visualization
+
+    for episode in range(config.training.num_episodes):
+        state = env.reset()
+        total_reward = 0
+        done = False
+        actions_taken = [] # Initialize for tracking actions in the episode
+
+        while not done:
+            action = model.get_action(state)
+            actions_taken.append(action)
+            next_state, reward, done, _ = env.step(action)
+            loss = model.update(optimizer, criterion, state, action, reward, next_state, done)
+            state = next_state
+            total_reward += reward
+
+        # Collect data for training visualization
+        episode_data = {
+            'episode': episode,
+            'loss': loss, 
+            'reward': total_reward,
+            'actions': actions_taken 
+        }
+        training_data.append(episode_data)
+
+        if (episode + 1) % 10 == 0:
+            logger.info(f"Episode {episode + 1}/{config.training.num_episodes}, Total Reward: {total_reward:.2f}, Loss: {loss:.4f}")
+            visualization.plot_training_progress(training_data) # Visualize training progress
+
+def evaluate_model(model: TradingModel, env: CryptoTradingEnv, config: DictConfig) -> float:
+    total_reward = 0
+    num_episodes = config.evaluation.num_episodes
+
+    for _ in range(num_episodes):
+        state = env.reset()
+        done = False
+        episode_reward = 0
+
+        while not done:
+            action = model.get_action(state)
+            state, reward, done, _ = env.step(action)
+            episode_reward += reward
+
+        total_reward += episode_reward
+
+    avg_reward = total_reward / num_episodes
+    logger.info(f"Evaluation - Average Reward: {avg_reward:.2f}")
+    return avg_reward
+
+def live_trading(model: TradingModel, data_provider: BinanceDataProvider, feature_engineer: FeatureEngineer, config: DictConfig, visualization: Visualization):
+    portfolio_values = []
+    returns = []
+    order_history = []
+
+    while True:
+        # Fetch latest data
+        latest_data = data_provider.get_data(config.exchange.symbol, config.exchange.timeframe, 
+                                             limit=config.live_trading.lookback_period)
+        
+        # Preprocess data
+        processed_data = preprocess_data(latest_data, feature_engineer)
+        
+        # Get the latest state
+        latest_state = processed_data.iloc[-1].values
+        
+        # Get model prediction
+        action = model.get_action(latest_state)
+        
+        # Execute trade based on the action
+        if action == 1:  # Buy
+            order = data_provider.place_order(config.exchange.symbol, 'market', 'buy', config.live_trading.trade_amount)
+            logger.info(f"Buy order placed: {order}")
+            # ... (Update portfolio_values, returns, order_history)
+        elif action == 2:  # Sell
+            order = data_provider.place_order(config.exchange.symbol, 'market', 'sell', config.live_trading.trade_amount)
+            logger.info(f"Sell order placed: {order}")
+            # ... (Update portfolio_values, returns, order_history)
+        else:
+            logger.info("Hold position")
+        
+        # Visualizations (Update periodically)
+        visualization.plot_price_chart(latest_data)
+        performance_data = {
+            'portfolio_value': portfolio_values,
+            'returns': returns,
+            # ...
+        }
+        visualization.plot_performance_metrics(performance_data)
+        visualization.display_order_history(order_history)
+
+        # Wait for next trading interval
+        time.sleep(config.live_trading.interval)
+
+@hydra.main(config_path="../../config", config_name="base_config", version_base=None)
+def main(cfg: DictConfig):
+    setup_logging(cfg.logging)
+    visualization = Visualization() # Instantiate for all modes
+    
+    # Initialize data provider
+    data_provider = BinanceDataProvider(api_key=cfg.exchange.api_key, api_secret=cfg.exchange.api_secret)
+    
+    # Fetch historical data
+    historical_data = data_provider.get_data(cfg.exchange.symbol, cfg.exchange.timeframe, 
+                                             start_date=cfg.data.start_date, end_date=cfg.data.end_date)
+    
+    # Initialize feature engineer
+    feature_engineer = FeatureEngineer()
+    
+    # Preprocess data
+    processed_data = preprocess_data(historical_data, feature_engineer)
+    
+    # Create environment
+    env = create_environment(processed_data, cfg)
+    
+    # Initialize model
+    model = TradingModel(input_size=len(feature_engineer.get_feature_names()), 
+                         hidden_size=cfg.model.hidden_size, 
+                         num_layers=cfg.model.num_layers, 
+                         output_size=env.action_space.n)
+    
+    if cfg.mode == "train":
+        # Train the model
+        train_model(model, env, cfg, visualization)
+        
+        # Save the trained model
+        torch.save(model.state_dict(), cfg.paths.model_save_path)
+        logger.info(f"Model saved to {cfg.paths.model_save_path}")
+        
+        # Evaluate the model
+        evaluate_model(model, env, cfg)
+    
+    elif cfg.mode == "evaluate":
+        # Load the trained model
+        model.load_state_dict(torch.load(cfg.paths.model_save_path))
+        logger.info(f"Model loaded from {cfg.paths.model_save_path}")
+        
+        # Evaluate the model
+        evaluate_model(model, env, cfg)
+    
+    elif cfg.mode == "live":
+        # Load the trained model
+        model.load_state_dict(torch.load(cfg.paths.model_save_path))
+        logger.info(f"Model loaded from {cfg.paths.model_save_path}")
+        
+        # Start live trading
+        live_trading(model, data_provider, feature_engineer, cfg, visualization)
+    
+    else:
+        logger.error(f"Invalid mode: {cfg.mode}")
+
+if __name__ == "__main__":
+    main()
+
+// File: src\__init__.py
+
+
+// File: src\agents\agent_manager.py
+from typing import List, Dict, Any
+import ray
+from .trading_agent import TradingAgent
 from environments.crypto_trading_env import CryptoTradingEnv
-from models.trading_model import TradingModel
-from rewards.reward_functions import RewardFunction
-from utils.logging_config import get_logger
+from src.models.lstm_model import TradingModel # Corrected import
+from src.rewards.rewards import RewardFunction, get_reward_function
+from utils.utils import get_logger
 
 logger = get_logger(__name__)
 
 @ray.remote
+class RemoteTradingAgent(TradingAgent):
+    pass
+
+class AgentManager:
+    def __init__(self, agent_configs: List[Dict[str, Any]], environments: Dict[str, CryptoTradingEnv]):
+        ray.init(ignore_reinit_error=True)
+        self.agents = []
+        for config in agent_configs:
+            env = environments[config['timeframe']]
+            model = TradingModel(
+                input_size=env.observation_space.shape[0],
+                hidden_size=config['hidden_size'],
+                num_layers=config['num_layers'],
+                output_size=env.action_space.n
+            )
+            reward_function = get_reward_function(config['reward_function'])
+            agent = RemoteTradingAgent.remote(env, model, reward_function, config['agent_id'])
+            self.agents.append(agent)
+
+    def train_agents(self, num_episodes: int):
+        results = ray.get([agent.train.remote(num_episodes) for agent in self.agents])
+        for result in results:
+            logger.info(f"Agent {result['agent_id']} - Average Reward: {result['average_reward']:.2f}")
+        return results
+
+    def evaluate_agents(self, num_episodes: int):
+        results = ray.get([agent.evaluate.remote(num_episodes) for agent in self.agents])
+        for result in results:
+            logger.info(f"Agent {result['agent_id']} - Evaluation Average Reward: {result['average_reward']:.2f}")
+        return results
+
+    def get_best_agent(self):
+        evaluation_results = self.evaluate_agents(num_episodes=100)
+        best_agent = max(evaluation_results, key=lambda x: x['average_reward'])
+        return best_agent['agent_id']
+
+    def save_agents(self, directory: str):
+        ray.get([agent.save.remote(directory) for agent in self.agents])
+
+    def load_agents(self, directory: str):
+        ray.get([agent.load.remote(directory) for agent in self.agents])
+
+    def shutdown(self):
+        ray.shutdown()
+
+// File: src\agents\base_agent.py
+
+
+// File: src\agents\dqn_agent.py
+
+
+// File: src\agents\ppo_agent.py
+
+
+// File: src\agents\trading_agent.py
+import torch
+from environments.crypto_trading_env import CryptoTradingEnv
+from models.trading_model import TradingModel
+from src.rewards.rewards import RewardFunction
+
 class TradingAgent:
     def __init__(self, env: CryptoTradingEnv, model: TradingModel, reward_function: RewardFunction, agent_id: str):
         self.env = env
@@ -1077,16 +970,7 @@ class TradingAgent:
         self.agent_id = agent_id
         self.performance_history = []
 
-    def train(self, num_episodes: int) -> Dict[str, Any]:
-        """
-        Train the agent for a specified number of episodes.
-
-        Args:
-            num_episodes (int): The number of training episodes.
-
-        Returns:
-            Dict[str, Any]: A dictionary containing the agent's ID, average reward, and performance history.
-        """
+    def train(self, num_episodes: int):
         total_reward = 0
         for episode in range(num_episodes):
             state = self.env.reset()
@@ -1096,24 +980,20 @@ class TradingAgent:
             while not done:
                 action = self.model.get_action(state)
                 next_state, reward, done, _ = self.env.step(action)
-                adjusted_reward = self.reward_function(state, action, reward, next_state, done)
+                adjusted_reward = self.reward_function.calculate_reward(state, action, reward, next_state, done)
                 self.model.update(state, action, adjusted_reward, next_state, done)
                 episode_reward += adjusted_reward
                 state = next_state
 
             self.performance_history.append(episode_reward)
             total_reward += episode_reward
-            logger.info(f"Agent {self.agent_id} - Episode {episode + 1}/{num_episodes}, Reward: {episode_reward:.2f}")
 
-        average_reward = total_reward / num_episodes
-        return {"agent_id": self.agent_id, "average_reward": average_reward, "performance_history": self.performance_history}
+        return total_reward / num_episodes
 
-    def act(self, state: np.ndarray) -> int:
-        """Get an action for the given state."""
+    def act(self, state):
         return self.model.get_action(state)
 
-    def evaluate(self, num_episodes: int) -> Dict[str, float]:
-        """Evaluate the agent's performance."""
+    def evaluate(self, num_episodes: int):
         total_reward = 0
         for _ in range(num_episodes):
             state = self.env.reset()
@@ -1122,72 +1002,115 @@ class TradingAgent:
                 action = self.act(state)
                 state, reward, done, _ = self.env.step(action)
                 total_reward += reward
-        return {"agent_id": self.agent_id, "average_reward": total_reward / num_episodes}
+        return total_reward / num_episodes
 
-    def save(self, path: str) -> None:
-        """Save the agent's model and performance history."""
+    def save(self, path: str):
         torch.save({
             'model_state_dict': self.model.state_dict(),
             'performance_history': self.performance_history
         }, f"{path}/{self.agent_id}.pth")
 
-    def load(self, path: str) -> None:
-        """Load the agent's model and performance history."""
+    def load(self, path: str):
         checkpoint = torch.load(f"{path}/{self.agent_id}.pth")
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.performance_history = checkpoint['performance_history']
 
-class AgentManager:
-    def __init__(self, environments: Dict[str, CryptoTradingEnv], agent_configs: List[Dict[str, Any]]):
-        self.environments = environments
-        self.agents = [
-            TradingAgent.remote(
-                env=environments[list(environments.keys())[i % len(environments)]],
-                model=config['model'],
-                reward_function=config['reward_function'],
-                agent_id=config['agent_id']
-            ) for i, config in enumerate(agent_configs)
-        ]
+// File: src\agents\__init__.py
+from .trading_agent import TradingAgent
+from .agent_manager import AgentManager
 
-    def train_agents(self, num_episodes: int) -> List[Dict[str, Any]]:
-        """Train all agents for a specified number of episodes."""
+__all__ = ['TradingAgent', 'AgentManager']
+
+// File: src\data\data_acquisition.py
+import ccxt
+import pandas as pd
+from typing import List
+import time
+from src.utils.utils import get_logger  # Use absolute import here too
+
+logger = get_logger(__name__)
+
+class BinanceDataProvider:
+    def __init__(self, api_key: str, api_secret: str):
+        self.exchange = ccxt.binance({
+            'apiKey': api_key,
+            'secret': api_secret,
+            'enableRateLimit': True,
+        })
+        self.rate_limit = 1200  # Binance rate limit (requests per minute)
+        self.last_request_time = 0
+
+    def _rate_limit(self):
+        current_time = time.time()
+        elapsed = current_time - self.last_request_time
+        if elapsed < 60 / self.rate_limit:
+            time.sleep((60 / self.rate_limit) - elapsed)
+        self.last_request_time = time.time()
+
+    def get_data(self, symbol: str, timeframe: str, start_date: str, end_date: str) -> pd.DataFrame:
         try:
-            results = ray.get([agent.train.remote(num_episodes) for agent in self.agents])
-            return results
+            self._rate_limit()
+            data = self.exchange.fetch_ohlcv(symbol, timeframe, self.exchange.parse8601(start_date), limit=1000)
+            df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df.set_index('timestamp', inplace=True)
+            return df
         except Exception as e:
-            logger.error(f"Error during agent training: {str(e)}")
-            return []
+            logger.error(f"Error fetching data: {str(e)}")
+            return pd.DataFrame()
 
-    def evaluate_agents(self, num_episodes: int) -> List[Dict[str, float]]:
-        """Evaluate all agents on unseen data."""
+    def get_multiple_symbols(self, symbols: List[str], timeframe: str, start_date: str, end_date: str) -> dict:
+        data = {}
+        for symbol in symbols:
+            data[symbol] = self.get_data(symbol, timeframe, start_date, end_date)
+        return data
+
+    def get_account_balance(self) -> dict:
         try:
-            results = ray.get([agent.evaluate.remote(num_episodes) for agent in self.agents])
-            return results
+            self._rate_limit()
+            balance = self.exchange.fetch_balance()
+            return {asset: balance[asset] for asset in balance if balance[asset]['total'] > 0}
         except Exception as e:
-            logger.error(f"Error during agent evaluation: {str(e)}")
-            return []
+            logger.error(f"Error fetching account balance: {str(e)}")
+            return {}
 
-    def get_best_agent(self) -> str:
-        """Determine the best agent based on average reward."""
-        results = self.evaluate_agents(num_episodes=100)
-        best_agent = max(results, key=lambda x: x['average_reward'])
-        return best_agent['agent_id']
+    def place_order(self, symbol: str, order_type: str, side: str, amount: float, price: float = None) -> dict:
+        try:
+            self._rate_limit()
+            order = self.exchange.create_order(symbol, order_type, side, amount, price)
+            return order
+        except Exception as e:
+            logger.error(f"Error placing order: {str(e)}")
+            return {}
 
-    def ensemble_prediction(self, state: np.ndarray) -> int:
-        """Make a prediction using an ensemble of all agents."""
-        predictions = ray.get([agent.act.remote(state) for agent in self.agents])
-        return int(np.argmax(np.bincount(predictions)))
+// File: src\data\data_loader.py
+# src/data/data_loader.py
 
-    def save_agents(self, directory: str) -> None:
-        """Save all agents to the specified directory."""
-        ray.get([agent.save.remote(directory) for agent in self.agents])
+import torch
+from torch.utils.data import Dataset, DataLoader
+import pandas as pd
 
-    def load_agents(self, directory: str) -> None:
-        """Load all agents from the specified directory."""
-        ray.get([agent.load.remote(directory) for agent in self.agents])
+class TradingDataset(Dataset):
+    """
+    PyTorch Dataset for trading data.
+    """
 
-// File: src\data_acquisition.py
-# File: src/data_acquisition.py
+    def __init__(self, features: pd.DataFrame, targets: pd.Series):
+        self.X = torch.tensor(features.values, dtype=torch.float32)
+        self.y = torch.tensor(targets.values, dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+# Example usage (you can remove this if you don't need it in this file)
+# dataset = TradingDataset(X_selected, target)
+# dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+
+// File: src\data\data_provider.py
+# File: src/data/data_provider.py
 
 from abc import ABC, abstractmethod
 import ccxt
@@ -1226,216 +1149,8 @@ class BinanceDataProvider(DataProvider):
 # data_provider = BinanceDataProvider(api_key="YOUR_API_KEY", api_secret="YOUR_API_SECRET")
 # df = data_provider.get_data(symbol="BTC/USDT", timeframe="1h", start_date="2023-01-01", end_date="2023-01-31")
 
-// File: src\data_loader.py
-# src/data_loader.py
-
-import torch
-from torch.utils.data import Dataset, DataLoader
-import pandas as pd
-
-class TradingDataset(Dataset):
-    """
-    PyTorch Dataset for trading data.
-    """
-
-    def __init__(self, features: pd.DataFrame, targets: pd.Series):
-        self.X = torch.tensor(features.values, dtype=torch.float32)
-        self.y = torch.tensor(targets.values, dtype=torch.float32)
-
-    def __len__(self):
-        return len(self.X)
-
-    def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
-
-# Example usage
-# dataset = TradingDataset(X_selected, target)
-# dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
-
-
-// File: src\experiment_manager.py
-# src/experiment_manager.py
-
-import mlflow
-import optuna
-from src.agent_manager import AgentManager, TradingAgent
-from environments.crypto_trading_env import CryptoTradingEnv
-from models.model import TradingModel
-from src.rewards import ProfitReward, SharpeRatioReward
-from src.data_acquisition import BinanceDataProvider
-from src.utils import get_logger
-import torch
-
-logger = get_logger()
-
-class ExperimentManager:
-    """
-    Manages experiment tracking and hyperparameter optimization.
-    """
-
-    def __init__(self, experiment_name: str):
-        mlflow.set_experiment(experiment_name)
-
-    def run_experiment(self, params: dict, trade_history: pd.DataFrame):
-        with mlflow.start_run():
-            # Log parameters
-            mlflow.log_params(params)
-
-            # Initialize components based on params
-            data_provider = BinanceDataProvider(api_key=params['api_key'], api_secret=params['api_secret'])
-            reward_function = ProfitReward() if params['reward_type'] == 'profit' else SharpeRatioReward()
-            env = CryptoTradingEnv(data_provider=data_provider, reward_function=reward_function, initial_balance=params['initial_balance'])
-            model = TradingModel(input_size=env.observation_space.shape[0],
-                                 hidden_size=params['hidden_size'],
-                                 output_size=env.action_space.n)
-            model.load_state_dict(torch.load(params['model_path']))
-            model.eval()
-
-            # Initialize agents
-            agents = [TradingAgent.remote(env, model, reward_function) for _ in range(params['num_agents'])]
-            agent_manager = AgentManager(agents)
-
-            # Train agents
-            results = agent_manager.train_agents(num_episodes=params['num_episodes'])
-
-            # Log metrics
-            average_reward = sum(results) / len(results)
-            mlflow.log_metric("average_reward", average_reward)
-
-            logger.info(f"Experiment completed with average_reward: {average_reward}")
-
-            return average_reward
-
-    def optimize_hyperparameters(self, objective_function, num_trials: int):
-        study = optuna.create_study(direction="maximize")
-        study.optimize(objective_function, n_trials=num_trials)
-        return study.best_params
-
-# Example usage
-# experiment_manager = ExperimentManager(experiment_name="Trading Experiment")
-# best_params = experiment_manager.optimize_hyperparameters(objective_function, num_trials=50)
-
-
-// File: src\feature_engineering.py
-import pandas as pd
-import talib
-
-class FeatureEngineer:
-    def add_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        df['SMA_20'] = talib.SMA(df['close'], timeperiod=20)
-        df['EMA_20'] = talib.EMA(df['close'], timeperiod=20)
-        df['RSI'] = talib.RSI(df['close'], timeperiod=14)
-        df['MACD'], df['MACD_Signal'], df['MACD_Hist'] = talib.MACD(df['close'])
-        df['ATR'] = talib.ATR(df['high'], df['low'], df['close'])
-        df['BBANDS_Upper'], df['BBANDS_Middle'], df['BBANDS_Lower'] = talib.BBANDS(df['close'])
-        df['OBV'] = talib.OBV(df['close'], df['volume'])
-        df['ADX'] = talib.ADX(df['high'], df['low'], df['close'])
-        return df
-
-    def add_custom_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        df['pct_change'] = df['close'].pct_change()
-        df['log_return'] = np.log(df['close'] / df['close'].shift(1))
-        df['volatility'] = df['log_return'].rolling(window=20).std() * np.sqrt(252)
-        df['momentum'] = df['close'] - df['close'].shift(10)
-        df['price_volume'] = df['close'] * df['volume']
-        return df
-
-    def create_lagged_features(self, df: pd.DataFrame, lag: int = 5) -> pd.DataFrame:
-        features = ['close', 'volume', 'SMA_20', 'RSI', 'MACD', 'ATR']
-        for feature in features:
-            for i in range(1, lag + 1):
-                df[f'{feature}_lag_{i}'] = df[feature].shift(i)
-        return df
-
-    def process_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        df = self.add_technical_indicators(df)
-        df = self.add_custom_features(df)
-        df = self.create_lagged_features(df)
-        return df.dropna()
-
-// File: src\feature_selection.py
-# File: src/feature_selection.py
-
-from sklearn.feature_selection import SelectFromModel, RFE
-from sklearn.linear_model import Lasso
-from sklearn.ensemble import RandomForestClassifier
-from typing import Optional
-import pandas as pd
-
-class FeatureSelector:
-    """
-    Handles feature selection using various methods.
-    """
-
-    def __init__(self, method: str = "SelectFromModel", threshold: Optional[float] = None, max_features: Optional[int] = None):
-        """
-        Initializes the FeatureSelector.
-
-        Args:
-            method (str): Feature selection method. Options: 'SelectFromModel', 'RFE'.
-            threshold (Optional[float]): Threshold for SelectFromModel.
-            max_features (Optional[int]): Number of features for RFE.
-        """
-        self.method = method
-        self.threshold = threshold
-        self.max_features = max_features
-        self.selector = None
-
-    def fit_transform(self, X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
-        """
-        Fits the feature selector and transforms the feature set.
-
-        Args:
-            X (pd.DataFrame): Feature set.
-            y (pd.Series): Target variable.
-
-        Returns:
-            pd.DataFrame: Reduced feature set.
-        """
-        if self.method == "SelectFromModel":
-            # Using Lasso for feature selection
-            estimator = Lasso(alpha=0.01)
-            self.selector = SelectFromModel(estimator, threshold=self.threshold)
-        elif self.method == "RFE":
-            # Using RandomForest for RFE
-            estimator = RandomForestClassifier(n_estimators=100)
-            self.selector = RFE(estimator, n_features_to_select=self.max_features)
-        else:
-            raise ValueError(f"Unsupported feature selection method: {self.method}")
-
-        self.selector.fit(X, y)
-        selected_features = X.columns[self.selector.get_support()]
-        return X[selected_features]
-
-    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
-        """
-        Transforms the feature set based on the fitted selector.
-
-        Args:
-            X (pd.DataFrame): Feature set.
-
-        Returns:
-            pd.DataFrame: Reduced feature set.
-        """
-        if not self.selector:
-            raise RuntimeError("FeatureSelector not fitted yet.")
-        selected_features = X.columns[self.selector.get_support()]
-        return X[selected_features]
-
-    def get_selected_features(self) -> list:
-        """
-        Returns the list of selected feature names.
-
-        Returns:
-            list: Selected feature names.
-        """
-        if not self.selector:
-            raise RuntimeError("FeatureSelector not fitted yet.")
-        return list(self.selector.get_support(indices=True))
-
-
-// File: src\feature_store.py
-# File: src/feature_store.py
+// File: src\data\feature_store.py
+# File: src/data/feature_store.py
 
 import pandas as pd
 import os
@@ -1491,100 +1206,599 @@ class FeatureStore:
         """
         return os.listdir(self.feature_save_path)
 
+// File: src\data\__init__.py
+# File: src/data/__init__.py
 
-// File: src\main.py
-# File: main.py
+from .data_provider import DataProvider, BinanceDataProvider
+from .feature_store import FeatureStore
 
-import hydra
-from omegaconf import DictConfig
-import ray
-from agents.agent_manager import AgentManager
-from environments.crypto_trading_env import CryptoTradingEnv
-from models.trading_model import TradingModel
-from utils.logging_config import setup_logging, get_logger
-from data.data_provider import BinanceDataProvider
-from feature_engineering.feature_engineer import FeatureEngineer
-from feature_engineering.feature_selector import FeatureSelector
-from rewards.reward_functions import ProfitReward, SharpeRatioReward
-import torch
+__all__ = ['DataProvider', 'BinanceDataProvider', 'FeatureStore']
 
-@hydra.main(config_path="config", config_name="base_config")
-def main(cfg: DictConfig):
-    # Setup logging
-    setup_logging(cfg.logging)
-    logger = get_logger(__name__)
+// File: src\environments\crypto_trading_env.py
+import gym
+from gym import spaces
+import numpy as np
+import pandas as pd
+from typing import Dict, Tuple
+from utils.utils import get_logger
 
-    # Initialize Ray
-    ray.init(num_cpus=cfg.ray.num_cpus, num_gpus=cfg.ray.num_gpus)
+logger = get_logger()
 
-    # Initialize Data Provider
-    data_provider = BinanceDataProvider(api_key=cfg.exchange.api_key, api_secret=cfg.exchange.api_secret)
-    
-    # Fetch data for each trading pair
-    data = {}
-    for symbol in cfg.exchange.trading_pairs:
-        df = data_provider.get_data(
-            symbol=symbol,
-            timeframe=cfg.exchange.timeframe,
-            start_date=cfg.data.start_date,
-            end_date=cfg.data.end_date
+
+class CryptoTradingEnv(gym.Env):
+    """
+    A cryptocurrency trading environment for OpenAI gym
+    """
+    metadata = {'render.modes': ['human']}
+
+    def __init__(self, df: pd.DataFrame, initial_balance=10000, transaction_fee_percent: float = 0.001):
+        super(CryptoTradingEnv, self).__init__()
+        self.df = df
+        self.initial_balance = initial_balance
+        self.transaction_fee_percent = transaction_fee_percent
+        self.current_step = 0
+        self.balance = initial_balance
+        self.crypto_held = 0
+        
+        # Define action and observation space
+        self.action_space = spaces.Discrete(3)  # Buy, Sell, Hold
+        
+        # Observation space: Normalized prices + current balance + crypto held
+        self.observation_space = spaces.Box(
+            low=0, high=1, shape=(len(self.df.columns) + 2,), dtype=np.float32
         )
-        data[symbol] = df
-        logger.info(f"Fetched {len(df)} rows for {symbol}")
 
-    # Feature Engineering
-    feature_engineer = FeatureEngineer(cfg.features)
-    feature_selector = FeatureSelector(cfg.feature_selection)
+    def reset(self) -> np.array:
+        self.balance = self.initial_balance
+        self.crypto_held = 0
+        self.current_step = 0
+        return self._next_observation()
+
+    def step(self, action: int) -> Tuple[np.array, float, bool, Dict]:
+        self.current_step += 1
+        current_price = self._get_current_price()
+        
+        if action == 0:  # Buy
+            max_buy = self.balance / current_price
+            buy_amount = max_buy * 0.1  # Buy 10% of max possible
+            impacted_price = self._apply_market_impact(action, buy_amount)
+            cost = buy_amount * impacted_price * (1 + self.transaction_fee_percent)
+            self.balance -= cost
+            self.crypto_held += buy_amount
+        elif action == 1:  # Sell
+            sell_amount = self.crypto_held * 0.1  # Sell 10% of holdings
+            impacted_price = self._apply_market_impact(action, sell_amount)
+            revenue = sell_amount * impacted_price * (1 - self.transaction_fee_percent)
+            self.balance += revenue
+            self.crypto_held -= sell_amount
+        
+        # Hold case: do nothing
+        
+        done = self.current_step >= len(self.df) - 1
+        obs = self._next_observation()
+        reward = self._calculate_reward(current_price)
+        info = self._get_info()
+        
+        return obs, reward, done, info
+
+    def _next_observation(self) -> np.array:
+        frame = np.array(self.df.iloc[self.current_step])
+        normalized_frame = frame / frame.max()  # Simple normalization
+        obs = np.append(normalized_frame, [self.balance / self.initial_balance, self.crypto_held])
+        return obs
+
+    def _get_current_price(self) -> float:
+        return self.df.iloc[self.current_step]['close']
+
+    def _calculate_reward(self, current_price: float) -> float:
+        portfolio_value = self.balance + self.crypto_held * current_price
+        return (portfolio_value / self.initial_balance) - 1
+
+    def _get_info(self) -> Dict:
+        return {
+            'current_step': self.current_step,
+            'balance': self.balance,
+            'crypto_held': self.crypto_held,
+            'portfolio_value': self.balance + self.crypto_held * self._get_current_price()
+        }
+
+    def _apply_market_impact(self, action: int, amount: float) -> float:
+        current_price = self._get_current_price()
+        impact = 0.1 * (amount / self.df['volume'].iloc[self.current_step])
+        if action == 0:  # Buy
+            return current_price * (1 + impact)
+        elif action == 1:  # Sell
+            return current_price * (1 - impact)
+        return current_price
+
+    def render(self, mode='human'):
+        # Implement visualization logic here if needed
+        pass
+
+// File: src\environments\__init__.py
+
+
+// File: src\features\feature_engineer.py
+from typing import List
+import pandas as pd
+import numpy as np
+from ta.trend import SMAIndicator, EMAIndicator, MACD, IchimokuIndicator
+from ta.momentum import RSIIndicator, StochasticOscillator
+from ta.volatility import BollingerBands, AverageTrueRange
+from ta.volume import OnBalanceVolumeIndicator, AccumulationDistributionIndicator
+from typing import List
+
+class FeatureEngineer:
+    def __init__(self):
+        self.feature_names = []
+
+    def add_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        # Trend indicators
+        df['SMA_20'] = SMAIndicator(close=df['close'], window=20).sma_indicator()
+        df['EMA_20'] = EMAIndicator(close=df['close'], window=20).ema_indicator()
+        macd = MACD(close=df['close'])
+        df['MACD'] = macd.macd()
+        df['MACD_Signal'] = macd.macd_signal()
+        ichimoku = IchimokuIndicator(high=df['high'], low=df['low'])
+        df['Ichimoku_a'] = ichimoku.ichimoku_a()
+        df['Ichimoku_b'] = ichimoku.ichimoku_b()
+
+        # Momentum indicators
+        df['RSI'] = RSIIndicator(close=df['close']).rsi()
+        stoch = StochasticOscillator(high=df['high'], low=df['low'], close=df['close'])
+        df['Stoch_k'] = stoch.stoch()
+        df['Stoch_d'] = stoch.stoch_signal()
+
+        # Volatility indicators
+        bb = BollingerBands(close=df['close'])
+        df['BB_high'] = bb.bollinger_hband()
+        df['BB_low'] = bb.bollinger_lband()
+        df['ATR'] = AverageTrueRange(high=df['high'], low=df['low'], close=df['close']).average_true_range()
+
+        # Volume indicators
+        df['OBV'] = OnBalanceVolumeIndicator(close=df['close'], volume=df['volume']).on_balance_volume()
+        df['ADI'] = AccumulationDistributionIndicator(high=df['high'], low=df['low'], close=df['close'], volume=df['volume']).acc_dist_index()
+
+        self.feature_names.extend([col for col in df.columns if col not in ['open', 'high', 'low', 'close', 'volume']])
+        return df
+
+    def add_custom_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        df['log_return'] = np.log(df['close'] / df['close'].shift(1))
+        df['volatility'] = df['log_return'].rolling(window=20).std() * np.sqrt(252)
+        df['z_score'] = (df['close'] - df['close'].rolling(window=20).mean()) / df['close'].rolling(window=20).std()
+        df['momentum'] = df['close'] - df['close'].shift(10)
+        df['price_volume'] = df['close'] * df['volume']
+
+        self.feature_names.extend(['log_return', 'volatility', 'z_score', 'momentum', 'price_volume'])
+        return df
+
+    def create_lagged_features(self, df: pd.DataFrame, lags: List[int] = [1, 5, 10]) -> pd.DataFrame:
+        for feature in self.feature_names:
+            for lag in lags:
+                df[f'{feature}_lag_{lag}'] = df[feature].shift(lag)
+                self.feature_names.append(f'{feature}_lag_{lag}')
+        return df
+
+    def process_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = self.add_technical_indicators(df)
+        df = self.add_custom_features(df)
+        df = self.create_lagged_features(df)
+        return df.dropna()
+
+    def get_feature_names(self) -> List[str]:
+        return self.feature_names
+
+// File: src\features\feature_selector.py
+# File: src/features/feature_selection.py
+
+from sklearn.feature_selection import SelectFromModel, RFE
+from sklearn.linear_model import Lasso
+from sklearn.ensemble import RandomForestClassifier
+from typing import Optional
+import pandas as pd
+
+class FeatureSelector:
+    def __init__(self, method: str = "SelectFromModel", threshold: Optional[float] = None, max_features: Optional[int] = None):
+        self.method = method
+        self.threshold = threshold
+        self.max_features = max_features
+        self.selector = None
+
+    def fit_transform(self, X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
+        if self.method == "SelectFromModel":
+            estimator = Lasso(alpha=0.01)
+            self.selector = SelectFromModel(estimator, threshold=self.threshold)
+        elif self.method == "RFE":
+            estimator = RandomForestClassifier(n_estimators=100)
+            self.selector = RFE(estimator, n_features_to_select=self.max_features)
+        else:
+            raise ValueError(f"Unsupported feature selection method: {self.method}")
+
+        self.selector.fit(X, y)
+        selected_features = X.columns[self.selector.get_support()]
+        return X[selected_features]
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        if not self.selector:
+            raise RuntimeError("FeatureSelector not fitted yet.")
+        selected_features = X.columns[self.selector.get_support()]
+        return X[selected_features]
+
+    def get_selected_features(self) -> list:
+        if not self.selector:
+            raise RuntimeError("FeatureSelector not fitted yet.")
+        return list(self.selector.get_support(indices=True))
+
+// File: src\features\__init__.py
+from .feature_engineer import FeatureEngineer
+from .feature_selector import FeatureSelector
+
+__all__ = ['FeatureEngineer', 'FeatureSelector']
+
+
+
+// File: src\models\base_model.py
+# File: models/model.py
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class TradingModel(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout=0.2):
+        super(TradingModel, self).__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
+        self.fc = nn.Linear(hidden_size, output_size)
+        self.dropout = nn.Dropout(dropout)
     
-    processed_data = {}
-    for symbol, df in data.items():
-        df = feature_engineer.process_features(df)
-        X = df[cfg.features.feature_columns]
-        y = (df['close'].shift(-1) > df['close']).astype(int).fillna(0)
-        X_selected = feature_selector.fit_transform(X, y)
-        processed_data[symbol] = (X_selected, y)
-        logger.info(f"Processed features for {symbol}. Selected features: {X_selected.columns.tolist()}")
+    def forward(self, x):
+        # Assuming x shape: (batch, seq_length, input_size)
+        lstm_out, _ = self.lstm(x)
+        # Taking the output of the last time step
+        last_output = lstm_out[:, -1, :]
+        out = self.dropout(last_output)
+        out = self.fc(out)
+        return out
 
-    # Initialize environments and agents
-    environments = {
-        symbol: CryptoTradingEnv(
-            data=data,
-            processed_features=X,
-            reward_function=ProfitReward() if cfg.trading.reward_type == 'profit' else SharpeRatioReward(),
-            **cfg.environment
-        ) for symbol, (X, _) in processed_data.items()
-    }
+    def get_action(self, state):
+        with torch.no_grad():
+            q_values = self(torch.FloatTensor(state).unsqueeze(0))
+            return q_values.argmax().item()
 
-    agent_configs = [
-        {
-            "model": TradingModel(
-                input_size=next(iter(processed_data.values()))[0].shape[1],
-                **cfg.model
-            ),
-            "reward_function": ProfitReward() if cfg.trading.reward_type == 'profit' else SharpeRatioReward(),
-            "agent_id": f"agent_{i}"
-        } for i in range(cfg.agents.num_agents)
-    ]
+    def update(self, state, action, reward, next_state, done):
+        # Implement your update logic here (e.g., Q-learning updates)
+        pass
 
-    agent_manager = AgentManager(environments, agent_configs)
 
-    # Train agents
-    results = agent_manager.train_agents(num_episodes=cfg.training.num_episodes)
-    logger.info(f"Training completed. Results: {results}")
+// File: src\models\evaluator.py
+# models/evaluator.py
 
-    # Evaluate agents
-    evaluation_results = agent_manager.evaluate_agents(num_episodes=cfg.evaluation.num_episodes)
-    logger.info(f"Evaluation completed. Results: {evaluation_results}")
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+import numpy as np
+from typing import List
+from utils.utils import get_logger
 
-    # Save trained agents
-    agent_manager.save_agents(cfg.paths.model_save_path)
+logger = get_logger()
 
-    ray.shutdown()
+class Evaluator:
+    """
+    Evaluates trading strategies based on various performance metrics.
+    """
 
-if __name__ == "__main__":
-    main()
+    def __init__(self, trade_history: pd.DataFrame):
+        """
+        Initializes the evaluator with trade history data.
 
-// File: src\rewards.py
+        Args:
+            trade_history (pd.DataFrame): DataFrame containing trade details.
+        """
+        self.trade_history = trade_history
+
+    def calculate_sharpe_ratio(self, risk_free_rate: float = 0.0) -> float:
+        """
+        Calculates the Sharpe Ratio of the trading strategy.
+
+        Args:
+            risk_free_rate (float): The risk-free rate. Defaults to 0.0.
+
+        Returns:
+            float: Sharpe Ratio.
+        """
+        returns = self.trade_history['returns']
+        excess_returns = returns - risk_free_rate
+        sharpe_ratio = excess_returns.mean() / excess_returns.std()
+        return sharpe_ratio
+
+    def calculate_max_drawdown(self) -> float:
+        """
+        Calculates the Maximum Drawdown of the trading strategy.
+
+        Returns:
+            float: Maximum Drawdown.
+        """
+        cumulative_returns = (1 + self.trade_history['returns']).cumprod()
+        peak = cumulative_returns.expanding(min_periods=1).max()
+        drawdown = (cumulative_returns - peak) / peak
+        max_drawdown = drawdown.min()
+        return max_drawdown
+
+    def calculate_total_return(self) -> float:
+        """
+        Calculates the Total Return of the trading strategy.
+
+        Returns:
+            float: Total Return.
+        """
+        total_return = (self.trade_history['portfolio_value'].iloc[-1] / self.trade_history['portfolio_value'].iloc[0]) - 1
+        return total_return
+
+    def plot_equity_curve(self):
+        """
+        Plots the equity curve of the trading strategy.
+        """
+        cumulative_returns = (1 + self.trade_history['returns']).cumprod()
+        plt.figure(figsize=(12, 6))
+        plt.plot(cumulative_returns, label='Equity Curve')
+        plt.xlabel('Trade Number')
+        plt.ylabel('Cumulative Returns')
+        plt.title('Equity Curve')
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+
+    def plot_drawdown(self):
+        """
+        Plots the drawdown over time.
+        """
+        cumulative_returns = (1 + self.trade_history['returns']).cumprod()
+        peak = cumulative_returns.expanding(min_periods=1).max()
+        drawdown = (cumulative_returns - peak) / peak
+        plt.figure(figsize=(12, 6))
+        plt.plot(drawdown, label='Drawdown', color='red')
+        plt.xlabel('Trade Number')
+        plt.ylabel('Drawdown')
+        plt.title('Drawdown Over Time')
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+
+    def summary(self):
+        """
+        Prints a summary of key performance metrics.
+        """
+        sharpe = self.calculate_sharpe_ratio()
+        max_dd = self.calculate_max_drawdown()
+        total_ret = self.calculate_total_return()
+
+        print(f"Sharpe Ratio: {sharpe:.2f}")
+        print(f"Maximum Drawdown: {max_dd:.2%}")
+        print(f"Total Return: {total_ret:.2%}")
+
+# Example usage
+# evaluator = Evaluator(trade_history=trade_history_df)
+# evaluator.summary()
+# evaluator.plot_equity_curve()
+# evaluator.plot_drawdown()
+
+
+// File: src\models\lstm_model.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+
+class AttentionLayer(nn.Module):
+    def __init__(self, hidden_size):
+        super(AttentionLayer, self).__init__()
+        self.attention = nn.Linear(hidden_size * 2, 1)
+
+    def forward(self, hidden_states):
+        attention_weights = F.softmax(self.attention(hidden_states), dim=1)
+        context_vector = torch.sum(attention_weights * hidden_states, dim=1)
+        return context_vector, attention_weights
+
+class TradingModel(nn.Module):
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int, output_size: int, dropout: float = 0.2):
+        super(TradingModel, self).__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
+        self.attention = AttentionLayer(hidden_size)
+        self.fc1 = nn.Linear(hidden_size, hidden_size // 2)
+        self.fc2 = nn.Linear(hidden_size // 2, output_size)
+        self.dropout = nn.Dropout(dropout)
+        self.batch_norm = nn.BatchNorm1d(hidden_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        lstm_out, _ = self.lstm(x)
+        context_vector, attention_weights = self.attention(lstm_out)
+        out = self.batch_norm(context_vector)
+        out = F.relu(self.fc1(out))
+        out = self.dropout(out)
+        out = self.fc2(out)
+        return out, attention_weights
+
+    def get_action(self, state: np.ndarray) -> int:
+        with torch.no_grad():
+            state_tensor = torch.FloatTensor(state).unsqueeze(0)
+            q_values, _ = self(state_tensor)
+            return q_values.argmax().item()
+
+    def update(self, optimizer: torch.optim.Optimizer, criterion: nn.Module, 
+               state: np.ndarray, action: int, reward: float, next_state: np.ndarray, done: bool):
+        optimizer.zero_grad()
+        state_tensor = torch.FloatTensor(state).unsqueeze(0)
+        next_state_tensor = torch.FloatTensor(next_state).unsqueeze(0)
+        
+        current_q_values, _ = self(state_tensor)
+        next_q_values, _ = self(next_state_tensor)
+        
+        current_q_value = current_q_values[0][action]
+        next_q_value = next_q_values.max()
+        
+        expected_q_value = reward + (0.99 * next_q_value * (1 - int(done)))
+        
+        loss = criterion(current_q_value, expected_q_value.detach())
+        loss.backward()
+        optimizer.step()
+        
+        return loss.item()
+
+// File: src\models\timesnet_model.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class TimesBlock(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super(TimesBlock, self).__init__()
+        self.conv1 = nn.Conv1d(input_size, hidden_size, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv1d(hidden_size, hidden_size, kernel_size=3, padding=1)
+        self.ln = nn.LayerNorm(hidden_size)
+
+    def forward(self, x):
+        residual = x
+        x = self.conv1(x.transpose(1, 2)).transpose(1, 2)
+        x = F.relu(x)
+        x = self.conv2(x.transpose(1, 2)).transpose(1, 2)
+        x = self.ln(x + residual)
+        return x
+
+class TimesNet(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, output_size):
+        super(TimesNet, self).__init__()
+        self.blocks = nn.ModuleList([TimesBlock(input_size if i == 0 else hidden_size, hidden_size) for i in range(num_layers)])
+        self.fc = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        for block in self.blocks:
+            x = block(x)
+        x = x.mean(dim=1)  # Global average pooling
+        return self.fc(x)
+
+class TimesNetTradingModel(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, output_size):
+        super(TimesNetTradingModel, self).__init__()
+        self.timesnet = TimesNet(input_size, hidden_size, num_layers, output_size)
+
+    def forward(self, x):
+        return self.timesnet(x)
+
+    def get_action(self, state):
+        with torch.no_grad():
+            q_values = self(torch.FloatTensor(state).unsqueeze(0))
+            return q_values.argmax().item()
+
+    def update(self, state, action, reward, next_state, done):
+        # Implement your update logic here
+        pass
+
+// File: src\models\trainer.py
+# models/trainer.py
+
+import pytorch_lightning as pl
+import torch
+from torch.utils.data import DataLoader
+import pandas as pd
+from src.data.data_loader import TradingDataset
+from src.models.base_model import TradingModel
+from src.utils.utils import get_logger
+from src.features.feature_selector import FeatureSelector
+
+logger = get_logger()
+
+logger = get_logger()
+
+class TradingLitModel(pl.LightningModule):
+    """
+    PyTorch Lightning module for trading.
+    """
+
+    def __init__(self, model: TradingModel, learning_rate: float, loss_fn, optimizer_cls):
+        super(TradingLitModel, self).__init__()
+        self.model = model
+        self.learning_rate = learning_rate
+        self.loss_fn = loss_fn
+        self.optimizer_cls = optimizer_cls
+
+    def forward(self, x):
+        return self.model(x)
+
+    def training_step(self, batch, batch_idx):
+        X, y = batch
+        preds = self.forward(X)
+        loss = self.loss_fn(preds, y)
+        self.log('train_loss', loss)
+        return loss
+
+    def configure_optimizers(self):
+        optimizer = self.optimizer_cls(self.model.parameters(), lr=self.learning_rate)
+        return optimizer
+
+def train_model(config, train_df: pd.DataFrame, target_df: pd.Series):
+    """
+    Trains the trading model using PyTorch Lightning.
+
+    Args:
+        config (dict): Configuration dictionary.
+        train_df (pd.DataFrame): Training feature data.
+        target_df (pd.Series): Training target data.
+    """
+    # Feature Selection
+    feature_selector = FeatureSelector(threshold=config['feature_selection']['threshold'],
+                                       max_features=config['feature_selection']['max_features'])
+    X_selected = feature_selector.fit_transform(train_df, target_df)
+    logger.info(f"Selected features: {X_selected.columns.tolist()}")
+
+    # Dataset and DataLoader
+    dataset = TradingDataset(X_selected, target_df)
+    dataloader = DataLoader(dataset, batch_size=config['model']['batch_size'], shuffle=True)
+
+    # Model
+    model = TradingModel(input_size=X_selected.shape[1],
+                         hidden_size=config['model']['hidden_size'],
+                         output_size=config['model']['output_size'])
+    
+    # Lightning Module
+    lit_model = TradingLitModel(model=model,
+                                learning_rate=config['model']['learning_rate'],
+                                loss_fn=torch.nn.MSELoss(),
+                                optimizer_cls=torch.optim.Adam)
+
+    # Trainer
+    trainer = pl.Trainer(max_epochs=config['model']['epochs'],
+                         gpus=1 if torch.cuda.is_available() else 0,
+                         logger=True)
+
+    # Train
+    trainer.fit(lit_model, dataloader)
+
+    # Save the trained model
+    torch.save(model.state_dict(), config['model']['model_save_path'] + "trading_model.pth")
+    logger.info("Model training completed and saved.")
+
+# Example usage
+# train_model(config, train_features, train_targets)
+
+
+// File: src\models\transformer_model.py
+
+
+// File: src\models\__init__.py
+from .base_model import BaseModel
+from .lstm_model import LSTMModel
+from .transformer_model import TransformerModel
+from .timesnet_model import TimesNetModel
+
+__all__ = ['BaseModel', 'LSTMModel', 'TransformerModel', 'TimesNetModel']
+
+// File: src\rewards\base_reward.py
+
+
+// File: src\rewards\profit_reward.py
+
+
+// File: src\rewards\rewards.py
 import numpy as np
 from typing import List
 
@@ -1632,235 +1846,120 @@ class CombinedReward(RewardFunction):
         sharpe = self.sharpe_reward.calculate_reward(action, current_price, next_price, portfolio_value)
         return self.profit_weight * profit + self.sharpe_weight * sharpe
 
-// File: src\sentiment_analysis.py
-# File: src/sentiment_analysis.py
+// File: src\rewards\reward_functions.py
+# File: rewards/reward_functions.py
 
-from typing import List
-import pandas as pd
-from transformers import pipeline
-from src.utils import get_logger
+from abc import ABC, abstractmethod
+import numpy as np
 
-logger = get_logger()
+class RewardFunction(ABC):
+    @abstractmethod
+    def __call__(self, state: np.ndarray, action: float, reward: float, next_state: np.ndarray, done: bool) -> float:
+        pass
 
-class SentimentAnalyzer:
-    """
-    Analyzes sentiment from text data using pre-trained models.
-    """
+class ProfitReward(RewardFunction):
+    def __call__(self, state: np.ndarray, action: float, reward: float, next_state: np.ndarray, done: bool) -> float:
+        return reward
 
-    def __init__(self, model_name: str = "nlptown/bert-base-multilingual-uncased-sentiment"):
-        """
-        Initializes the SentimentAnalyzer.
+class SharpeRatioReward(RewardFunction):
+    def __init__(self, window_size: int = 20, risk_free_rate: float = 0.0):
+        self.window_size = window_size
+        self.risk_free_rate = risk_free_rate
+        self.returns = []
 
-        Args:
-            model_name (str): Name of the pre-trained sentiment analysis model.
-        """
-        self.pipeline = pipeline("sentiment-analysis", model=model_name)
-        logger.info(f"Initialized SentimentAnalyzer with model: {model_name}")
-
-    def analyze_sentiment(self, texts: List[str]) -> pd.Series:
-        """
-        Analyzes sentiment for a list of texts.
-
-        Args:
-            texts (List[str]): List of text strings.
-
-        Returns:
-            pd.Series: Sentiment scores.
-        """
-        results = self.pipeline(texts)
-        sentiments = [result['score'] if result['label'] in ['POSITIVE', '5 stars'] else -result['score'] for result in results]
-        return pd.Series(sentiments, index=range(len(sentiments)))
-
-    def add_sentiment_to_df(self, df: pd.DataFrame, text_column: str = "news_headline", sentiment_column: str = "sentiment") -> pd.DataFrame:
-        """
-        Adds sentiment scores to the DataFrame based on a text column.
-
-        Args:
-            df (pd.DataFrame): Original DataFrame.
-            text_column (str): Column containing text data.
-            sentiment_column (str): Name of the new sentiment column.
-
-        Returns:
-            pd.DataFrame: DataFrame with added sentiment scores.
-        """
-        if text_column not in df.columns:
-            logger.warning(f"Text column '{text_column}' not found in DataFrame.")
-            df[sentiment_column] = 0
-            return df
-
-        texts = df[text_column].tolist()
-        df[sentiment_column] = self.analyze_sentiment(texts)
-        logger.info(f"Added sentiment scores to DataFrame as '{sentiment_column}'.")
-        return df
-
-# Example usage
-# sentiment_analyzer = SentimentAnalyzer()
-# df = sentiment_analyzer.add_sentiment_to_df(df, text_column="news_headline")
+    def __call__(self, state: np.ndarray, action: float, reward: float, next_state: np.ndarray, done: bool) -> float:
+        self.returns.append(reward)
+        if len(self.returns) < self.window_size:
+            return 0.0
+        
+        returns_array = np.array(self.returns[-self.window_size:])
+        excess_returns = returns_array - self.risk_free_rate
+        sharpe_ratio = np.sqrt(252) * np.mean(excess_returns) / np.std(excess_returns)
+        return sharpe_ratio
 
 
-// File: src\trading.py
-# File: src/trading.py
 
-import pandas as pd
-from typing import Optional
-from src.rewards import RewardFunction
-from src.utils import get_logger
+// File: src\rewards\sharpe_ratio_reward.py
 
-logger = get_logger()
+
+// File: src\rewards\__init__.py
+from .base_reward import BaseReward
+from .profit_reward import ProfitReward
+from .sharpe_ratio_reward import SharpeRatioReward
+
+__all__ = ['BaseReward', 'ProfitReward', 'SharpeRatioReward']
+
+// File: src\trading\trading_executor.py
+# src/trading/trading_executor.py
+
+import ccxt
+from src.utils.utils import get_logger
+
+logger = get_logger(__name__)
 
 class TradingExecutor:
-    """
-    Executes trading strategies based on model predictions.
-    """
+    def __init__(self, api_key: str, api_secret: str, exchange_name: str = 'binance'):
+        self.exchange = getattr(ccxt, exchange_name)({
+            'apiKey': api_key,
+            'secret': api_secret,
+            'enableRateLimit': True,
+        })
 
-    def __init__(self, initial_balance: float = 10000.0, transaction_fee: float = 0.001, slippage: float = 0.0005):
+    def execute_trade(self, symbol: str, order_type: str, side: str, amount: float, price: float = None):
         """
-        Initializes the TradingExecutor.
+        Executes a trade on the exchange.
 
         Args:
-            initial_balance (float): Starting balance in USD.
-            transaction_fee (float): Fee per trade.
-            slippage (float): Slippage per trade.
+            symbol (str): The trading pair (e.g., 'BTC/USDT').
+            order_type (str): 'market' or 'limit'.
+            side (str): 'buy' or 'sell'.
+            amount (float): The amount of cryptocurrency to buy or sell.
+            price (float, optional): The limit price for limit orders. Defaults to None.
         """
-        self.initial_balance = initial_balance
-        self.transaction_fee = transaction_fee
-        self.slippage = slippage
-
-    def execute_backtest(self, df: pd.DataFrame, features: pd.DataFrame, target: pd.Series, reward_function: RewardFunction) -> pd.DataFrame:
-        """
-        Executes a backtest of the trading strategy.
-
-        Args:
-            df (pd.DataFrame): Original DataFrame with market data.
-            features (pd.DataFrame): Feature DataFrame used for predictions.
-            target (pd.Series): Target variable.
-            reward_function (RewardFunction): Reward function to calculate rewards.
-
-        Returns:
-            pd.DataFrame: Trade history.
-        """
-        balance = self.initial_balance
-        position = 0
-        trade_history = []
-
-        for i in range(len(features) - 1):
-            current_features = features.iloc[i].values
-            current_price = df.iloc[i]['close']
-            next_price = df.iloc[i + 1]['close']
-
-            # Dummy prediction logic (replace with actual model predictions)
-            # For example, buy if RSI < 30, sell if RSI > 70
-            rsi = features.iloc[i]['RSI']
-            if rsi < 30 and balance > 0:
-                # Buy
-                amount_to_buy = balance * 0.1  # Buy 10% of balance
-                position += amount_to_buy / current_price
-                balance -= amount_to_buy * (1 + self.transaction_fee + self.slippage)
-                action = 'Buy'
-            elif rsi > 70 and position > 0:
-                # Sell
-                proceeds = position * current_price
-                balance += proceeds * (1 - self.transaction_fee - self.slippage)
-                position = 0
-                action = 'Sell'
+        try:
+            if order_type == 'market':
+                order = self.exchange.create_market_order(symbol, side, amount)
+            elif order_type == 'limit':
+                order = self.exchange.create_limit_order(symbol, side, amount, price)
             else:
-                action = 'Hold'
+                raise ValueError("Invalid order type. Must be 'market' or 'limit'.")
+            
+            logger.info(f"Trade executed: {order}")
+            return order
+        except Exception as e:
+            logger.error(f"Error executing trade: {e}")
+            return None
 
-            # Calculate portfolio value
-            portfolio_value = balance + position * current_price
+    # Add more methods for order management, risk management, etc. 
 
-            # Calculate reward
-            reward = reward_function.calculate_reward(
-                action=action,
-                current_price=current_price,
-                next_price=next_price,
-                portfolio_value=portfolio_value
-            )
+// File: src\trading\__init__.py
+# src/trading/__init__.py
 
-            # Record trade
-            trade_history.append({
-                'step': i,
-                'action': action,
-                'balance': balance,
-                'position': position,
-                'portfolio_value': portfolio_value,
-                'reward': reward
-            })
+# This file can be left empty. 
 
-        trade_history_df = pd.DataFrame(trade_history)
-        logger.info("Backtest completed.")
-        return trade_history_df
+// File: src\utils\logging_config.py
+# File: utils/logging_config.py
 
-    def execute_live_trading(self, df: pd.DataFrame, features: pd.DataFrame, model, reward_function: RewardFunction) -> pd.DataFrame:
-        """
-        Executes live trading using the trained model.
+import logging
+import os
+from typing import Dict
 
-        Args:
-            df (pd.DataFrame): DataFrame with live market data.
-            features (pd.DataFrame): Feature DataFrame used for predictions.
-            model: Trained trading model.
-            reward_function (RewardFunction): Reward function to calculate rewards.
+def setup_logging(config: Dict):
+    log_level = getattr(logging, config.level.upper())
+    log_format = config.format
+    log_file = config.file
 
-        Returns:
-            pd.DataFrame: Trade history.
-        """
-        balance = self.initial_balance
-        position = 0
-        trade_history = []
+    logging.basicConfig(level=log_level, format=log_format)
 
-        model.eval()
+    if log_file:
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(logging.Formatter(log_format))
+        logging.getLogger().addHandler(file_handler)
 
-        with torch.no_grad():
-            for i in range(len(features) - 1):
-                current_features = torch.tensor(features.iloc[i].values, dtype=torch.float32).unsqueeze(0)
-                current_price = df.iloc[i]['close']
-                next_price = df.iloc[i + 1]['close']
+def get_logger(name: str):
+    return logging.getLogger(name)
 
-                # Get model prediction
-                outputs = model(current_features)
-                action = torch.argmax(outputs, dim=1).item()  # 0: Hold, 1: Buy, 2: Sell
-
-                # Map action to string
-                action_str = {0: 'Hold', 1: 'Buy', 2: 'Sell'}[action]
-
-                if action_str == 'Buy' and balance > 0:
-                    # Buy
-                    amount_to_buy = balance * 0.1  # Buy 10% of balance
-                    position += amount_to_buy / current_price
-                    balance -= amount_to_buy * (1 + self.transaction_fee + self.slippage)
-                elif action_str == 'Sell' and position > 0:
-                    # Sell
-                    proceeds = position * current_price
-                    balance += proceeds * (1 - self.transaction_fee - self.slippage)
-                    position = 0
-
-                # Calculate portfolio value
-                portfolio_value = balance + position * current_price
-
-                # Calculate reward
-                reward = reward_function.calculate_reward(
-                    action=action,
-                    current_price=current_price,
-                    next_price=next_price,
-                    portfolio_value=portfolio_value
-                )
-
-                # Record trade
-                trade_history.append({
-                    'step': i,
-                    'action': action_str,
-                    'balance': balance,
-                    'position': position,
-                    'portfolio_value': portfolio_value,
-                    'reward': reward
-                })
-
-        trade_history_df = pd.DataFrame(trade_history)
-        logger.info("Live trading execution completed.")
-        return trade_history_df
-
-
-// File: src\utils.py
+// File: src\utils\utils.py
 # File: src/utils.py
 
 import logging
@@ -1900,29 +1999,141 @@ def get_logger(name: Optional[str] = None) -> logging.Logger:
     return logging.getLogger(name)
 
 
-// File: src\__init__.py
-# File: src/__init__.py
+// File: src\utils\__init__.py
 
-from .data_acquisition import BinanceDataProvider
-from .feature_engineering import FeatureEngineer
-from .feature_selection import FeatureSelector
-from .feature_store import FeatureStore
-from .sentiment_analysis import SentimentAnalyzer
-from .trading import TradingExecutor
-from .utils import setup_logging, get_logger
-from .data_loader import TradingDataset
 
-__all__ = [
-    'BinanceDataProvider',
-    'FeatureEngineer',
-    'FeatureSelector',
-    'FeatureStore',
-    'SentimentAnalyzer',
-    'TradingExecutor',
-    'setup_logging',
-    'get_logger',
-    'TradingDataset'
-]
+// File: src\visualization\visualization.py
+# File: src/visualization/visualization.py
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+import numpy as np
+from typing import List, Dict
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import streamlit as st
+from src.utils.utils import get_logger
+
+logger = get_logger(__name__)
+
+class Visualization:
+    """
+    Provides various visualization methods for trading data, 
+    performance, and training progress.
+    """
+
+    def __init__(self):
+        pass
+
+    def plot_price_chart(self, df: pd.DataFrame, title: str = "Price Chart"):
+        """
+        Creates an interactive candlestick chart with optional technical indicators.
+
+        Args:
+            df (pd.DataFrame): DataFrame containing price data ('open', 'high', 'low', 'close', 'volume').
+            title (str, optional): Title of the chart. Defaults to "Price Chart".
+        """
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1, 
+                           subplot_titles=(title, "Volume"))
+
+        # Candlestick chart
+        fig.add_trace(go.Candlestick(x=df.index,
+                        open=df['open'],
+                        high=df['high'],
+                        low=df['low'],
+                        close=df['close'],
+                        name="Price"), row=1, col=1)
+
+        # Add indicators (example: SMA and RSI)
+        if 'SMA_20' in df.columns:
+            fig.add_trace(go.Scatter(x=df.index, y=df['SMA_20'], mode='lines', name='SMA 20'), row=1, col=1)
+        if 'RSI' in df.columns:
+            fig.add_trace(go.Scatter(x=df.index, y=df['RSI'], mode='lines', name='RSI'), row=2, col=1)
+
+        # Volume bar chart
+        fig.add_trace(go.Bar(x=df.index, y=df['volume'], name='Volume'), row=2, col=1)
+
+        fig.update_layout(xaxis_rangeslider_visible=False, height=800)
+        st.plotly_chart(fig)
+
+    def plot_performance_metrics(self, performance_data: Dict):
+        """
+        Visualizes key performance metrics such as equity curve, Sharpe ratio, 
+        and maximum drawdown.
+
+        Args:
+            performance_data (Dict): Dictionary containing performance data.
+                Example: {'portfolio_value': [], 'returns': [], ...}
+        """
+        df = pd.DataFrame(performance_data)
+
+        # Equity Curve
+        fig_equity = go.Figure()
+        fig_equity.add_trace(go.Scatter(x=df.index, y=df['portfolio_value'], mode='lines', name='Equity Curve'))
+        fig_equity.update_layout(title="Equity Curve", xaxis_title="Time", yaxis_title="Portfolio Value")
+        st.plotly_chart(fig_equity)
+
+        # Sharpe Ratio (Display as a single value)
+        sharpe_ratio = self.calculate_sharpe_ratio(df['returns'])
+        st.write(f"**Sharpe Ratio:** {sharpe_ratio:.2f}")
+
+        # Maximum Drawdown (Display as a single value)
+        max_drawdown = self.calculate_max_drawdown(df['portfolio_value'])
+        st.write(f"**Maximum Drawdown:** {max_drawdown:.2%}")
+
+    def display_order_history(self, order_history: List[Dict]):
+        """
+        Displays the order history in a tabular format.
+
+        Args:
+            order_history (List[Dict]): List of order dictionaries.
+        """
+        df = pd.DataFrame(order_history)
+        st.table(df)
+
+    def plot_training_progress(self, training_data: List[Dict]):
+        """
+        Visualizes the training progress, including reward/loss curves, 
+        actions over time, etc.
+
+        Args:
+            training_data (List[Dict]): List of dictionaries containing training data 
+                for each episode.
+        """
+        df = pd.DataFrame(training_data)
+
+        # Reward/Loss Curve
+        fig_reward = go.Figure()
+        fig_reward.add_trace(go.Scatter(x=df['episode'], y=df['reward'], mode='lines', name='Reward'))
+        if 'loss' in df.columns:
+            fig_reward.add_trace(go.Scatter(x=df['episode'], y=df['loss'], mode='lines', name='Loss'))
+        fig_reward.update_layout(title="Reward/Loss Curve", xaxis_title="Episode", yaxis_title="Reward/Loss")
+        st.plotly_chart(fig_reward)
+
+        # Actions Over Time (Example with bar chart)
+        if 'actions' in df.columns:
+            action_counts = df['actions'].explode().value_counts()
+            fig_actions = go.Figure(data=[go.Bar(x=action_counts.index, y=action_counts.values)])
+            fig_actions.update_layout(title="Action Distribution", xaxis_title="Action", yaxis_title="Count")
+            st.plotly_chart(fig_actions)
+
+    def calculate_sharpe_ratio(self, returns: pd.Series, risk_free_rate: float = 0.0) -> float:
+        """
+        Calculates the Sharpe Ratio.
+        """
+        excess_returns = returns - risk_free_rate
+        return np.sqrt(252) * excess_returns.mean() / excess_returns.std()
+
+    def calculate_max_drawdown(self, portfolio_value: pd.Series) -> float:
+        """
+        Calculates the Maximum Drawdown.
+        """
+        peak = portfolio_value.expanding(min_periods=1).max()
+        drawdown = (portfolio_value - peak) / peak
+        return drawdown.min()
+
+// File: src\visualization\__init__.py
 
 
 // File: tests\test_agent_manager.py
@@ -1933,7 +2144,7 @@ from unittest.mock import MagicMock
 from src.agent_manager import TradingAgent, AgentManager
 from environments.crypto_trading_env import CryptoTradingEnv
 from models.model import TradingModel
-from src.rewards import ProfitReward
+from src.rewards.rewards import ProfitReward
 
 class TestAgentManager(unittest.TestCase):
 
@@ -1971,7 +2182,7 @@ if __name__ == '__main__':
 
 import unittest
 from unittest.mock import patch
-from src.data_acquisition import BinanceDataProvider
+from src.data.data_acquisition import BinanceDataProvider
 import pandas as pd
 
 class TestBinanceDataProvider(unittest.TestCase):
@@ -2004,8 +2215,8 @@ if __name__ == '__main__':
 import unittest
 from unittest.mock import MagicMock
 from environments.crypto_trading_env import CryptoTradingEnv
-from src.data_acquisition import DataProvider
-from src.rewards import RewardFunction
+from src.data.data_acquisition import DataProvider
+from src.rewards.rewards import RewardFunction
 import numpy as np
 
 class TestCryptoTradingEnv(unittest.TestCase):
@@ -2169,7 +2380,7 @@ if __name__ == '__main__':
 import unittest
 import pandas as pd
 from src.trading import TradingExecutor
-from src.rewards import ProfitReward
+from src.rewards.rewards import ProfitReward
 
 class TestTradingExecutor(unittest.TestCase):
 
@@ -2285,7 +2496,7 @@ if __name__ == '__main__':
 
 import unittest
 import logging
-from src.utils import setup_logging, get_logger
+from utils.utils import setup_logging, get_logger
 import os
 
 class TestUtils(unittest.TestCase):

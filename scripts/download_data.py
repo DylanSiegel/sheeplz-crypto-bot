@@ -1,10 +1,10 @@
 # scripts/download_data.py
 
 import argparse
-from src.data_acquisition import BinanceDataProvider
-from src.feature_engineering import FeatureEngineer
 import pandas as pd
-from src.utils import setup_logging, get_logger
+from src.data.data_acquisition import BinanceDataProvider  
+from src.features.feature_engineer import FeatureEngineer  # Corrected import
+from src.utils.utils import setup_logging, get_logger  # Corrected import
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Download Historical Data")

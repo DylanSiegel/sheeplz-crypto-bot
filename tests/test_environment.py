@@ -3,8 +3,8 @@
 import unittest
 from unittest.mock import MagicMock
 from environments.crypto_trading_env import CryptoTradingEnv
-from src.data_acquisition import DataProvider
-from src.rewards import RewardFunction
+from src.data.data_acquisition import DataProvider
+from src.rewards.rewards import RewardFunction
 import numpy as np
 
 class TestCryptoTradingEnv(unittest.TestCase):

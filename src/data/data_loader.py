@@ -1,4 +1,4 @@
-# src/data_loader.py
+# src/data/data_loader.py
 
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -19,6 +19,6 @@ class TradingDataset(Dataset):
     def __getitem__(self, idx):
         return self.X[idx], self.y[idx]
 
-# Example usage
+# Example usage (you can remove this if you don't need it in this file)
 # dataset = TradingDataset(X_selected, target)
 # dataloader = DataLoader(dataset, batch_size=32, shuffle=True)

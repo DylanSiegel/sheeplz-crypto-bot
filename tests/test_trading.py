@@ -3,7 +3,7 @@
 import unittest
 import pandas as pd
 from src.trading import TradingExecutor
-from src.rewards import ProfitReward
+from src.rewards.rewards import ProfitReward
 
 class TestTradingExecutor(unittest.TestCase):
 

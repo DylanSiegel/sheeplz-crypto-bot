@@ -2,9 +2,9 @@
 
 import argparse
 import pandas as pd
-from src.feature_engineering import FeatureEngineer
-from src.feature_selection import FeatureSelector
-from src.utils import setup_logging, get_logger
+from src.features.feature_engineer import FeatureEngineer  # Corrected import
+from src.features.feature_selector import FeatureSelector  # Corrected import
+from src.utils.utils import setup_logging, get_logger  # Corrected import
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Preprocess Raw Data")

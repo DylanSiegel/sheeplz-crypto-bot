@@ -2,13 +2,13 @@
 
 import argparse
 import pandas as pd
-from src.data_acquisition import BinanceDataProvider
-from src.feature_engineering import FeatureEngineer
-from src.feature_selection import FeatureSelector
-from src.trading import TradingExecutor
-from models.evaluator import Evaluator
-from src.rewards import ProfitReward, SharpeRatioReward
-from src.utils import setup_logging, get_logger
+from src.data.data_acquisition import BinanceDataProvider
+from src.features.feature_engineer import FeatureEngineer
+from src.features.feature_selector import FeatureSelector  # Corrected
+from src.trading.trading_executor import TradingExecutor  # Corrected
+from src.models.evaluator import Evaluator
+from src.rewards.rewards import ProfitReward, SharpeRatioReward
+from src.utils.utils import setup_logging, get_logger
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Backtest Trading Strategies")

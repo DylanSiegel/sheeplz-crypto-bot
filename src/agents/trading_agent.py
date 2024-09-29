@@ -1,7 +1,7 @@
 import torch
 from environments.crypto_trading_env import CryptoTradingEnv
 from models.trading_model import TradingModel
-from src.rewards import RewardFunction
+from src.rewards.rewards import RewardFunction
 
 class TradingAgent:
     def __init__(self, env: CryptoTradingEnv, model: TradingModel, reward_function: RewardFunction, agent_id: str):
