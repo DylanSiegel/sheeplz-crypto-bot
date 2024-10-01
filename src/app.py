@@ -2,7 +2,7 @@
 
 import streamlit as st
 from src.visualization.visualization import Visualization
-from src.data.data_acquisition import BinanceDataProvider 
+from src.data import MexcDataProvider
 from src.features.feature_engineer import FeatureEngineer
 from src.models.lstm_model import TradingModel  # Or your preferred model
 import torch

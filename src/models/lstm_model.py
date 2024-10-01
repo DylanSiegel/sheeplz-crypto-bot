@@ -1,7 +1,10 @@
+# File: src/models/lstm_model.py
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from src.models.base_model import BaseModel
 
 class AttentionLayer(nn.Module):
     def __init__(self, hidden_size):
@@ -13,9 +16,9 @@ class AttentionLayer(nn.Module):
         context_vector = torch.sum(attention_weights * hidden_states, dim=1)
         return context_vector, attention_weights
 
-class TradingModel(nn.Module):
+class LSTMModel(BaseModel):
     def __init__(self, input_size: int, hidden_size: int, num_layers: int, output_size: int, dropout: float = 0.2):
-        super(TradingModel, self).__init__()
+        super(LSTMModel, self).__init__()
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
         self.attention = AttentionLayer(hidden_size)
         self.fc1 = nn.Linear(hidden_size, hidden_size // 2)
@@ -34,20 +37,20 @@ class TradingModel(nn.Module):
 
     def get_action(self, state: np.ndarray) -> int:
         with torch.no_grad():
-            state_tensor = torch.FloatTensor(state).unsqueeze(0)
+            state_tensor = torch.FloatTensor(state).unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, input_size)
             q_values, _ = self(state_tensor)
             return q_values.argmax().item()
 
     def update(self, optimizer: torch.optim.Optimizer, criterion: nn.Module, 
                state: np.ndarray, action: int, reward: float, next_state: np.ndarray, done: bool):
         optimizer.zero_grad()
-        state_tensor = torch.FloatTensor(state).unsqueeze(0)
-        next_state_tensor = torch.FloatTensor(next_state).unsqueeze(0)
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, input_size)
+        next_state_tensor = torch.FloatTensor(next_state).unsqueeze(0).unsqueeze(0)
         
-        current_q_values, _ = self(state_tensor)
+        q_values, _ = self(state_tensor)
         next_q_values, _ = self(next_state_tensor)
         
-        current_q_value = current_q_values[0][action]
+        current_q_value = q_values[0][action]
         next_q_value = next_q_values.max()
         
         expected_q_value = reward + (0.99 * next_q_value * (1 - int(done)))

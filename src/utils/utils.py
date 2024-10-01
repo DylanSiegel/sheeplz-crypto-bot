@@ -1,8 +1,7 @@
-# File: src/utils.py
-
 import logging
 import os
 import sys
+from typing import Optional
 
 def setup_logging(log_level: str = "INFO", log_file: Optional[str] = None):
     """

@@ -1,31 +1,60 @@
 // File: config\base_config.yaml
-# File: config/base_config.yaml
-
-defaults:
-  - _self_
-  - exchange: exchange_config
-  - features: features_config
-  - model: model_config
-  - trading: trading_config
-  - logging: logging_config
-  - ray: ray_config
+exchange:
+  name: mexc
+  symbol: BTC/USDT
+  timeframe: 1h
+  trading_pairs:
+    - BTC/USDT
+    - ETH/USDT
+  rate_limit: 1200
 
 data:
   start_date: "2023-01-01"
   end_date: "2023-12-31"
 
-agents:
-  num_agents: 5
+features:
+  target_column: close
+  feature_selection:
+    method: "SelectFromModel"
+    threshold: 0.01
+    max_features: 10
+
+model:
+  type: LSTM
+  params:
+    input_size: 10
+    hidden_size: 64
+    num_layers: 2
+    output_size: 3
+
+agent:
+  type: DQN
+  params:
+    learning_rate: 0.001
+    gamma: 0.99
+    epsilon_start: 1.0
+    epsilon_end: 0.01
+    epsilon_decay: 0.995
 
 training:
+  batch_size: 32
   num_episodes: 1000
+  test_size: 0.2
+  random_state: 42
 
 evaluation:
   num_episodes: 100
 
-paths:
-  model_save_path: "./models/saved/"
+trading:
+  initial_balance: 10000
+  transaction_fee_percent: 0.001
 
+logging:
+  level: INFO
+  file: logs/trading_bot.log
+
+paths:
+  model_save_path: models/
 
 // File: config\exchange_config.yaml
 # config/exchange_config.yaml
@@ -77,6 +106,9 @@ features:
 
 
 // File: config\logging_config.yaml
+level: INFO
+format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+file: 'logs/app.log'
 
 
 // File: config\model_config.yaml
@@ -112,106 +144,15 @@ trading:
   trade_history_limit: 1000  # Number of past trades to keep
 
 
-// File: models\trainer.py
-# models/trainer.py
-
-import pytorch_lightning as pl
-import torch
-from torch.utils.data import DataLoader
-import pandas as pd
-from src.data.data_loader import TradingDataset  # Corrected import
-from src.models.lstm_model import TradingModel  # Assuming TradingModel is in lstm_model.py
-from src.utils.utils import get_logger           # Corrected import
-from src.features.feature_selector import FeatureSelector # Corrected import
-
-logger = get_logger()
-
-logger = get_logger()
-
-class TradingLitModel(pl.LightningModule):
-    """
-    PyTorch Lightning module for trading.
-    """
-
-    def __init__(self, model: TradingModel, learning_rate: float, loss_fn, optimizer_cls):
-        super(TradingLitModel, self).__init__()
-        self.model = model
-        self.learning_rate = learning_rate
-        self.loss_fn = loss_fn
-        self.optimizer_cls = optimizer_cls
-
-    def forward(self, x):
-        return self.model(x)
-
-    def training_step(self, batch, batch_idx):
-        X, y = batch
-        preds = self.forward(X)
-        loss = self.loss_fn(preds, y)
-        self.log('train_loss', loss)
-        return loss
-
-    def configure_optimizers(self):
-        optimizer = self.optimizer_cls(self.model.parameters(), lr=self.learning_rate)
-        return optimizer
-
-def train_model(config, train_df: pd.DataFrame, target_df: pd.Series):
-    """
-    Trains the trading model using PyTorch Lightning.
-
-    Args:
-        config (dict): Configuration dictionary.
-        train_df (pd.DataFrame): Training feature data.
-        target_df (pd.Series): Training target data.
-    """
-    # Feature Selection
-    feature_selector = FeatureSelector(threshold=config['feature_selection']['threshold'],
-                                       max_features=config['feature_selection']['max_features'])
-    X_selected = feature_selector.fit_transform(train_df, target_df)
-    logger.info(f"Selected features: {X_selected.columns.tolist()}")
-
-    # Dataset and DataLoader
-    dataset = TradingDataset(X_selected, target_df)
-    dataloader = DataLoader(dataset, batch_size=config['model']['batch_size'], shuffle=True)
-
-    # Model
-    model = TradingModel(input_size=X_selected.shape[1],
-                         hidden_size=config['model']['hidden_size'],
-                         output_size=config['model']['output_size'])
-    
-    # Lightning Module
-    lit_model = TradingLitModel(model=model,
-                                learning_rate=config['model']['learning_rate'],
-                                loss_fn=torch.nn.MSELoss(),
-                                optimizer_cls=torch.optim.Adam)
-
-    # Trainer
-    trainer = pl.Trainer(max_epochs=config['model']['epochs'],
-                         gpus=1 if torch.cuda.is_available() else 0,
-                         logger=True)
-
-    # Train
-    trainer.fit(lit_model, dataloader)
-
-    # Save the trained model
-    torch.save(model.state_dict(), config['model']['model_save_path'] + "trading_model.pth")
-    logger.info("Model training completed and saved.")
-
-# Example usage
-# train_model(config, train_features, train_targets)
-
-
-// File: models\__init__.py
-
-
 // File: scripts\backtest.py
-# scripts/backtest.py
+# File: scripts/backtest.py
 
 import argparse
 import pandas as pd
-from src.data.data_acquisition import BinanceDataProvider
+from src.data import MexcDataProvider  # Updated import
 from src.features.feature_engineer import FeatureEngineer
-from src.features.feature_selector import FeatureSelector  # Corrected
-from src.trading.trading_executor import TradingExecutor  # Corrected
+from src.features.feature_selector import FeatureSelector
+from src.trading.trading_executor import TradingExecutor
 from src.models.evaluator import Evaluator
 from src.rewards.rewards import ProfitReward, SharpeRatioReward
 from src.utils.utils import setup_logging, get_logger
@@ -233,7 +174,7 @@ def main():
     args = parse_args()
 
     # Initialize Data Provider
-    data_provider = BinanceDataProvider(api_key='YOUR_API_KEY', api_secret='YOUR_API_SECRET')
+    data_provider = MexcDataProvider(api_key='YOUR_API_KEY', api_secret='YOUR_API_SECRET')
     logger.info(f"Fetching historical data for {args.symbol} from {args.start_date} to {args.end_date}")
     df = data_provider.get_data(symbol=args.symbol, timeframe=args.timeframe, start_date=args.start_date, end_date=args.end_date)
 
@@ -269,13 +210,13 @@ if __name__ == "__main__":
 
 
 // File: scripts\download_data.py
-# scripts/download_data.py
+# File: scripts/download_data.py
 
 import argparse
 import pandas as pd
-from src.data.data_acquisition import BinanceDataProvider  
-from src.features.feature_engineer import FeatureEngineer  # Corrected import
-from src.utils.utils import setup_logging, get_logger  # Corrected import
+from src.data import MexcDataProvider  # Updated import
+from src.features.feature_engineer import FeatureEngineer
+from src.utils.utils import setup_logging, get_logger
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Download Historical Data")
@@ -294,7 +235,7 @@ def main():
     args = parse_args()
 
     # Initialize Data Provider
-    data_provider = BinanceDataProvider(api_key='YOUR_API_KEY', api_secret='YOUR_API_SECRET')
+    data_provider = MexcDataProvider(api_key='YOUR_API_KEY', api_secret='YOUR_API_SECRET')
 
     # Fetch data
     logger.info(f"Downloading data for {args.symbol} from {args.start_date} to {args.end_date}")
@@ -442,11 +383,13 @@ if __name__ == "__main__":
 
 
 // File: scripts\run.py
+# File: scripts/run.py
+
 import hydra
 from omegaconf import DictConfig
 from src.agents.agent_manager import AgentManager 
 from src.environments.crypto_trading_env import CryptoTradingEnv 
-from src.data.data_acquisition import BinanceDataProvider
+from src.data import MexcDataProvider
 from src.features.feature_engineer import FeatureEngineer
 from src.features.feature_selector import FeatureSelector 
 from src.utils.utils import setup_logging, get_logger
@@ -459,7 +402,7 @@ def main(cfg: DictConfig):
     logger.info(f"Running in {cfg.base.mode} mode")
 
     # Initialize Data Provider and fetch data
-    data_provider = BinanceDataProvider(api_key=cfg.exchange.api_key, api_secret=cfg.exchange.api_secret)
+    data_provider = MexcDataProvider(api_key=cfg.exchange.api_key, api_secret=cfg.exchange.api_secret)
     data = {}
     for symbol in cfg.exchange.trading_pairs:
         df = data_provider.get_data(symbol=symbol, timeframe=cfg.exchange.timeframe, start_date=cfg.data.start_date, end_date=cfg.data.end_date)
@@ -502,6 +445,7 @@ def main(cfg: DictConfig):
 if __name__ == "__main__":
     main()
 
+
 // File: scripts\run_visualization.py
 
 
@@ -511,7 +455,7 @@ if __name__ == "__main__":
 import argparse
 import optuna
 from src.models.trainer import train_model  # Corrected import
-from src.data.data_acquisition import BinanceDataProvider
+from src.data import MexcDataProvider
 from src.features.feature_engineer import FeatureEngineer  # Corrected import
 from src.features.feature_selector import FeatureSelector
 from src.trading.trading_executor import TradingExecutor 
@@ -635,7 +579,7 @@ if __name__ == "__main__":
 
 import streamlit as st
 from src.visualization.visualization import Visualization
-from src.data.data_acquisition import BinanceDataProvider 
+from src.data import MexcDataProvider
 from src.features.feature_engineer import FeatureEngineer
 from src.models.lstm_model import TradingModel  # Or your preferred model
 import torch
@@ -695,256 +639,328 @@ if __name__ == '__main__':
     # st.experimental_rerun() # Optional: Uncomment for auto-refresh
 
 // File: src\main.py
-import hydra
-from omegaconf import DictConfig
-import torch
-import pandas as pd
-import numpy as np
-from typing import Dict
-import time
-from src.data.data_acquisition import BinanceDataProvider
-from src.features.feature_engineer import FeatureEngineer
-from src.models.lstm_model import TradingModel
-from src.agents.agent_manager import AgentManager
-from src.environments.crypto_trading_env import CryptoTradingEnv
-from src.rewards.rewards import get_reward_function
-from utils.utils import setup_logging, get_logger
-from dotenv import load_dotenv  # For loading environment variables
-import os
-from src.visualization.visualization import Visualization # Import for visualizations
+# src/main.py
 
-logger = get_logger(__name__)
+import asyncio
+from data.acquisition.mexc_data_provider import MexcDataProvider
+from data.preprocessing.feature_engineering import FeatureEngineer
+from data.storage.data_loader import create_data_loader
+from utils.config_manager import ConfigManager
 
-# Load environment variables from .env file
-load_dotenv(os.path.join(os.path.dirname(__file__), '../../config/secrets.env'))
-
-def preprocess_data(data: pd.DataFrame, feature_engineer: FeatureEngineer) -> pd.DataFrame:
-    processed_data = feature_engineer.process_features(data)
-    return processed_data.fillna(0)  # Fill NaN values with 0 to avoid issues
-
-def create_environment(data: pd.DataFrame, config: DictConfig) -> CryptoTradingEnv:
-    reward_function = get_reward_function(config.trading.reward_function)
-    return CryptoTradingEnv(data, initial_balance=config.trading.initial_balance, 
-                            transaction_fee=config.trading.transaction_fee, 
-                            reward_function=reward_function)
-
-def train_model(model: TradingModel, env: CryptoTradingEnv, config: DictConfig, visualization: Visualization):
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.model.learning_rate)
-    criterion = torch.nn.MSELoss()
-    training_data = [] # Initialize for training visualization
-
-    for episode in range(config.training.num_episodes):
-        state = env.reset()
-        total_reward = 0
-        done = False
-        actions_taken = [] # Initialize for tracking actions in the episode
-
-        while not done:
-            action = model.get_action(state)
-            actions_taken.append(action)
-            next_state, reward, done, _ = env.step(action)
-            loss = model.update(optimizer, criterion, state, action, reward, next_state, done)
-            state = next_state
-            total_reward += reward
-
-        # Collect data for training visualization
-        episode_data = {
-            'episode': episode,
-            'loss': loss, 
-            'reward': total_reward,
-            'actions': actions_taken 
-        }
-        training_data.append(episode_data)
-
-        if (episode + 1) % 10 == 0:
-            logger.info(f"Episode {episode + 1}/{config.training.num_episodes}, Total Reward: {total_reward:.2f}, Loss: {loss:.4f}")
-            visualization.plot_training_progress(training_data) # Visualize training progress
-
-def evaluate_model(model: TradingModel, env: CryptoTradingEnv, config: DictConfig) -> float:
-    total_reward = 0
-    num_episodes = config.evaluation.num_episodes
-
-    for _ in range(num_episodes):
-        state = env.reset()
-        done = False
-        episode_reward = 0
-
-        while not done:
-            action = model.get_action(state)
-            state, reward, done, _ = env.step(action)
-            episode_reward += reward
-
-        total_reward += episode_reward
-
-    avg_reward = total_reward / num_episodes
-    logger.info(f"Evaluation - Average Reward: {avg_reward:.2f}")
-    return avg_reward
-
-def live_trading(model: TradingModel, data_provider: BinanceDataProvider, feature_engineer: FeatureEngineer, config: DictConfig, visualization: Visualization):
-    portfolio_values = []
-    returns = []
-    order_history = []
-
-    while True:
-        # Fetch latest data
-        latest_data = data_provider.get_data(config.exchange.symbol, config.exchange.timeframe, 
-                                             limit=config.live_trading.lookback_period)
-        
-        # Preprocess data
-        processed_data = preprocess_data(latest_data, feature_engineer)
-        
-        # Get the latest state
-        latest_state = processed_data.iloc[-1].values
-        
-        # Get model prediction
-        action = model.get_action(latest_state)
-        
-        # Execute trade based on the action
-        if action == 1:  # Buy
-            order = data_provider.place_order(config.exchange.symbol, 'market', 'buy', config.live_trading.trade_amount)
-            logger.info(f"Buy order placed: {order}")
-            # ... (Update portfolio_values, returns, order_history)
-        elif action == 2:  # Sell
-            order = data_provider.place_order(config.exchange.symbol, 'market', 'sell', config.live_trading.trade_amount)
-            logger.info(f"Sell order placed: {order}")
-            # ... (Update portfolio_values, returns, order_history)
-        else:
-            logger.info("Hold position")
-        
-        # Visualizations (Update periodically)
-        visualization.plot_price_chart(latest_data)
-        performance_data = {
-            'portfolio_value': portfolio_values,
-            'returns': returns,
-            # ...
-        }
-        visualization.plot_performance_metrics(performance_data)
-        visualization.display_order_history(order_history)
-
-        # Wait for next trading interval
-        time.sleep(config.live_trading.interval)
-
-@hydra.main(config_path="../../config", config_name="base_config", version_base=None)
-def main(cfg: DictConfig):
-    setup_logging(cfg.logging)
-    visualization = Visualization() # Instantiate for all modes
+async def main():
+    config = ConfigManager("config/base_config.yaml")
     
     # Initialize data provider
-    data_provider = BinanceDataProvider(api_key=cfg.exchange.api_key, api_secret=cfg.exchange.api_secret)
-    
+    data_provider = MexcDataProvider(
+        api_key=config.get_exchange_credentials()['api_key'],
+        api_secret=config.get_exchange_credentials()['api_secret']
+    )
+
     # Fetch historical data
-    historical_data = data_provider.get_data(cfg.exchange.symbol, cfg.exchange.timeframe, 
-                                             start_date=cfg.data.start_date, end_date=cfg.data.end_date)
-    
-    # Initialize feature engineer
+    symbol = config.get('exchange.symbol')
+    timeframe = config.get('exchange.timeframe')
+    start_date = config.get('data.start_date')
+    end_date = config.get('data.end_date')
+
+    historical_data = await data_provider.get_historical_data(symbol, timeframe, start_date, end_date)
+
+    # Process features
     feature_engineer = FeatureEngineer()
-    
-    # Preprocess data
-    processed_data = preprocess_data(historical_data, feature_engineer)
-    
-    # Create environment
-    env = create_environment(processed_data, cfg)
-    
-    # Initialize model
-    model = TradingModel(input_size=len(feature_engineer.get_feature_names()), 
-                         hidden_size=cfg.model.hidden_size, 
-                         num_layers=cfg.model.num_layers, 
-                         output_size=env.action_space.n)
-    
-    if cfg.mode == "train":
-        # Train the model
-        train_model(model, env, cfg, visualization)
-        
-        # Save the trained model
-        torch.save(model.state_dict(), cfg.paths.model_save_path)
-        logger.info(f"Model saved to {cfg.paths.model_save_path}")
-        
-        # Evaluate the model
-        evaluate_model(model, env, cfg)
-    
-    elif cfg.mode == "evaluate":
-        # Load the trained model
-        model.load_state_dict(torch.load(cfg.paths.model_save_path))
-        logger.info(f"Model loaded from {cfg.paths.model_save_path}")
-        
-        # Evaluate the model
-        evaluate_model(model, env, cfg)
-    
-    elif cfg.mode == "live":
-        # Load the trained model
-        model.load_state_dict(torch.load(cfg.paths.model_save_path))
-        logger.info(f"Model loaded from {cfg.paths.model_save_path}")
-        
-        # Start live trading
-        live_trading(model, data_provider, feature_engineer, cfg, visualization)
-    
-    else:
-        logger.error(f"Invalid mode: {cfg.mode}")
+    processed_data = feature_engineer.process_features(historical_data)
+
+    # Create data loader
+    features = processed_data[feature_engineer.get_feature_names()]
+    targets = processed_data['close']  # Assuming 'close' price as the target
+    data_loader = create_data_loader(features, targets, batch_size=32)
+
+    # Print some information
+    print(f"Processed data shape: {processed_data.shape}")
+    print(f"Features: {feature_engineer.get_feature_names()}")
+
+    # Fetch real-time data
+    real_time_data = await data_provider.get_real_time_data(symbol)
+    print(f"Real-time data for {symbol}: {real_time_data}")
+
+    # Get account balance
+    balance = await data_provider.get_account_balance()
+    print(f"Account balance: {balance}")
+
+    # Close connections
+    await data_provider.close()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
 
 // File: src\__init__.py
+# File: src/__init__.py
 
+from .agents import TradingAgent, AgentManager
+from .data import DataProvider, BinanceDataProvider, FeatureStore, TradingDataset, MexcWebsocketClient
+from .environments import CryptoTradingEnv
+from .features import FeatureEngineer, FeatureSelector
+from .models import BaseModel, LSTMModel, TimesNetModel, TransformerModel
+from .rewards import RewardFunction, ProfitReward, SharpeRatioReward
+from .trading import TradingExecutor
+from .utils import setup_logging, get_logger
+from .visualization import Visualization
+
+__all__ = [
+    'TradingAgent', 'AgentManager',
+    'DataProvider', 'BinanceDataProvider', 'FeatureStore', 'TradingDataset', 'MexcWebsocketClient',
+    'CryptoTradingEnv',
+    'FeatureEngineer', 'FeatureSelector',
+    'BaseModel', 'LSTMModel', 'TimesNetModel', 'TransformerModel',
+    'RewardFunction', 'ProfitReward', 'SharpeRatioReward',
+    'TradingExecutor',
+    'setup_logging', 'get_logger',
+    'Visualization'
+]
+
+
+// File: src\agents\agent_factory.py
+# src/agents/agent_factory.py
+
+from typing import Dict, Any
+from .base_agent import BaseAgent
+from .dqn_agent import DQNAgent
+from ..models.base_model import BaseModel
+from ..utils.config_manager import ConfigManager
+
+class AgentFactory:
+    @staticmethod
+    def create(config: ConfigManager, model: BaseModel) -> BaseAgent:
+        agent_type = config.get('agent.type')
+        agent_params = config.get('agent.params')
+
+        if agent_type == 'DQN':
+            return DQNAgent(model, **agent_params)
+        # Add more agent types as needed
+        else:
+            raise ValueError(f"Unsupported agent type: {agent_type}")
 
 // File: src\agents\agent_manager.py
+# File: src/agents/agent_manager.py
+
 from typing import List, Dict, Any
 import ray
-from .trading_agent import TradingAgent
-from environments.crypto_trading_env import CryptoTradingEnv
-from src.models.lstm_model import TradingModel # Corrected import
-from src.rewards.rewards import RewardFunction, get_reward_function
-from utils.utils import get_logger
+from src.agents.trading_agent import TradingAgent  # Corrected import
+from src.environments.crypto_trading_env import CryptoTradingEnv  # Corrected import
+from src.models.lstm_model import LSTMModel  # Corrected import
+from src.rewards.rewards import RewardFunction, get_reward_function  # Corrected import
+from src.utils.utils import get_logger  # Corrected import
 
 logger = get_logger(__name__)
 
 @ray.remote
 class RemoteTradingAgent(TradingAgent):
+    """
+    Ray remote wrapper for TradingAgent.
+    This allows TradingAgent instances to run in parallel as Ray actors.
+    """
     pass
 
 class AgentManager:
+    """
+    Manages multiple TradingAgent instances using Ray for parallel execution.
+    Handles training, evaluation, saving, loading, and selection of the best-performing agents.
+    """
+
     def __init__(self, agent_configs: List[Dict[str, Any]], environments: Dict[str, CryptoTradingEnv]):
-        ray.init(ignore_reinit_error=True)
+        """
+        Initializes the AgentManager with agent configurations and environments.
+
+        Args:
+            agent_configs (List[Dict[str, Any]]): List of agent configuration dictionaries.
+                Each config should contain:
+                    - 'timeframe': str, e.g., '1m'
+                    - 'hidden_size': int, size of LSTM hidden layer
+                    - 'num_layers': int, number of LSTM layers
+                    - 'reward_function': str, e.g., 'profit', 'sharpe_ratio', 'combined'
+                    - 'agent_id': str, unique identifier for the agent
+            environments (Dict[str, CryptoTradingEnv]): Dictionary mapping timeframes to CryptoTradingEnv instances.
+        """
+        # Initialize Ray
+        if not ray.is_initialized():
+            ray.init(ignore_reinit_error=True)
+            logger.info("Ray initialized for AgentManager.")
+
         self.agents = []
+        self._initialize_agents(agent_configs, environments)
+
+    def _initialize_agents(self, agent_configs: List[Dict[str, Any]], environments: Dict[str, CryptoTradingEnv]):
+        """
+        Initializes and launches remote trading agents based on configurations.
+
+        Args:
+            agent_configs (List[Dict[str, Any]]): List of agent configuration dictionaries.
+            environments (Dict[str, CryptoTradingEnv]): Dictionary mapping timeframes to CryptoTradingEnv instances.
+        """
         for config in agent_configs:
-            env = environments[config['timeframe']]
-            model = TradingModel(
+            timeframe = config.get('timeframe')
+            if timeframe not in environments:
+                logger.error(f"Timeframe '{timeframe}' not found in provided environments.")
+                continue
+
+            env = environments[timeframe]
+            model = LSTMModel(
                 input_size=env.observation_space.shape[0],
-                hidden_size=config['hidden_size'],
-                num_layers=config['num_layers'],
+                hidden_size=config.get('hidden_size', 64),
+                num_layers=config.get('num_layers', 2),
                 output_size=env.action_space.n
             )
-            reward_function = get_reward_function(config['reward_function'])
-            agent = RemoteTradingAgent.remote(env, model, reward_function, config['agent_id'])
-            self.agents.append(agent)
+            reward_function = get_reward_function(config.get('reward_function', 'profit'))
+            agent_id = config.get('agent_id', f"agent_{len(self.agents)+1}")
 
-    def train_agents(self, num_episodes: int):
+            # Instantiate the remote agent
+            agent = RemoteTradingAgent.remote(env, model, reward_function, agent_id)
+            self.agents.append(agent)
+            logger.info(f"Initialized RemoteTradingAgent '{agent_id}' for timeframe '{timeframe}'.")
+
+    def train_agents(self, num_episodes: int) -> List[Dict[str, Any]]:
+        """
+        Trains all agents for a specified number of episodes.
+
+        Args:
+            num_episodes (int): Number of training episodes.
+
+        Returns:
+            List[Dict[str, Any]]: List of training results from each agent.
+        """
+        if not self.agents:
+            logger.warning("No agents to train.")
+            return []
+
+        logger.info(f"Starting training for {len(self.agents)} agents for {num_episodes} episodes each.")
         results = ray.get([agent.train.remote(num_episodes) for agent in self.agents])
         for result in results:
-            logger.info(f"Agent {result['agent_id']} - Average Reward: {result['average_reward']:.2f}")
+            agent_id = result.get('agent_id', 'Unknown')
+            avg_reward = result.get('average_reward', 0.0)
+            logger.info(f"Agent '{agent_id}' - Average Reward: {avg_reward:.2f}")
         return results
 
-    def evaluate_agents(self, num_episodes: int):
+    def evaluate_agents(self, num_episodes: int) -> List[Dict[str, Any]]:
+        """
+        Evaluates all agents for a specified number of episodes.
+
+        Args:
+            num_episodes (int): Number of evaluation episodes.
+
+        Returns:
+            List[Dict[str, Any]]: List of evaluation results from each agent.
+        """
+        if not self.agents:
+            logger.warning("No agents to evaluate.")
+            return []
+
+        logger.info(f"Starting evaluation for {len(self.agents)} agents for {num_episodes} episodes each.")
         results = ray.get([agent.evaluate.remote(num_episodes) for agent in self.agents])
         for result in results:
-            logger.info(f"Agent {result['agent_id']} - Evaluation Average Reward: {result['average_reward']:.2f}")
+            agent_id = result.get('agent_id', 'Unknown')
+            avg_reward = result.get('average_reward', 0.0)
+            logger.info(f"Agent '{agent_id}' - Evaluation Average Reward: {avg_reward:.2f}")
         return results
 
-    def get_best_agent(self):
+    def get_best_agent(self) -> str:
+        """
+        Identifies the best-performing agent based on evaluation results.
+
+        Returns:
+            str: ID of the best-performing agent.
+        """
         evaluation_results = self.evaluate_agents(num_episodes=100)
-        best_agent = max(evaluation_results, key=lambda x: x['average_reward'])
-        return best_agent['agent_id']
+        if not evaluation_results:
+            logger.warning("No evaluation results to determine the best agent.")
+            return ""
+
+        best_agent = max(evaluation_results, key=lambda x: x.get('average_reward', float('-inf')))
+        best_agent_id = best_agent.get('agent_id', '')
+        logger.info(f"Best agent identified: '{best_agent_id}' with Average Reward: {best_agent.get('average_reward', 0.0):.2f}")
+        return best_agent_id
 
     def save_agents(self, directory: str):
-        ray.get([agent.save.remote(directory) for agent in self.agents])
+        """
+        Saves all agents' models and performance histories to the specified directory.
+
+        Args:
+            directory (str): Directory path to save the agents' data.
+        """
+        if not self.agents:
+            logger.warning("No agents to save.")
+            return
+
+        logger.info(f"Saving all agents to directory: '{directory}'.")
+        results = ray.get([agent.save.remote(directory) for agent in self.agents])
+        logger.info("All agents have been saved successfully.")
 
     def load_agents(self, directory: str):
-        ray.get([agent.load.remote(directory) for agent in self.agents])
+        """
+        Loads all agents' models and performance histories from the specified directory.
+
+        Args:
+            directory (str): Directory path from where to load the agents' data.
+        """
+        if not self.agents:
+            logger.warning("No agents to load.")
+            return
+
+        logger.info(f"Loading all agents from directory: '{directory}'.")
+        results = ray.get([agent.load.remote(directory) for agent in self.agents])
+        logger.info("All agents have been loaded successfully.")
 
     def shutdown(self):
-        ray.shutdown()
+        """
+        Shuts down Ray to free up resources.
+        """
+        if ray.is_initialized():
+            ray.shutdown()
+            logger.info("Ray has been shutdown successfully.")
+        else:
+            logger.info("Ray was not initialized; no need to shutdown.")
+
 
 // File: src\agents\base_agent.py
+# File: src/agents/base_agent.py
+
+from abc import ABC, abstractmethod
+from src.environments.crypto_trading_env import CryptoTradingEnv
+from src.models.base_model import BaseModel
+from src.rewards.base_reward import RewardFunction
+
+class BaseAgent(ABC):
+    @abstractmethod
+    def train(self, num_episodes: int):
+        """
+        Trains the agent over a specified number of episodes.
+        """
+        pass
+
+    @abstractmethod
+    def act(self, state):
+        """
+        Determines the action to take based on the current state.
+        """
+        pass
+
+    @abstractmethod
+    def evaluate(self, num_episodes: int):
+        """
+        Evaluates the agent's performance over a specified number of episodes.
+        """
+        pass
+
+    @abstractmethod
+    def save(self, path: str):
+        """
+        Saves the agent's model and performance history.
+        """
+        pass
+
+    @abstractmethod
+    def load(self, path: str):
+        """
+        Loads the agent's model and performance history.
+        """
+        pass
 
 
 // File: src\agents\dqn_agent.py
@@ -954,516 +970,676 @@ class AgentManager:
 
 
 // File: src\agents\trading_agent.py
+# File: src/agents/trading_agent.py
+
 import torch
-from environments.crypto_trading_env import CryptoTradingEnv
-from models.trading_model import TradingModel
+import torch.nn as nn
+from src.environments.crypto_trading_env import CryptoTradingEnv
+from src.models.lstm_model import LSTMModel  # Corrected import
 from src.rewards.rewards import RewardFunction
+import logging
+
+logger = logging.getLogger(__name__)
 
 class TradingAgent:
-    def __init__(self, env: CryptoTradingEnv, model: TradingModel, reward_function: RewardFunction, agent_id: str):
+    def __init__(self, env: CryptoTradingEnv, model: LSTMModel, reward_function: RewardFunction, agent_id: str, learning_rate: float = 0.001):
+        """
+        Initializes the TradingAgent.
+
+        Args:
+            env (CryptoTradingEnv): The trading environment.
+            model (LSTMModel): The DRL model.
+            reward_function (RewardFunction): The reward function.
+            agent_id (str): Unique identifier for the agent.
+            learning_rate (float): Learning rate for the optimizer.
+        """
         self.env = env
         self.model = model
         self.reward_function = reward_function
         self.agent_id = agent_id
         self.performance_history = []
 
+        # Initialize optimizer and criterion
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
+        self.criterion = nn.MSELoss()
+
     def train(self, num_episodes: int):
+        """
+        Trains the agent over a specified number of episodes.
+
+        Args:
+            num_episodes (int): Number of training episodes.
+
+        Returns:
+            float: Average reward over episodes.
+        """
         total_reward = 0
-        for episode in range(num_episodes):
+        for episode in range(1, num_episodes + 1):
+            state = self.env.reset()
+            done = False
+            episode_reward = 0
+            loss = 0.0  # Initialize loss for the episode
+
+            while not done:
+                action = self.act(state)
+                next_state, reward, done, info = self.env.step(action)
+
+                # Extract necessary components from state and next_state for reward calculation
+                current_price = state[-2]  # Assuming second last element is current_price
+                next_price = next_state[-2]  # Assuming second last element is next_price
+                portfolio_value = next_state[-1]  # Assuming last element is portfolio_value
+
+                adjusted_reward = self.reward_function.calculate_reward(
+                    action, current_price, next_price, portfolio_value
+                )
+
+                # Update the model
+                loss = self.model.update(
+                    optimizer=self.optimizer,
+                    criterion=self.criterion,
+                    state=state,
+                    action=action,
+                    reward=adjusted_reward,
+                    next_state=next_state,
+                    done=done
+                )
+
+                episode_reward += adjusted_reward
+                state = next_state
+
+            self.performance_history.append({
+                'episode': episode,
+                'reward': episode_reward,
+                'loss': loss
+            })
+            total_reward += episode_reward
+
+            if episode % 10 == 0 or episode == 1:
+                logger.info(f"Agent {self.agent_id} - Episode {episode}/{num_episodes}, "
+                            f"Reward: {episode_reward:.2f}, Loss: {loss:.4f}")
+
+        average_reward = total_reward / num_episodes
+        logger.info(f"Agent {self.agent_id} - Training completed. Average Reward: {average_reward:.2f}")
+        return average_reward
+
+    def act(self, state):
+        """
+        Determines the action to take based on the current state.
+
+        Args:
+            state (np.ndarray): Current state.
+
+        Returns:
+            int: Action to take.
+        """
+        return self.model.get_action(state)
+
+    def evaluate(self, num_episodes: int):
+        """
+        Evaluates the agent over a specified number of episodes.
+
+        Args:
+            num_episodes (int): Number of evaluation episodes.
+
+        Returns:
+            float: Average reward over episodes.
+        """
+        total_reward = 0
+        for episode in range(1, num_episodes + 1):
             state = self.env.reset()
             done = False
             episode_reward = 0
 
             while not done:
-                action = self.model.get_action(state)
-                next_state, reward, done, _ = self.env.step(action)
-                adjusted_reward = self.reward_function.calculate_reward(state, action, reward, next_state, done)
-                self.model.update(state, action, adjusted_reward, next_state, done)
-                episode_reward += adjusted_reward
-                state = next_state
-
-            self.performance_history.append(episode_reward)
-            total_reward += episode_reward
-
-        return total_reward / num_episodes
-
-    def act(self, state):
-        return self.model.get_action(state)
-
-    def evaluate(self, num_episodes: int):
-        total_reward = 0
-        for _ in range(num_episodes):
-            state = self.env.reset()
-            done = False
-            while not done:
                 action = self.act(state)
-                state, reward, done, _ = self.env.step(action)
-                total_reward += reward
-        return total_reward / num_episodes
+                state, reward, done, info = self.env.step(action)
+                episode_reward += reward
+
+            total_reward += episode_reward
+            logger.info(f"Agent {self.agent_id} - Evaluation Episode {episode} - Reward: {episode_reward:.2f}")
+
+        average_reward = total_reward / num_episodes
+        logger.info(f"Agent {self.agent_id} - Evaluation completed. Average Reward: {average_reward:.2f}")
+        return average_reward
 
     def save(self, path: str):
+        """
+        Saves the agent's model and performance history.
+
+        Args:
+            path (str): Directory path to save the agent's data.
+        """
         torch.save({
             'model_state_dict': self.model.state_dict(),
             'performance_history': self.performance_history
         }, f"{path}/{self.agent_id}.pth")
+        logger.info(f"Agent {self.agent_id} - Model and performance history saved to '{path}/{self.agent_id}.pth'.")
 
     def load(self, path: str):
-        checkpoint = torch.load(f"{path}/{self.agent_id}.pth")
+        """
+        Loads the agent's model and performance history.
+
+        Args:
+            path (str): Directory path from where to load the agent's data.
+        """
+        checkpoint = torch.load(f"{path}/{self.agent_id}.pth", map_location=torch.device('cpu'))
         self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.performance_history = checkpoint['performance_history']
+        self.performance_history = checkpoint.get('performance_history', [])
+        logger.info(f"Agent {self.agent_id} - Model and performance history loaded from '{path}/{self.agent_id}.pth'.")
+
 
 // File: src\agents\__init__.py
+# File: src/agents/__init__.py
+
 from .trading_agent import TradingAgent
 from .agent_manager import AgentManager
 
 __all__ = ['TradingAgent', 'AgentManager']
 
-// File: src\data\data_acquisition.py
-import ccxt
-import pandas as pd
-from typing import List
-import time
-from src.utils.utils import get_logger  # Use absolute import here too
-
-logger = get_logger(__name__)
-
-class BinanceDataProvider:
-    def __init__(self, api_key: str, api_secret: str):
-        self.exchange = ccxt.binance({
-            'apiKey': api_key,
-            'secret': api_secret,
-            'enableRateLimit': True,
-        })
-        self.rate_limit = 1200  # Binance rate limit (requests per minute)
-        self.last_request_time = 0
-
-    def _rate_limit(self):
-        current_time = time.time()
-        elapsed = current_time - self.last_request_time
-        if elapsed < 60 / self.rate_limit:
-            time.sleep((60 / self.rate_limit) - elapsed)
-        self.last_request_time = time.time()
-
-    def get_data(self, symbol: str, timeframe: str, start_date: str, end_date: str) -> pd.DataFrame:
-        try:
-            self._rate_limit()
-            data = self.exchange.fetch_ohlcv(symbol, timeframe, self.exchange.parse8601(start_date), limit=1000)
-            df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            df.set_index('timestamp', inplace=True)
-            return df
-        except Exception as e:
-            logger.error(f"Error fetching data: {str(e)}")
-            return pd.DataFrame()
-
-    def get_multiple_symbols(self, symbols: List[str], timeframe: str, start_date: str, end_date: str) -> dict:
-        data = {}
-        for symbol in symbols:
-            data[symbol] = self.get_data(symbol, timeframe, start_date, end_date)
-        return data
-
-    def get_account_balance(self) -> dict:
-        try:
-            self._rate_limit()
-            balance = self.exchange.fetch_balance()
-            return {asset: balance[asset] for asset in balance if balance[asset]['total'] > 0}
-        except Exception as e:
-            logger.error(f"Error fetching account balance: {str(e)}")
-            return {}
-
-    def place_order(self, symbol: str, order_type: str, side: str, amount: float, price: float = None) -> dict:
-        try:
-            self._rate_limit()
-            order = self.exchange.create_order(symbol, order_type, side, amount, price)
-            return order
-        except Exception as e:
-            logger.error(f"Error placing order: {str(e)}")
-            return {}
-
-// File: src\data\data_loader.py
-# src/data/data_loader.py
-
-import torch
-from torch.utils.data import Dataset, DataLoader
-import pandas as pd
-
-class TradingDataset(Dataset):
-    """
-    PyTorch Dataset for trading data.
-    """
-
-    def __init__(self, features: pd.DataFrame, targets: pd.Series):
-        self.X = torch.tensor(features.values, dtype=torch.float32)
-        self.y = torch.tensor(targets.values, dtype=torch.float32)
-
-    def __len__(self):
-        return len(self.X)
-
-    def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
-
-# Example usage (you can remove this if you don't need it in this file)
-# dataset = TradingDataset(X_selected, target)
-# dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
-
-// File: src\data\data_provider.py
-# File: src/data/data_provider.py
-
-from abc import ABC, abstractmethod
-import ccxt
-import pandas as pd
-
-class DataProvider(ABC):
-    """Abstract base class for data providers."""
-
-    @abstractmethod
-    def get_data(self, symbol: str, timeframe: str, start_date: str, end_date: str) -> pd.DataFrame:
-        """
-        Retrieves historical data for a given symbol and timeframe.
-        """
-        pass
-
-class BinanceDataProvider(DataProvider):
-    """Data provider for Binance exchange."""
-
-    def __init__(self, api_key: str, api_secret: str):
-        self.exchange = ccxt.binance({
-            'apiKey': api_key,
-            'secret': api_secret,
-        })
-
-    def get_data(self, symbol: str, timeframe: str, start_date: str, end_date: str) -> pd.DataFrame:
-        # Fetch data from Binance API
-        data = self.exchange.fetch_ohlcv(symbol, timeframe, since=start_date, limit=1000)  # Adjust limit as needed
-
-        # Convert to pandas DataFrame
-        df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-
-        return df
-
-# Example usage
-# data_provider = BinanceDataProvider(api_key="YOUR_API_KEY", api_secret="YOUR_API_SECRET")
-# df = data_provider.get_data(symbol="BTC/USDT", timeframe="1h", start_date="2023-01-01", end_date="2023-01-31")
-
-// File: src\data\feature_store.py
-# File: src/data/feature_store.py
-
-import pandas as pd
-import os
-from typing import Optional
-
-class FeatureStore:
-    """
-    Manages the storage and retrieval of features.
-    """
-
-    def __init__(self, feature_save_path: str):
-        """
-        Initializes the FeatureStore.
-
-        Args:
-            feature_save_path (str): Path to save the features.
-        """
-        self.feature_save_path = feature_save_path
-        os.makedirs(self.feature_save_path, exist_ok=True)
-
-    def save_features(self, df: pd.DataFrame, filename: str):
-        """
-        Saves the feature DataFrame to a CSV file.
-
-        Args:
-            df (pd.DataFrame): Feature DataFrame.
-            filename (str): Name of the file to save.
-        """
-        filepath = os.path.join(self.feature_save_path, filename)
-        df.to_csv(filepath, index=False)
-
-    def load_features(self, filename: str) -> pd.DataFrame:
-        """
-        Loads features from a CSV file.
-
-        Args:
-            filename (str): Name of the file to load.
-
-        Returns:
-            pd.DataFrame: Loaded feature DataFrame.
-        """
-        filepath = os.path.join(self.feature_save_path, filename)
-        if not os.path.exists(filepath):
-            raise FileNotFoundError(f"Feature file not found: {filepath}")
-        return pd.read_csv(filepath)
-
-    def list_features(self) -> list:
-        """
-        Lists all saved feature files.
-
-        Returns:
-            list: List of feature filenames.
-        """
-        return os.listdir(self.feature_save_path)
 
 // File: src\data\__init__.py
-# File: src/data/__init__.py
+from .data_provider import DataProvider, FeatureStore, TradingDataset, MexcWebsocketClient
+# Removed BinanceDataProvider
 
-from .data_provider import DataProvider, BinanceDataProvider
-from .feature_store import FeatureStore
+__all__ = ['DataProvider', 'FeatureStore', 'TradingDataset', 'MexcWebsocketClient']
+# Removed 'BinanceDataProvider' from the list
 
-__all__ = ['DataProvider', 'BinanceDataProvider', 'FeatureStore']
+
+// File: src\data\acquisition\mexc\mexc_data_provider.py
+# acquisition/mexc/mexc_data_provider.py
+
+from typing import List, Dict, Any
+from .mexc_rest_api import MexcRestAPI
+from .mexc_websocket import MexcWebSocket
+from .mexc_order_book import MexcOrderBook
+from ..data_provider import DataProvider
+
+class MexcDataProvider(DataProvider):
+    def __init__(self, api_key: str, api_secret: str):
+        self.rest_api = MexcRestAPI(api_key, api_secret)
+        self.websocket = MexcWebSocket(api_key, api_secret)
+        self.order_book = MexcOrderBook()
+
+    async def get_historical_data(self, symbol: str, interval: str, start_time: int, end_time: int) -> List[Dict[str, Any]]:
+        return await self.rest_api.get_klines(symbol, interval, start_time, end_time)
+
+    async def stream_data(self, symbols: List[str], callback: callable):
+        await self.websocket.subscribe_klines(symbols, callback)
+
+    async def get_account_info(self) -> Dict[str, Any]:
+        return await self.rest_api.get_account_info()
+
+    async def place_order(self, symbol: str, side: str, type: str, quantity: float, price: float = None) -> Dict[str, Any]:
+        return await self.rest_api.place_order(symbol, side, type, quantity, price)
+
+    async def get_order_book(self, symbol: str, limit: int = 100) -> Dict[str, Any]:
+        return await self.order_book.get_order_book(symbol, limit)
+
+    async def stream_order_book(self, symbol: str, callback: callable):
+        await self.websocket.subscribe_order_book(symbol, callback)
+
+// File: src\data\acquisition\mexc\mexc_order_book.py
+# acquisition/mexc/mexc_order_book.py
+
+from typing import Dict, Any
+from .mexc_rest_api import MexcRestAPI
+
+class MexcOrderBook:
+    def __init__(self):
+        self.rest_api = None
+
+    async def get_order_book(self, symbol: str, limit: int = 100) -> Dict[str, Any]:
+        if not self.rest_api:
+            raise ValueError("REST API client not initialized. Call set_rest_api first.")
+        
+        endpoint = "/api/v3/depth"
+        params = {
+            "symbol": symbol,
+            "limit": limit
+        }
+        return await self.rest_api._request("GET", endpoint, params)
+
+    def set_rest_api(self, rest_api: MexcRestAPI):
+        self.rest_api = rest_api
+
+// File: src\data\acquisition\mexc\mexc_rest_api.py
+# acquisition/mexc/mexc_rest_api.py
+
+import aiohttp
+import time
+from typing import Dict, Any, List
+from .utils.mexc_auth import generate_signature
+from .utils.mexc_endpoints import MEXC_API_URL
+from .utils.mexc_error_handling import handle_rest_error
+
+class MexcRestAPI:
+    def __init__(self, api_key: str, api_secret: str):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.session = None
+
+    async def __aenter__(self):
+        self.session = aiohttp.ClientSession()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.session.close()
+
+    async def _request(self, method: str, endpoint: str, params: Dict = None, signed: bool = False) -> Any:
+        url = f"{MEXC_API_URL}{endpoint}"
+        headers = {"X-MEXC-APIKEY": self.api_key}
+
+        if signed:
+            params = params or {}
+            params['timestamp'] = int(time.time() * 1000)
+            params['signature'] = generate_signature(self.api_secret, params)
+
+        try:
+            async with self.session.request(method, url, params=params, headers=headers) as response:
+                if response.status != 200:
+                    text = await response.text()
+                    handle_rest_error(response.status, text)
+                return await response.json()
+        except aiohttp.ClientError as e:
+            handle_rest_error(None, str(e))
+
+    async def get_klines(self, symbol: str, interval: str, start_time: int, end_time: int) -> List[Dict[str, Any]]:
+        endpoint = "/api/v3/klines"
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "startTime": start_time,
+            "endTime": end_time
+        }
+        return await self._request("GET", endpoint, params)
+
+    async def get_account_info(self) -> Dict[str, Any]:
+        endpoint = "/api/v3/account"
+        return await self._request("GET", endpoint, signed=True)
+
+    async def place_order(self, symbol: str, side: str, type: str, quantity: float, price: float = None) -> Dict[str, Any]:
+        endpoint = "/api/v3/order"
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "type": type,
+            "quantity": quantity
+        }
+        if price:
+            params["price"] = price
+        return await self._request("POST", endpoint, params, signed=True)
+
+// File: src\data\acquisition\mexc\mexc_websocket.py
+# acquisition/mexc/mexc_websocket.py
+
+import asyncio
+import websockets
+import json
+import logging
+from typing import List
+from .utils.mexc_auth import generate_signature
+from .utils.mexc_error_handling import handle_websocket_error
+
+class MexcWebSocket:
+    def __init__(self, api_key: str, api_secret: str):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.ws_url = "wss://wbs.mexc.com/ws"
+        self.logger = logging.getLogger(__name__)
+
+    async def _connect(self):
+        return await websockets.connect(self.ws_url)
+
+    async def _subscribe(self, websocket, channel: str):
+        await websocket.send(json.dumps({
+            "method": "SUBSCRIPTION",
+            "params": [channel],
+            "id": 1
+        }))
+
+    async def subscribe_klines(self, symbols: List[str], callback: callable):
+        async with await self._connect() as websocket:
+            for symbol in symbols:
+                await self._subscribe(websocket, f"{symbol}@kline_1m")
+            
+            while True:
+                try:
+                    response = await websocket.recv()
+                    data = json.loads(response)
+                    await callback(data)
+                except Exception as e:
+                    self.logger.error(f"Error in kline stream: {str(e)}")
+                    handle_websocket_error(e)
+
+    async def subscribe_order_book(self, symbol: str, callback: callable):
+        async with await self._connect() as websocket:
+            await self._subscribe(websocket, f"{symbol}@depth20")
+            
+            while True:
+                try:
+                    response = await websocket.recv()
+                    data = json.loads(response)
+                    await callback(data)
+                except Exception as e:
+                    self.logger.error(f"Error in order book stream: {str(e)}")
+                    handle_websocket_error(e)
+
+// File: src\data\acquisition\mexc\__init__.py
+# acquisition/mexc/__init__.py
+
+from .mexc_data_provider import MexcDataProvider
+from .mexc_websocket import MexcWebSocket
+from .mexc_rest_api import MexcRestAPI
+from .mexc_order_book import MexcOrderBook
+
+__all__ = ['MexcDataProvider', 'MexcWebSocket', 'MexcRestAPI', 'MexcOrderBook']
+
+// File: src\data\acquisition\mexc\utils\mexc_auth.py
+# acquisition/mexc/utils/mexc_auth.py
+
+import hmac
+import hashlib
+from urllib.parse import urlencode
+
+def generate_signature(api_secret: str, params: dict) -> str:
+    query_string = urlencode(params)
+    return hmac.new(api_secret.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
+
+// File: src\data\acquisition\mexc\utils\mexc_endpoints.py
+# acquisition/mexc/utils/mexc_endpoints.py
+
+MEXC_API_URL = "https://api.mexc.com"
+
+// File: src\data\acquisition\mexc\utils\mexc_error_handling.py
+# acquisition/mexc/utils/mexc_error_handling.py
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+class MexcAPIException(Exception):
+    def __init__(self, status_code, message):
+        self.status_code = status_code
+        self.message = message
+        super().__init__(self.message)
+
+def handle_rest_error(status_code: int, error_message: str):
+    logger.error(f"MEXC API error: status_code={status_code}, message={error_message}")
+    raise MexcAPIException(status_code, error_message)
+
+def handle_websocket_error(error: Exception):
+    logger.error(f"MEXC WebSocket error: {str(error)}")
+    # You might want to implement reconnection logic here
+    raise error
+
+// File: src\data\acquisition\mexc\utils\__init__.py
+# acquisition/mexc/utils/__init__.py
+
+from .mexc_auth import generate_signature
+from .mexc_endpoints import MEXC_API_URL
+from .mexc_error_handling import handle_rest_error, handle_websocket_error
+
+__all__ = ['generate_signature', 'MEXC_API_URL', 'handle_rest_error', 'handle_websocket_error']
+
+// File: src\data\storage\data_loader.py
+# src/data/storage/data_loader.py
+
+import pandas as pd
+from torch.utils.data import Dataset, DataLoader
+from typing import Tuple
+import torch
+
+class TradingDataset(Dataset):
+    def __init__(self, features: pd.DataFrame, targets: pd.Series):
+        self.features = torch.tensor(features.values, dtype=torch.float32)
+        self.targets = torch.tensor(targets.values, dtype=torch.float32)
+
+    def __len__(self) -> int:
+        return len(self.features)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.features[idx], self.targets[idx]
+
+def create_data_loader(features: pd.DataFrame, targets: pd.Series, batch_size: int, shuffle: bool = True) -> DataLoader:
+    dataset = TradingDataset(features, targets)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+
+// File: src\data\storage\__init__.py
+
 
 // File: src\environments\crypto_trading_env.py
+# File: src/environments/crypto_trading_env.py
+
 import gym
 from gym import spaces
 import numpy as np
 import pandas as pd
-from typing import Dict, Tuple
-from utils.utils import get_logger
+from typing import Dict, Tuple, Any
+from src.utils.utils import get_logger
 
-logger = get_logger()
-
+logger = get_logger(__name__)
 
 class CryptoTradingEnv(gym.Env):
     """
-    A cryptocurrency trading environment for OpenAI gym
+    A cryptocurrency trading environment for OpenAI gym.
     """
+
     metadata = {'render.modes': ['human']}
 
-    def __init__(self, df: pd.DataFrame, initial_balance=10000, transaction_fee_percent: float = 0.001):
+    def __init__(self, df: pd.DataFrame, initial_balance: float = 10000.0, 
+                 transaction_fee_percent: float = 0.001):
+        """
+        Initializes the CryptoTradingEnv.
+
+        Args:
+            df (pd.DataFrame): Historical OHLCV data.
+            initial_balance (float, optional): Starting balance in USD. Defaults to 10000.0.
+            transaction_fee_percent (float, optional): Transaction fee percentage. Defaults to 0.001.
+        """
         super(CryptoTradingEnv, self).__init__()
-        self.df = df
+        self.df = df.reset_index()
         self.initial_balance = initial_balance
         self.transaction_fee_percent = transaction_fee_percent
         self.current_step = 0
         self.balance = initial_balance
-        self.crypto_held = 0
-        
+        self.crypto_held = 0.0
+        self.max_steps = len(self.df) - 1
+
         # Define action and observation space
-        self.action_space = spaces.Discrete(3)  # Buy, Sell, Hold
+        # Actions: 0 - Hold, 1 - Buy, 2 - Sell
+        self.action_space = spaces.Discrete(3)
         
-        # Observation space: Normalized prices + current balance + crypto held
+        # Observation space: [open, high, low, close, volume, balance, crypto_held]
+        # Normalize OHLCV by dividing by maximum value in dataset
         self.observation_space = spaces.Box(
-            low=0, high=1, shape=(len(self.df.columns) + 2,), dtype=np.float32
+            low=0, high=1, shape=(len(self.df.columns) - 1 + 2,), dtype=np.float32
         )
 
-    def reset(self) -> np.array:
+    def reset(self) -> np.ndarray:
+        """
+        Resets the environment to the initial state.
+
+        Returns:
+            np.ndarray: Initial observation.
+        """
         self.balance = self.initial_balance
-        self.crypto_held = 0
+        self.crypto_held = 0.0
         self.current_step = 0
         return self._next_observation()
 
-    def step(self, action: int) -> Tuple[np.array, float, bool, Dict]:
+    def step(self, action: int) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
+        """
+        Executes a trading action.
+
+        Args:
+            action (int): Action to take (0: Hold, 1: Buy, 2: Sell).
+
+        Returns:
+            Tuple[np.ndarray, float, bool, Dict[str, Any]]:
+                - observation (np.ndarray): Next observation.
+                - reward (float): Reward obtained.
+                - done (bool): Whether the episode has ended.
+                - info (Dict[str, Any]): Additional information.
+        """
         self.current_step += 1
+        done = self.current_step >= self.max_steps
+
         current_price = self._get_current_price()
-        
-        if action == 0:  # Buy
-            max_buy = self.balance / current_price
-            buy_amount = max_buy * 0.1  # Buy 10% of max possible
-            impacted_price = self._apply_market_impact(action, buy_amount)
-            cost = buy_amount * impacted_price * (1 + self.transaction_fee_percent)
-            self.balance -= cost
-            self.crypto_held += buy_amount
-        elif action == 1:  # Sell
-            sell_amount = self.crypto_held * 0.1  # Sell 10% of holdings
-            impacted_price = self._apply_market_impact(action, sell_amount)
-            revenue = sell_amount * impacted_price * (1 - self.transaction_fee_percent)
-            self.balance += revenue
-            self.crypto_held -= sell_amount
-        
-        # Hold case: do nothing
-        
-        done = self.current_step >= len(self.df) - 1
-        obs = self._next_observation()
+        current_volume = self.df.at[self.current_step, 'volume']
+
+        if action == 1:  # Buy
+            # Calculate maximum affordable amount (10% of balance)
+            max_buy = (self.balance * 0.1) / current_price
+            if max_buy > 0:
+                impacted_price = self._apply_market_impact(action, max_buy, current_volume)
+                cost = max_buy * impacted_price * (1 + self.transaction_fee_percent)
+                self.balance -= cost
+                self.crypto_held += max_buy
+                logger.debug(f"Buy: Amount={max_buy}, Cost={cost}, New Balance={self.balance}, Crypto Held={self.crypto_held}")
+        elif action == 2:  # Sell
+            # Calculate maximum sellable amount (10% of holdings)
+            sell_amount = self.crypto_held * 0.1
+            if sell_amount > 0:
+                impacted_price = self._apply_market_impact(action, sell_amount, current_volume)
+                revenue = sell_amount * impacted_price * (1 - self.transaction_fee_percent)
+                self.balance += revenue
+                self.crypto_held -= sell_amount
+                logger.debug(f"Sell: Amount={sell_amount}, Revenue={revenue}, New Balance={self.balance}, Crypto Held={self.crypto_held}")
+        else:
+            logger.debug("Hold action taken.")
+
+        # Calculate reward
         reward = self._calculate_reward(current_price)
-        info = self._get_info()
-        
+        logger.debug(f"Step {self.current_step}: Reward={reward}")
+
+        # Get next observation
+        obs = self._next_observation()
+
+        # Info dictionary
+        info = self._get_info(current_price)
+
         return obs, reward, done, info
 
-    def _next_observation(self) -> np.array:
-        frame = np.array(self.df.iloc[self.current_step])
-        normalized_frame = frame / frame.max()  # Simple normalization
-        obs = np.append(normalized_frame, [self.balance / self.initial_balance, self.crypto_held])
-        return obs
+    def _next_observation(self) -> np.ndarray:
+        """
+        Generates the next observation.
+
+        Returns:
+            np.ndarray: Normalized feature vector.
+        """
+        frame = self.df.iloc[self.current_step].drop('timestamp').values
+        normalized_frame = frame / self.df.drop('timestamp', axis=1).max().values
+        obs = np.concatenate([normalized_frame, 
+                              [self.balance / self.initial_balance, 
+                               self.crypto_held / self.initial_balance]])
+        return obs.astype(np.float32)
 
     def _get_current_price(self) -> float:
-        return self.df.iloc[self.current_step]['close']
+        """
+        Retrieves the current closing price.
+
+        Returns:
+            float: Current closing price.
+        """
+        return self.df.at[self.current_step, 'close']
 
     def _calculate_reward(self, current_price: float) -> float:
-        portfolio_value = self.balance + self.crypto_held * current_price
-        return (portfolio_value / self.initial_balance) - 1
+        """
+        Calculates the reward based on portfolio value change.
 
-    def _get_info(self) -> Dict:
+        Args:
+            current_price (float): Current closing price.
+
+        Returns:
+            float: Calculated reward.
+        """
+        portfolio_value = self.balance + self.crypto_held * current_price
+        reward = (portfolio_value - self.initial_balance) / self.initial_balance
+        return reward
+
+    def _get_info(self, current_price: float) -> Dict[str, Any]:
+        """
+        Provides additional information about the current state.
+
+        Args:
+            current_price (float): Current closing price.
+
+        Returns:
+            Dict[str, Any]: Information dictionary.
+        """
+        portfolio_value = self.balance + self.crypto_held * current_price
         return {
             'current_step': self.current_step,
             'balance': self.balance,
             'crypto_held': self.crypto_held,
-            'portfolio_value': self.balance + self.crypto_held * self._get_current_price()
+            'portfolio_value': portfolio_value
         }
 
-    def _apply_market_impact(self, action: int, amount: float) -> float:
-        current_price = self._get_current_price()
-        impact = 0.1 * (amount / self.df['volume'].iloc[self.current_step])
-        if action == 0:  # Buy
-            return current_price * (1 + impact)
-        elif action == 1:  # Sell
-            return current_price * (1 - impact)
-        return current_price
+    def _apply_market_impact(self, action: int, amount: float, volume: float) -> float:
+        """
+        Applies market impact to the trade price based on action and amount.
+
+        Args:
+            action (int): Action type (1: Buy, 2: Sell).
+            amount (float): Amount of cryptocurrency to trade.
+            volume (float): Current volume.
+
+        Returns:
+            float: Impacted price.
+        """
+        impact_factor = 0.1 * (amount / volume)
+        if action == 1:  # Buy
+            impacted_price = self._get_current_price() * (1 + impact_factor)
+        elif action == 2:  # Sell
+            impacted_price = self._get_current_price() * (1 - impact_factor)
+        else:
+            impacted_price = self._get_current_price()
+        return impacted_price
 
     def render(self, mode='human'):
-        # Implement visualization logic here if needed
-        pass
+        """
+        Renders the current state. Can be expanded for visualization.
+
+        Args:
+            mode (str, optional): Render mode. Defaults to 'human'.
+        """
+        portfolio_value = self.balance + self.crypto_held * self._get_current_price()
+        print(f"Step: {self.current_step}")
+        print(f"Balance: {self.balance:.2f}")
+        print(f"Crypto Held: {self.crypto_held:.4f}")
+        print(f"Portfolio Value: {portfolio_value:.2f}")
+
 
 // File: src\environments\__init__.py
+# File: src/environments/__init__.py
 
+from .crypto_trading_env import CryptoTradingEnv
 
-// File: src\features\feature_engineer.py
-from typing import List
-import pandas as pd
-import numpy as np
-from ta.trend import SMAIndicator, EMAIndicator, MACD, IchimokuIndicator
-from ta.momentum import RSIIndicator, StochasticOscillator
-from ta.volatility import BollingerBands, AverageTrueRange
-from ta.volume import OnBalanceVolumeIndicator, AccumulationDistributionIndicator
-from typing import List
-
-class FeatureEngineer:
-    def __init__(self):
-        self.feature_names = []
-
-    def add_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        # Trend indicators
-        df['SMA_20'] = SMAIndicator(close=df['close'], window=20).sma_indicator()
-        df['EMA_20'] = EMAIndicator(close=df['close'], window=20).ema_indicator()
-        macd = MACD(close=df['close'])
-        df['MACD'] = macd.macd()
-        df['MACD_Signal'] = macd.macd_signal()
-        ichimoku = IchimokuIndicator(high=df['high'], low=df['low'])
-        df['Ichimoku_a'] = ichimoku.ichimoku_a()
-        df['Ichimoku_b'] = ichimoku.ichimoku_b()
-
-        # Momentum indicators
-        df['RSI'] = RSIIndicator(close=df['close']).rsi()
-        stoch = StochasticOscillator(high=df['high'], low=df['low'], close=df['close'])
-        df['Stoch_k'] = stoch.stoch()
-        df['Stoch_d'] = stoch.stoch_signal()
-
-        # Volatility indicators
-        bb = BollingerBands(close=df['close'])
-        df['BB_high'] = bb.bollinger_hband()
-        df['BB_low'] = bb.bollinger_lband()
-        df['ATR'] = AverageTrueRange(high=df['high'], low=df['low'], close=df['close']).average_true_range()
-
-        # Volume indicators
-        df['OBV'] = OnBalanceVolumeIndicator(close=df['close'], volume=df['volume']).on_balance_volume()
-        df['ADI'] = AccumulationDistributionIndicator(high=df['high'], low=df['low'], close=df['close'], volume=df['volume']).acc_dist_index()
-
-        self.feature_names.extend([col for col in df.columns if col not in ['open', 'high', 'low', 'close', 'volume']])
-        return df
-
-    def add_custom_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        df['log_return'] = np.log(df['close'] / df['close'].shift(1))
-        df['volatility'] = df['log_return'].rolling(window=20).std() * np.sqrt(252)
-        df['z_score'] = (df['close'] - df['close'].rolling(window=20).mean()) / df['close'].rolling(window=20).std()
-        df['momentum'] = df['close'] - df['close'].shift(10)
-        df['price_volume'] = df['close'] * df['volume']
-
-        self.feature_names.extend(['log_return', 'volatility', 'z_score', 'momentum', 'price_volume'])
-        return df
-
-    def create_lagged_features(self, df: pd.DataFrame, lags: List[int] = [1, 5, 10]) -> pd.DataFrame:
-        for feature in self.feature_names:
-            for lag in lags:
-                df[f'{feature}_lag_{lag}'] = df[feature].shift(lag)
-                self.feature_names.append(f'{feature}_lag_{lag}')
-        return df
-
-    def process_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        df = self.add_technical_indicators(df)
-        df = self.add_custom_features(df)
-        df = self.create_lagged_features(df)
-        return df.dropna()
-
-    def get_feature_names(self) -> List[str]:
-        return self.feature_names
-
-// File: src\features\feature_selector.py
-# File: src/features/feature_selection.py
-
-from sklearn.feature_selection import SelectFromModel, RFE
-from sklearn.linear_model import Lasso
-from sklearn.ensemble import RandomForestClassifier
-from typing import Optional
-import pandas as pd
-
-class FeatureSelector:
-    def __init__(self, method: str = "SelectFromModel", threshold: Optional[float] = None, max_features: Optional[int] = None):
-        self.method = method
-        self.threshold = threshold
-        self.max_features = max_features
-        self.selector = None
-
-    def fit_transform(self, X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
-        if self.method == "SelectFromModel":
-            estimator = Lasso(alpha=0.01)
-            self.selector = SelectFromModel(estimator, threshold=self.threshold)
-        elif self.method == "RFE":
-            estimator = RandomForestClassifier(n_estimators=100)
-            self.selector = RFE(estimator, n_features_to_select=self.max_features)
-        else:
-            raise ValueError(f"Unsupported feature selection method: {self.method}")
-
-        self.selector.fit(X, y)
-        selected_features = X.columns[self.selector.get_support()]
-        return X[selected_features]
-
-    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
-        if not self.selector:
-            raise RuntimeError("FeatureSelector not fitted yet.")
-        selected_features = X.columns[self.selector.get_support()]
-        return X[selected_features]
-
-    def get_selected_features(self) -> list:
-        if not self.selector:
-            raise RuntimeError("FeatureSelector not fitted yet.")
-        return list(self.selector.get_support(indices=True))
-
-// File: src\features\__init__.py
-from .feature_engineer import FeatureEngineer
-from .feature_selector import FeatureSelector
-
-__all__ = ['FeatureEngineer', 'FeatureSelector']
-
+__all__ = ['CryptoTradingEnv']
 
 
 // File: src\models\base_model.py
-# File: models/model.py
+# File: src/models/base_model.py
 
-import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from abc import ABC, abstractmethod
 
-class TradingModel(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout=0.2):
-        super(TradingModel, self).__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
-        self.fc = nn.Linear(hidden_size, output_size)
-        self.dropout = nn.Dropout(dropout)
-    
-    def forward(self, x):
-        # Assuming x shape: (batch, seq_length, input_size)
-        lstm_out, _ = self.lstm(x)
-        # Taking the output of the last time step
-        last_output = lstm_out[:, -1, :]
-        out = self.dropout(last_output)
-        out = self.fc(out)
-        return out
-
+class BaseModel(nn.Module, ABC):
+    """
+    Abstract base class for trading models.
+    """
+    @abstractmethod
     def get_action(self, state):
-        with torch.no_grad():
-            q_values = self(torch.FloatTensor(state).unsqueeze(0))
-            return q_values.argmax().item()
+        """
+        Determines the action to take based on the current state.
+        """
+        pass
 
-    def update(self, state, action, reward, next_state, done):
-        # Implement your update logic here (e.g., Q-learning updates)
+    @abstractmethod
+    def update(self, optimizer, criterion, state, action, reward, next_state, done):
+        """
+        Updates the model parameters based on the transition.
+        """
         pass
 
 
@@ -1581,10 +1757,13 @@ class Evaluator:
 
 
 // File: src\models\lstm_model.py
+# File: src/models/lstm_model.py
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from src.models.base_model import BaseModel
 
 class AttentionLayer(nn.Module):
     def __init__(self, hidden_size):
@@ -1596,9 +1775,9 @@ class AttentionLayer(nn.Module):
         context_vector = torch.sum(attention_weights * hidden_states, dim=1)
         return context_vector, attention_weights
 
-class TradingModel(nn.Module):
+class LSTMModel(BaseModel):
     def __init__(self, input_size: int, hidden_size: int, num_layers: int, output_size: int, dropout: float = 0.2):
-        super(TradingModel, self).__init__()
+        super(LSTMModel, self).__init__()
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
         self.attention = AttentionLayer(hidden_size)
         self.fc1 = nn.Linear(hidden_size, hidden_size // 2)
@@ -1617,20 +1796,20 @@ class TradingModel(nn.Module):
 
     def get_action(self, state: np.ndarray) -> int:
         with torch.no_grad():
-            state_tensor = torch.FloatTensor(state).unsqueeze(0)
+            state_tensor = torch.FloatTensor(state).unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, input_size)
             q_values, _ = self(state_tensor)
             return q_values.argmax().item()
 
     def update(self, optimizer: torch.optim.Optimizer, criterion: nn.Module, 
                state: np.ndarray, action: int, reward: float, next_state: np.ndarray, done: bool):
         optimizer.zero_grad()
-        state_tensor = torch.FloatTensor(state).unsqueeze(0)
-        next_state_tensor = torch.FloatTensor(next_state).unsqueeze(0)
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, input_size)
+        next_state_tensor = torch.FloatTensor(next_state).unsqueeze(0).unsqueeze(0)
         
-        current_q_values, _ = self(state_tensor)
+        q_values, _ = self(state_tensor)
         next_q_values, _ = self(next_state_tensor)
         
-        current_q_value = current_q_values[0][action]
+        current_q_value = q_values[0][action]
         next_q_value = next_q_values.max()
         
         expected_q_value = reward + (0.99 * next_q_value * (1 - int(done)))
@@ -1641,19 +1820,44 @@ class TradingModel(nn.Module):
         
         return loss.item()
 
+
+// File: src\models\model_factory.py
+# src/models/model_factory.py
+
+from typing import Dict, Any
+from .base_model import BaseModel
+from .lstm_model import LSTMModel
+from ..utils.config_manager import ConfigManager
+
+class ModelFactory:
+    @staticmethod
+    def create(config: ConfigManager) -> BaseModel:
+        model_type = config.get('model.type')
+        model_params = config.get('model.params')
+
+        if model_type == 'LSTM':
+            return LSTMModel(**model_params)
+        # Add more model types as needed
+        else:
+            raise ValueError(f"Unsupported model type: {model_type}")
+
+
 // File: src\models\timesnet_model.py
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Tuple
+from src.models.base_model import BaseModel
 
 class TimesBlock(nn.Module):
-    def __init__(self, input_size, hidden_size):
+    def __init__(self, input_size: int, hidden_size: int):
         super(TimesBlock, self).__init__()
         self.conv1 = nn.Conv1d(input_size, hidden_size, kernel_size=3, padding=1)
         self.conv2 = nn.Conv1d(hidden_size, hidden_size, kernel_size=3, padding=1)
         self.ln = nn.LayerNorm(hidden_size)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
         x = self.conv1(x.transpose(1, 2)).transpose(1, 2)
         x = F.relu(x)
@@ -1662,47 +1866,65 @@ class TimesBlock(nn.Module):
         return x
 
 class TimesNet(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, output_size):
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int, output_size: int):
         super(TimesNet, self).__init__()
-        self.blocks = nn.ModuleList([TimesBlock(input_size if i == 0 else hidden_size, hidden_size) for i in range(num_layers)])
+        self.blocks = nn.ModuleList([
+            TimesBlock(input_size if i == 0 else hidden_size, hidden_size) 
+            for i in range(num_layers)
+        ])
         self.fc = nn.Linear(hidden_size, output_size)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         for block in self.blocks:
             x = block(x)
         x = x.mean(dim=1)  # Global average pooling
         return self.fc(x)
 
-class TimesNetTradingModel(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, output_size):
-        super(TimesNetTradingModel, self).__init__()
+class TimesNetModel(BaseModel):
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int, output_size: int):
+        super(TimesNetModel, self).__init__()
         self.timesnet = TimesNet(input_size, hidden_size, num_layers, output_size)
 
-    def forward(self, x):
-        return self.timesnet(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # x shape: (batch_size, sequence_length, input_size)
+        return self.timesnet(x)  # output shape: (batch_size, output_size)
 
-    def get_action(self, state):
+    def get_action(self, state: np.ndarray) -> int:
         with torch.no_grad():
-            q_values = self(torch.FloatTensor(state).unsqueeze(0))
+            state_tensor = torch.FloatTensor(state).unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, input_size)
+            q_values = self(state_tensor)
             return q_values.argmax().item()
 
-    def update(self, state, action, reward, next_state, done):
-        # Implement your update logic here
-        pass
+    def update(self, optimizer: torch.optim.Optimizer, criterion: nn.Module, 
+               state: np.ndarray, action: int, reward: float, next_state: np.ndarray, done: bool) -> float:
+        optimizer.zero_grad()
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, input_size)
+        next_state_tensor = torch.FloatTensor(next_state).unsqueeze(0).unsqueeze(0)
+        
+        q_values = self(state_tensor)
+        next_q_values = self(next_state_tensor)
+        
+        current_q_value = q_values[0][action]
+        next_q_value = next_q_values.max()
+        
+        expected_q_value = reward + (0.99 * next_q_value * (1 - int(done)))
+        
+        loss = criterion(current_q_value, expected_q_value.detach())
+        loss.backward()
+        optimizer.step()
+        
+        return loss.item()
 
 // File: src\models\trainer.py
-# models/trainer.py
+# File: models/trainer.py
 
 import pytorch_lightning as pl
 import torch
 from torch.utils.data import DataLoader
 import pandas as pd
-from src.data.data_loader import TradingDataset
-from src.models.base_model import TradingModel
-from src.utils.utils import get_logger
-from src.features.feature_selector import FeatureSelector
-
-logger = get_logger()
+from src.data.data_loader import TradingDataset  # Corrected import
+from src.models.lstm_model import LSTMModel  # Updated to use LSTMModel
+from src.utils.utils import get_logger           # Corrected import
+from src.features.feature_selector import FeatureSelector  # Corrected import
 
 logger = get_logger()
 
@@ -1711,7 +1933,7 @@ class TradingLitModel(pl.LightningModule):
     PyTorch Lightning module for trading.
     """
 
-    def __init__(self, model: TradingModel, learning_rate: float, loss_fn, optimizer_cls):
+    def __init__(self, model: LSTMModel, learning_rate: float, loss_fn, optimizer_cls):
         super(TradingLitModel, self).__init__()
         self.model = model
         self.learning_rate = learning_rate
@@ -1723,7 +1945,7 @@ class TradingLitModel(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         X, y = batch
-        preds = self.forward(X)
+        preds, _ = self.forward(X)
         loss = self.loss_fn(preds, y)
         self.log('train_loss', loss)
         return loss
@@ -1742,8 +1964,10 @@ def train_model(config, train_df: pd.DataFrame, target_df: pd.Series):
         target_df (pd.Series): Training target data.
     """
     # Feature Selection
-    feature_selector = FeatureSelector(threshold=config['feature_selection']['threshold'],
-                                       max_features=config['feature_selection']['max_features'])
+    feature_selector = FeatureSelector(
+        threshold=config['features']['feature_selection']['threshold'],
+        max_features=config['features']['feature_selection']['max_features']
+    )
     X_selected = feature_selector.fit_transform(train_df, target_df)
     logger.info(f"Selected features: {X_selected.columns.tolist()}")
 
@@ -1752,26 +1976,33 @@ def train_model(config, train_df: pd.DataFrame, target_df: pd.Series):
     dataloader = DataLoader(dataset, batch_size=config['model']['batch_size'], shuffle=True)
 
     # Model
-    model = TradingModel(input_size=X_selected.shape[1],
-                         hidden_size=config['model']['hidden_size'],
-                         output_size=config['model']['output_size'])
+    model = LSTMModel(
+        input_size=X_selected.shape[1],
+        hidden_size=config['model']['hidden_size'],
+        num_layers=config['model']['num_layers'],
+        output_size=config['model']['output_size']
+    )
     
     # Lightning Module
-    lit_model = TradingLitModel(model=model,
-                                learning_rate=config['model']['learning_rate'],
-                                loss_fn=torch.nn.MSELoss(),
-                                optimizer_cls=torch.optim.Adam)
+    lit_model = TradingLitModel(
+        model=model,
+        learning_rate=config['model']['learning_rate'],
+        loss_fn=torch.nn.MSELoss(),
+        optimizer_cls=torch.optim.Adam
+    )
 
     # Trainer
-    trainer = pl.Trainer(max_epochs=config['model']['epochs'],
-                         gpus=1 if torch.cuda.is_available() else 0,
-                         logger=True)
+    trainer = pl.Trainer(
+        max_epochs=config['model']['epochs'],
+        gpus=1 if torch.cuda.is_available() else 0,
+        logger=True
+    )
 
     # Train
     trainer.fit(lit_model, dataloader)
 
     # Save the trained model
-    torch.save(model.state_dict(), config['model']['model_save_path'] + "trading_model.pth")
+    torch.save(model.state_dict(), config['paths']['model_save_path'] + "trading_model.pth")
     logger.info("Model training completed and saved.")
 
 # Example usage
@@ -1779,57 +2010,120 @@ def train_model(config, train_df: pd.DataFrame, target_df: pd.Series):
 
 
 // File: src\models\transformer_model.py
+import numpy as np
+import torch
+import torch.nn as nn
+import math
+from typing import Tuple
+from src.models.base_model import BaseModel
 
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, max_len: int = 5000):
+        super().__init__()
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.pe[:x.size(0)]
+
+class TransformerModel(BaseModel):
+    def __init__(self, input_size: int, d_model: int, nhead: int, num_layers: int, output_size: int):
+        super(TransformerModel, self).__init__()
+        self.model_type = 'Transformer'
+        self.pos_encoder = PositionalEncoding(d_model)
+        encoder_layers = nn.TransformerEncoderLayer(d_model, nhead, dim_feedforward=d_model*4)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers)
+        self.input_linear = nn.Linear(input_size, d_model)
+        self.output_linear = nn.Linear(d_model, output_size)
+
+        self.init_weights()
+
+    def init_weights(self) -> None:
+        initrange = 0.1
+        self.input_linear.weight.data.uniform_(-initrange, initrange)
+        self.output_linear.bias.data.zero_()
+        self.output_linear.weight.data.uniform_(-initrange, initrange)
+
+    def forward(self, src: torch.Tensor) -> torch.Tensor:
+        # src shape: (batch_size, sequence_length, input_size)
+        src = self.input_linear(src).permute(1, 0, 2)  # (sequence_length, batch_size, d_model)
+        src = self.pos_encoder(src)
+        output = self.transformer_encoder(src)
+        output = output.mean(dim=0)  # Global average pooling
+        output = self.output_linear(output)  # (batch_size, output_size)
+        return output
+
+    def get_action(self, state: np.ndarray) -> int:
+        with torch.no_grad():
+            state_tensor = torch.FloatTensor(state).unsqueeze(0)  # Shape: (1, sequence_length, input_size)
+            q_values = self(state_tensor)
+            return q_values.argmax().item()
+
+    def update(self, optimizer: torch.optim.Optimizer, criterion: nn.Module, 
+               state: np.ndarray, action: int, reward: float, next_state: np.ndarray, done: bool) -> float:
+        optimizer.zero_grad()
+        state_tensor = torch.FloatTensor(state).unsqueeze(0)  # Shape: (1, sequence_length, input_size)
+        next_state_tensor = torch.FloatTensor(next_state).unsqueeze(0)
+        
+        q_values = self(state_tensor)
+        next_q_values = self(next_state_tensor)
+        
+        current_q_value = q_values[0][action]
+        next_q_value = next_q_values.max()
+        
+        expected_q_value = reward + (0.99 * next_q_value * (1 - int(done)))
+        
+        loss = criterion(current_q_value, expected_q_value.detach())
+        loss.backward()
+        optimizer.step()
+        
+        return loss.item()
 
 // File: src\models\__init__.py
+# File: src/models/__init__.py
+
 from .base_model import BaseModel
 from .lstm_model import LSTMModel
-from .transformer_model import TransformerModel
 from .timesnet_model import TimesNetModel
+from .transformer_model import TransformerModel  # Ensure this is implemented similarly
 
-__all__ = ['BaseModel', 'LSTMModel', 'TransformerModel', 'TimesNetModel']
+__all__ = ['BaseModel', 'LSTMModel', 'TimesNetModel', 'TransformerModel']
+
 
 // File: src\rewards\base_reward.py
+# File: src/rewards/base_reward.py
 
-
-// File: src\rewards\profit_reward.py
-
-
-// File: src\rewards\rewards.py
+from abc import ABC, abstractmethod
 import numpy as np
-from typing import List
 
-class RewardFunction:
+class RewardFunction(ABC):
+    @abstractmethod
     def calculate_reward(self, action: int, current_price: float, next_price: float, portfolio_value: float) -> float:
+        """
+        Calculates the reward based on the action and price changes.
+
+        Args:
+            action (int): The action taken (e.g., Buy, Sell, Hold).
+            current_price (float): The current price of the asset.
+            next_price (float): The next price of the asset.
+            portfolio_value (float): The current portfolio value.
+
+        Returns:
+            float: The calculated reward.
+        """
         pass
 
-class ProfitReward(RewardFunction):
-    def calculate_reward(self, action: int, current_price: float, next_price: float, portfolio_value: float) -> float:
-        if action == 1:  # Buy
-            return (next_price - current_price) / current_price
-        elif action == 2:  # Sell
-            return (current_price - next_price) / current_price
-        else:  # Hold
-            return 0
 
-class SharpeRatioReward(RewardFunction):
-    def __init__(self, risk_free_rate: float = 0.0, window_size: int = 20):
-        self.risk_free_rate = risk_free_rate
-        self.window_size = window_size
-        self.returns = []
+// File: src\rewards\combined_reward.py
+# File: src/rewards/combined_reward.py
 
-    def calculate_reward(self, action: int, current_price: float, next_price: float, portfolio_value: float) -> float:
-        return_ = (next_price - current_price) / current_price
-        self.returns.append(return_)
-
-        if len(self.returns) < self.window_size:
-            return 0
-
-        returns_array = np.array(self.returns[-self.window_size:])
-        excess_returns = returns_array - self.risk_free_rate
-        sharpe_ratio = np.sqrt(252) * np.mean(excess_returns) / np.std(excess_returns)
-
-        return sharpe_ratio
+from .base_reward import RewardFunction
+from .profit_reward import ProfitReward
+from .sharpe_ratio_reward import SharpeRatioReward
 
 class CombinedReward(RewardFunction):
     def __init__(self, profit_weight: float = 0.5, sharpe_weight: float = 0.5):
@@ -1843,96 +2137,112 @@ class CombinedReward(RewardFunction):
         sharpe = self.sharpe_reward.calculate_reward(action, current_price, next_price, portfolio_value)
         return self.profit_weight * profit + self.sharpe_weight * sharpe
 
-// File: src\rewards\reward_functions.py
-# File: rewards/reward_functions.py
 
-from abc import ABC, abstractmethod
-import numpy as np
+// File: src\rewards\profit_reward.py
+# File: src/rewards/profit_reward.py
 
-class RewardFunction(ABC):
-    @abstractmethod
-    def __call__(self, state: np.ndarray, action: float, reward: float, next_state: np.ndarray, done: bool) -> float:
-        pass
+from .base_reward import RewardFunction
 
 class ProfitReward(RewardFunction):
-    def __call__(self, state: np.ndarray, action: float, reward: float, next_state: np.ndarray, done: bool) -> float:
-        return reward
-
-class SharpeRatioReward(RewardFunction):
-    def __init__(self, window_size: int = 20, risk_free_rate: float = 0.0):
-        self.window_size = window_size
-        self.risk_free_rate = risk_free_rate
-        self.returns = []
-
-    def __call__(self, state: np.ndarray, action: float, reward: float, next_state: np.ndarray, done: bool) -> float:
-        self.returns.append(reward)
-        if len(self.returns) < self.window_size:
+    def calculate_reward(self, action: int, current_price: float, next_price: float, portfolio_value: float) -> float:
+        if action == 1:  # Buy
+            return (next_price - current_price) / current_price
+        elif action == 2:  # Sell
+            return (current_price - next_price) / current_price
+        else:  # Hold
             return 0.0
-        
-        returns_array = np.array(self.returns[-self.window_size:])
-        excess_returns = returns_array - self.risk_free_rate
-        sharpe_ratio = np.sqrt(252) * np.mean(excess_returns) / np.std(excess_returns)
-        return sharpe_ratio
 
+
+// File: src\rewards\rewards.py
+# File: src/rewards/rewards.py
+
+from .base_reward import RewardFunction
+from .profit_reward import ProfitReward
+from .sharpe_ratio_reward import SharpeRatioReward
+from .combined_reward import CombinedReward  # Ensure CombinedReward is defined in combined_reward.py
+
+def get_reward_function(reward_type: str) -> RewardFunction:
+    """
+    Factory function to get the appropriate reward function.
+
+    Args:
+        reward_type (str): Type of reward function ('profit', 'sharpe_ratio', 'combined').
+
+    Returns:
+        RewardFunction: An instance of the requested reward function.
+    """
+    if reward_type == "profit":
+        return ProfitReward()
+    elif reward_type == "sharpe_ratio":
+        return SharpeRatioReward()
+    elif reward_type == "combined":
+        return CombinedReward()
+    else:
+        raise ValueError(f"Unsupported reward type: {reward_type}")
 
 
 // File: src\rewards\sharpe_ratio_reward.py
+# File: src/rewards/sharpe_ratio_reward.py
+
+from .base_reward import RewardFunction
+import numpy as np
+
+class SharpeRatioReward(RewardFunction):
+    def __init__(self, risk_free_rate: float = 0.0, window_size: int = 20):
+        self.risk_free_rate = risk_free_rate
+        self.window_size = window_size
+        self.returns = []
+
+    def calculate_reward(self, action: int, current_price: float, next_price: float, portfolio_value: float) -> float:
+        return_ = (next_price - current_price) / current_price
+        self.returns.append(return_)
+
+        if len(self.returns) < self.window_size:
+            return 0.0
+
+        returns_array = np.array(self.returns[-self.window_size:])
+        excess_returns = returns_array - self.risk_free_rate
+        sharpe_ratio = np.sqrt(252) * np.mean(excess_returns) / np.std(excess_returns)
+
+        return sharpe_ratio
 
 
 // File: src\rewards\__init__.py
-from .base_reward import BaseReward
+# File: src/rewards/__init__.py
+
+from .base_reward import RewardFunction
 from .profit_reward import ProfitReward
 from .sharpe_ratio_reward import SharpeRatioReward
+from .combined_reward import CombinedReward  # Ensure CombinedReward is defined
 
-__all__ = ['BaseReward', 'ProfitReward', 'SharpeRatioReward']
+__all__ = ['RewardFunction', 'ProfitReward', 'SharpeRatioReward', 'CombinedReward']
 
-// File: src\trading\trading_executor.py
-# src/trading/trading_executor.py
 
-import ccxt
-from src.utils.utils import get_logger
+// File: src\utils\config_manager.py
+# src/utils/config_manager.py
 
-logger = get_logger(__name__)
+import os
+from typing import Any, Dict
+from omegaconf import OmegaConf
+from dotenv import load_dotenv
 
-class TradingExecutor:
-    def __init__(self, api_key: str, api_secret: str, exchange_name: str = 'binance'):
-        self.exchange = getattr(ccxt, exchange_name)({
-            'apiKey': api_key,
-            'secret': api_secret,
-            'enableRateLimit': True,
-        })
+class ConfigManager:
+    def __init__(self, config_path: str):
+        self.config = OmegaConf.load(config_path)
+        self._load_env_vars()
 
-    def execute_trade(self, symbol: str, order_type: str, side: str, amount: float, price: float = None):
-        """
-        Executes a trade on the exchange.
+    def _load_env_vars(self):
+        env_path = os.path.join(os.path.dirname(__file__), '../../config/secrets.env')
+        load_dotenv(env_path)
 
-        Args:
-            symbol (str): The trading pair (e.g., 'BTC/USDT').
-            order_type (str): 'market' or 'limit'.
-            side (str): 'buy' or 'sell'.
-            amount (float): The amount of cryptocurrency to buy or sell.
-            price (float, optional): The limit price for limit orders. Defaults to None.
-        """
-        try:
-            if order_type == 'market':
-                order = self.exchange.create_market_order(symbol, side, amount)
-            elif order_type == 'limit':
-                order = self.exchange.create_limit_order(symbol, side, amount, price)
-            else:
-                raise ValueError("Invalid order type. Must be 'market' or 'limit'.")
-            
-            logger.info(f"Trade executed: {order}")
-            return order
-        except Exception as e:
-            logger.error(f"Error executing trade: {e}")
-            return None
+    def get(self, key: str, default: Any = None) -> Any:
+        return OmegaConf.select(self.config, key, default=default)
 
-    # Add more methods for order management, risk management, etc. 
-
-// File: src\trading\__init__.py
-# src/trading/__init__.py
-
-# This file can be left empty. 
+    def get_exchange_credentials(self) -> Dict[str, str]:
+        return {
+            'api_key': os.getenv(f"{self.get('exchange.name').upper()}_ACCESS_KEY"),
+            'api_secret': os.getenv(f"{self.get('exchange.name').upper()}_SECRET_KEY")
+        }
 
 // File: src\utils\logging_config.py
 # File: utils/logging_config.py
@@ -1956,12 +2266,31 @@ def setup_logging(config: Dict):
 def get_logger(name: str):
     return logging.getLogger(name)
 
-// File: src\utils\utils.py
-# File: src/utils.py
+// File: src\utils\rate_limiter.py
+# src/data/acquisition/utils/rate_limiter.py
 
+import asyncio
+import time
+
+class RateLimiter:
+    def __init__(self, max_calls: int, period: float):
+        self.max_calls = max_calls
+        self.period = period
+        self.calls = []
+
+    async def wait(self):
+        now = time.time()
+        self.calls = [call for call in self.calls if call > now - self.period]
+        if len(self.calls) >= self.max_calls:
+            sleep_time = self.calls[0] - (now - self.period)
+            await asyncio.sleep(sleep_time)
+        self.calls.append(time.time())
+
+// File: src\utils\utils.py
 import logging
 import os
 import sys
+from typing import Optional
 
 def setup_logging(log_level: str = "INFO", log_file: Optional[str] = None):
     """
@@ -1994,7 +2323,6 @@ def get_logger(name: Optional[str] = None) -> logging.Logger:
         logging.Logger: Logger instance.
     """
     return logging.getLogger(name)
-
 
 // File: src\utils\__init__.py
 
@@ -2133,42 +2461,91 @@ class Visualization:
 // File: src\visualization\__init__.py
 
 
-// File: tests\test_data_acquisition.py
-import unittest
-import pandas as pd
-from src.data.data_acquisition import BinanceDataProvider 
+// File: tests\data\acquisition\mexc\test_mexc_data_provider.py
+# tests/data/acquisition/mexc/test_mexc_data_provider.py
 
-class TestBinanceDataProvider(unittest.TestCase):
+import pytest
+from unittest.mock import Mock, patch
+from src.data.acquisition.mexc.mexc_data_provider import MexcDataProvider
+from src.data.acquisition.mexc.utils.mexc_config_reader import load_mexc_api_keys
 
-    def setUp(self):
-        """Set up for test methods."""
-        self.api_key = 'YOUR_API_KEY'  
-        self.api_secret = 'YOUR_API_SECRET' 
-        self.data_provider = BinanceDataProvider(self.api_key, self.api_secret)
+# To run this test file individually, use:
+# pytest tests/data/acquisition/mexc/test_mexc_data_provider.py -v
 
-    def test_get_data(self):
-        """Test fetching data from Binance."""
-        symbol = 'BTC/USDT'
-        timeframe = '1h'
-        start_date = '2024-01-01'
-        end_date = '2024-01-10'  # Fetch a small amount of data for testing
+# Fixture for unit tests (using mocked API keys)
+@pytest.fixture
+def mexc_provider_mock():
+    return MexcDataProvider("fake_api_key", "fake_api_secret")
 
-        df = self.data_provider.get_data(symbol, timeframe, start_date, end_date)
+# Fixture for integration tests (using real API keys)
+@pytest.fixture
+def mexc_provider_real():
+    api_key, api_secret = load_mexc_api_keys()
+    return MexcDataProvider(api_key, api_secret)
 
-        # Assertions to validate the data
-        self.assertIsInstance(df, pd.DataFrame)
-        self.assertFalse(df.empty)
-        self.assertGreater(len(df), 0)
-        self.assertIn('timestamp', df.columns)
-        self.assertIn('open', df.columns)
-        self.assertIn('high', df.columns)
-        self.assertIn('low', df.columns)
-        self.assertIn('close', df.columns)
-        self.assertIn('volume', df.columns)
+# Unit test example
+@pytest.mark.asyncio
+async def test_get_historical_data_mock(mexc_provider_mock):
+    with patch.object(mexc_provider_mock.rest_api, 'get_klines') as mock_get_klines:
+        mock_get_klines.return_value = [{"open_time": 1625097600000, "open": "33000.0", "high": "33100.0", "low": "32900.0", "close": "33050.0", "volume": "100.5"}]
+        
+        result = await mexc_provider_mock.get_historical_data("BTCUSDT", "1h", 1625097600000, 1625184000000)
+        
+        assert len(result) == 1
+        assert result[0]["open"] == "33000.0"
+        mock_get_klines.assert_called_once_with("BTCUSDT", "1h", 1625097600000, 1625184000000)
 
-    # Add more test methods for other functionalities
-    # in BinanceDataProvider (e.g., get_account_balance, place_order).
+# Integration test example
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_get_historical_data_real(mexc_provider_real):
+    result = await mexc_provider_real.get_historical_data("BTCUSDT", "1h", 1625097600000, 1625184000000)
+    
+    assert len(result) > 0
+    assert "open" in result[0]
+    assert "high" in result[0]
+    assert "low" in result[0]
+    assert "close" in result[0]
 
-if __name__ == '__main__':
-    unittest.main()
+# More unit tests...
+
+@pytest.mark.asyncio
+async def test_stream_data(mexc_provider_mock):
+    mock_callback = Mock()
+    
+    with patch.object(mexc_provider_mock.websocket, 'subscribe_klines') as mock_subscribe_klines:
+        await mexc_provider_mock.stream_data(["BTCUSDT"], mock_callback)
+        
+        mock_subscribe_klines.assert_called_once_with(["BTCUSDT"], mock_callback)
+
+@pytest.mark.asyncio
+async def test_get_account_info(mexc_provider_mock):
+    with patch.object(mexc_provider_mock.rest_api, 'get_account_info') as mock_get_account_info:
+        mock_get_account_info.return_value = {"balances": [{"asset": "BTC", "free": "1.0", "locked": "0.5"}]}
+        
+        result = await mexc_provider_mock.get_account_info()
+        
+        assert "balances" in result
+        assert result["balances"][0]["asset"] == "BTC"
+        mock_get_account_info.assert_called_once()
+
+# More integration tests...
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_get_account_info_real(mexc_provider_real):
+    result = await mexc_provider_real.get_account_info()
+    
+    assert "balances" in result
+    assert isinstance(result["balances"], list)
+    assert len(result["balances"]) > 0
+
+# To run only unit tests:
+# pytest tests/data/acquisition/mexc/test_mexc_data_provider.py -v -m "not integration"
+
+# To run only integration tests:
+# pytest tests/data/acquisition/mexc/test_mexc_data_provider.py -v -m "integration"
+
+# To run all tests:
+# pytest tests/data/acquisition/mexc/test_mexc_data_provider.py -v
 

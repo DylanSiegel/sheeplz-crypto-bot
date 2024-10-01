@@ -1,15 +1,13 @@
-# models/trainer.py
+# File: models/trainer.py
 
 import pytorch_lightning as pl
 import torch
 from torch.utils.data import DataLoader
 import pandas as pd
-from src.data.data_loader import TradingDataset
-from src.models.base_model import TradingModel
-from src.utils.utils import get_logger
-from src.features.feature_selector import FeatureSelector
-
-logger = get_logger()
+from src.data.data_loader import TradingDataset  # Corrected import
+from src.models.lstm_model import LSTMModel  # Updated to use LSTMModel
+from src.utils.utils import get_logger           # Corrected import
+from src.features.feature_selector import FeatureSelector  # Corrected import
 
 logger = get_logger()
 
@@ -18,7 +16,7 @@ class TradingLitModel(pl.LightningModule):
     PyTorch Lightning module for trading.
     """
 
-    def __init__(self, model: TradingModel, learning_rate: float, loss_fn, optimizer_cls):
+    def __init__(self, model: LSTMModel, learning_rate: float, loss_fn, optimizer_cls):
         super(TradingLitModel, self).__init__()
         self.model = model
         self.learning_rate = learning_rate
@@ -30,7 +28,7 @@ class TradingLitModel(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         X, y = batch
-        preds = self.forward(X)
+        preds, _ = self.forward(X)
         loss = self.loss_fn(preds, y)
         self.log('train_loss', loss)
         return loss
@@ -49,8 +47,10 @@ def train_model(config, train_df: pd.DataFrame, target_df: pd.Series):
         target_df (pd.Series): Training target data.
     """
     # Feature Selection
-    feature_selector = FeatureSelector(threshold=config['feature_selection']['threshold'],
-                                       max_features=config['feature_selection']['max_features'])
+    feature_selector = FeatureSelector(
+        threshold=config['features']['feature_selection']['threshold'],
+        max_features=config['features']['feature_selection']['max_features']
+    )
     X_selected = feature_selector.fit_transform(train_df, target_df)
     logger.info(f"Selected features: {X_selected.columns.tolist()}")
 
@@ -59,26 +59,33 @@ def train_model(config, train_df: pd.DataFrame, target_df: pd.Series):
     dataloader = DataLoader(dataset, batch_size=config['model']['batch_size'], shuffle=True)
 
     # Model
-    model = TradingModel(input_size=X_selected.shape[1],
-                         hidden_size=config['model']['hidden_size'],
-                         output_size=config['model']['output_size'])
+    model = LSTMModel(
+        input_size=X_selected.shape[1],
+        hidden_size=config['model']['hidden_size'],
+        num_layers=config['model']['num_layers'],
+        output_size=config['model']['output_size']
+    )
     
     # Lightning Module
-    lit_model = TradingLitModel(model=model,
-                                learning_rate=config['model']['learning_rate'],
-                                loss_fn=torch.nn.MSELoss(),
-                                optimizer_cls=torch.optim.Adam)
+    lit_model = TradingLitModel(
+        model=model,
+        learning_rate=config['model']['learning_rate'],
+        loss_fn=torch.nn.MSELoss(),
+        optimizer_cls=torch.optim.Adam
+    )
 
     # Trainer
-    trainer = pl.Trainer(max_epochs=config['model']['epochs'],
-                         gpus=1 if torch.cuda.is_available() else 0,
-                         logger=True)
+    trainer = pl.Trainer(
+        max_epochs=config['model']['epochs'],
+        gpus=1 if torch.cuda.is_available() else 0,
+        logger=True
+    )
 
     # Train
     trainer.fit(lit_model, dataloader)
 
     # Save the trained model
-    torch.save(model.state_dict(), config['model']['model_save_path'] + "trading_model.pth")
+    torch.save(model.state_dict(), config['paths']['model_save_path'] + "trading_model.pth")
     logger.info("Model training completed and saved.")
 
 # Example usage
