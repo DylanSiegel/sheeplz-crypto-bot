@@ -1,19 +1,227 @@
-# AI-Powered Crypto Trading Bot
+Trading Platform for BTC/USD Perpetual Futures on MEXC
+Introduction
+Welcome to the Trading Platform for BTC/USD Perpetual Futures on MEXC. This project is a cutting-edge, AI-driven trading platform designed to optimize trading strategies for BTC/USD perpetual futures contracts on the MEXC exchange. It integrates advanced technologies such as Graph-Based Metanetworks (GMNs), Dataset Distillation, Liquid Neural Networks (LNNs), and sophisticated AI trading methodologies.
 
-## Overview
+The platform is built with Python 3.12.6 and emphasizes real-time data processing, multi-agent collaboration, and adaptive learning to navigate the dynamic cryptocurrency market effectively.
 
-This repository contains an AI-powered cryptocurrency trading bot built using deep reinforcement learning (DRL). The bot serves as a research platform for developing and testing advanced trading strategies. It emphasizes flexibility in reward function design, data ingestion, and multi-agent experimentation.  This project uses Hydra for configuration management and PyTorch for model training.
+Features
+Real-Time Data Ingestion: Connects to MEXC's WebSocket API for live candlestick and order book data.
+Graph-Based Metanetworks (GMNs): Represents market data as dynamic graphs capturing multi-time frame analysis and technical indicators.
+Dataset Distillation: Prioritizes informative market events, focusing on high-volatility periods and reducing redundant data.
+Liquid Neural Networks (LNNs): Adapts in real-time to evolving market conditions using dynamic temporal dependencies.
+Multi-Agent Framework: Specialized agents for different time frames and strategies collaborate to optimize trading decisions.
+Reinforcement Learning: Implements Deep Reinforcement Learning algorithms to learn optimal trading strategies.
+Risk Management: Incorporates advanced risk controls, including dynamic stop-losses and leverage management.
+Backtesting and Simulation: Provides an environment for testing strategies under diverse market scenarios.
+Scalable Architecture: Designed for scalability, allowing future integration of additional assets and markets.
+Comprehensive Logging and Monitoring: Real-time performance metrics and AI-based drift detection mechanisms.
+Project Structure
+c
+Copy code
+trading_platform/
+├── data/
+│   ├── raw/
+│   ├── processed/
+│   └── distilled/
+├── models/
+│   ├── gmn/
+│   ├── lnn/
+│   ├── agents/
+│   └── utils/
+├── configs/
+│   ├── api_config.py
+│   ├── model_config.py
+│   └── trading_config.py
+├── logs/
+│   ├── trading.log
+│   └── performance.log
+├── notebooks/
+│   ├── data_exploration.ipynb
+│   └── model_training.ipynb
+├── tests/
+│   ├── test_data_pipeline.py
+│   ├── test_models.py
+│   └── test_agents.py
+├── main.py
+├── requirements.txt
+└── README.md
+data/: Stores datasets in various stages—raw, processed, and distilled.
+models/: Contains code for Graph-Based Metanetworks, Liquid Neural Networks, agents, and utility functions.
+configs/: Configuration files for API keys, model parameters, and trading settings.
+logs/: Log files for tracking trading activities and performance metrics.
+notebooks/: Jupyter notebooks for data analysis and model training experiments.
+tests/: Unit tests for validating components of the platform.
+main.py: The entry point of the application.
+requirements.txt: Lists all Python dependencies.
+README.md: Documentation of the project.
+Installation
+Prerequisites
+Python 3.12.6
+Git
+A valid MEXC API Key and Secret
+Steps
+Clone the Repository
 
-## Key Features
+bash
+Copy code
+git clone https://github.com/yourusername/trading_platform.git
+cd trading_platform
+Set Up a Virtual Environment
 
-* **Dynamic Reward Function Framework:** Easily iterate and test various reward strategies to optimize trading performance based on desired metrics (e.g., profit, Sharpe ratio, custom metrics).
-* **Flexible Data Ingestion:** Supports multiple data sources, including live market data from exchanges (e.g., Binance), historical data from CSV files, and (potentially) synthetic data generation.
-* **Modular Gym Environment:**  A configurable trading environment built using OpenAI Gym, adaptable to different scenarios, asset pairs, and data inputs.
-* **Online Learning (Potential):**  Designed for online learning to adapt to evolving market dynamics (implementation in progress).
-* **Multi-Agent Framework (Potential):**  Facilitates comparative testing of multiple agents (implementation in progress).
-* **Experiment Tracking (with MLflow or WandB):** Log experiments, track metrics, and compare configurations.
-* **Hydra Configuration Management:** Uses Hydra for flexible and organized configuration management.
-* **PyTorch for Model Training:** Leverages PyTorch for building and training DRL models.
+bash
+Copy code
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+Install Dependencies
 
-Disclaimer
-This project is for educational and research purposes only. Trading cryptocurrencies involves significant risk. Do not use for live trading without a thorough understanding of the risks involved. The developers are not responsible for any financial losses.
+bash
+Copy code
+pip install --upgrade pip
+pip install -r requirements.txt
+Configure API Keys
+
+Navigate to configs/api_config.py.
+
+Replace placeholders with your actual MEXC API Key and Secret.
+
+python
+Copy code
+# configs/api_config.py
+API_KEY = "YOUR_MEXC_API_KEY"
+API_SECRET = "YOUR_MEXC_API_SECRET"
+BASE_URL = "https://api.mexc.com"
+Important: Ensure that api_config.py is listed in your .gitignore file to prevent sensitive information from being committed.
+
+Run Initial Setup
+
+Create necessary directories:
+
+bash
+Copy code
+mkdir data/raw data/processed data/distilled
+mkdir logs
+Initialize Git (if not already done):
+
+bash
+Copy code
+git init
+Usage
+Running the Platform
+bash
+Copy code
+python main.py
+This command starts the data ingestion process, initializes the Graph-Based Metanetwork, and launches the trading agents.
+
+Components Overview
+Data Ingestion: Connects to MEXC's WebSocket API and streams real-time market data.
+Graph-Based Metanetwork (GMN): Dynamically updates with new data, representing market conditions as a graph.
+Liquid Neural Networks (LNNs): Agents use LNNs for adaptive learning and decision-making.
+Agents: Specialized for different time frames and strategies; make trading decisions based on GMN data.
+Reinforcement Learning (RL): Agents learn and optimize strategies over time using RL algorithms.
+Risk Management: Monitors and manages trading risks in real-time.
+Logging and Monitoring: Tracks performance metrics and system health.
+Detailed Components
+1. Data Ingestion
+Location: models/utils/data_ingestion.py
+Functionality:
+Establishes a WebSocket connection to MEXC.
+Subscribes to candlestick data for specified symbols and intervals.
+Processes and stores incoming data for further analysis.
+2. Graph-Based Metanetworks (GMNs)
+Location: models/gmn/gmn.py
+Functionality:
+Represents market data as nodes (time frames, technical indicators) and edges (relationships).
+Dynamically updates with new data to reflect real-time market conditions.
+Supports hypergraph extensions for complex interactions.
+3. Liquid Neural Networks (LNNs)
+Location: models/lnn/lnn_model.py
+Functionality:
+Implements neural networks capable of adapting in real-time.
+Processes dynamic temporal dependencies between market data.
+Used by agents for making predictions and decisions.
+4. Agents
+Location: models/agents/agent.py
+Functionality:
+Specialized agents focusing on different time frames (e.g., 1-minute, 1-hour).
+Make trading decisions based on LNN outputs and GMN data.
+Manage positions (entering, exiting) and interact with the MEXC API.
+5. Reinforcement Learning (RL)
+Location: models/agents/rl_agent.py
+Functionality:
+Uses OpenAI Gym environments for training agents.
+Implements algorithms like Proximal Policy Optimization (PPO).
+Agents learn optimal strategies through simulated trading experiences.
+6. Risk Management
+Location: models/utils/risk_management.py
+Functionality:
+Monitors key risk metrics such as maximum drawdown and profit.
+Implements risk controls like dynamic stop-losses and leverage adjustments.
+Ensures trading actions comply with predefined risk parameters.
+7. Backtesting
+Functionality:
+Provides a simulation environment to test trading strategies.
+Assesses performance under various market conditions.
+Helps in refining strategies before deploying them live.
+Configuration
+API Configuration
+File: configs/api_config.py
+Parameters:
+API_KEY: Your MEXC API Key.
+API_SECRET: Your MEXC API Secret.
+BASE_URL: The base URL for MEXC's API (default is "https://api.mexc.com").
+Model Configuration
+File: configs/model_config.py
+Parameters:
+Hyperparameters for LNNs and RL agents.
+Training parameters like learning rate, batch size, epochs.
+Trading Configuration
+File: configs/trading_config.py
+Parameters:
+Symbols and intervals to trade.
+Risk thresholds and leverage settings.
+Time frames and technical indicators to use.
+Logging and Monitoring
+Logs Directory: logs/
+Files:
+trading.log: Records trading actions and decisions.
+performance.log: Tracks performance metrics and KPIs.
+Monitoring Tools:
+
+Integrate with monitoring dashboards like Grafana for real-time visualization.
+Set up alerts for significant events or anomalies.
+Development and Testing
+Unit Tests
+Directory: tests/
+
+Running Tests:
+
+bash
+Copy code
+pytest tests/
+Notebooks
+Directory: notebooks/
+Purpose:
+data_exploration.ipynb: For exploratory data analysis.
+model_training.ipynb: For experimenting with model training and hyperparameter tuning.
+Contributing
+We welcome contributions to enhance the platform's functionality and robustness. Please follow these steps:
+
+Fork the Repository: Create your own fork to work on.
+Create a Feature Branch: Use descriptive names (e.g., feature/add-new-agent).
+Commit Changes: Make atomic commits with clear messages.
+Open a Pull Request: Describe your changes and submit for review.
+License
+This project is licensed under the MIT License. You are free to use, modify, and distribute this software in accordance with the license terms.
+
+Important Notes
+Risk Disclaimer: Trading cryptocurrencies involves significant risk. Ensure you understand the risks and have thoroughly tested the platform before deploying it in a live trading environment.
+API Rate Limits: Be mindful of MEXC's API rate limits to avoid being rate-limited or banned.
+Data Privacy: Keep your API keys secure. Do not share or commit them to public repositories.
+Contact Information
+For questions or support, please open an issue on the GitHub repository or contact the project maintainer at email@example.com.
+
+Acknowledgements
+MEXC Exchange: For providing comprehensive APIs for data access and trading.
+OpenAI: For advancements in AI technologies that inspired components of this platform.
+Community Contributors: Thank you to all who have contributed to the development and improvement of this project.
+By integrating state-of-the-art AI methodologies and robust software engineering practices, this platform aims to provide a powerful tool for navigating the complexities of cryptocurrency trading. We encourage collaboration and innovation to further enhance its capabilities.
