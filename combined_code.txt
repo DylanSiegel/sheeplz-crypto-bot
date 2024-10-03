@@ -1,0 +1,446 @@
+// File: main.py
+# main.py
+
+import asyncio
+from models.utils.data_ingestion import DataIngestion
+from models.gmn.gmn import GraphMetanetwork
+from models.agents.agent import TradingAgent
+
+async def main():
+    # Initialize components
+    data_ingestion = DataIngestion()
+    gmn = GraphMetanetwork()
+    agent_1m = TradingAgent(time_frame="1m")
+    agent_1h = TradingAgent(time_frame="1h")
+    agents = [agent_1m, agent_1h]
+
+    # Initialize GMN nodes
+    gmn.initialize_nodes(
+        time_frames=["1m", "5m", "1h", "1d"],
+        indicators=["price", "volume", "rsi", "macd", "fibonacci"]
+    )
+
+    # Start data ingestion and agent decision-making
+    await asyncio.gather(
+        data_ingestion.connect(),
+        agent_loop(agents, gmn)
+    )
+
+async def agent_loop(agents, gmn):
+    while True:
+        market_data = gmn.get_latest_data()
+        for agent in agents:
+            agent.make_decision(market_data)
+        await asyncio.sleep(1)  # Adjust sleep time as needed
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+// File: data\mexc_data_ingestion.py
+import asyncio
+import websockets
+import json
+import pandas as pd
+from configs.api_config import API_KEY, API_SECRET, BASE_URL
+from models.gmn.gmn import GraphMetanetwork
+
+class DataIngestion:
+    def __init__(self, symbol="BTC_USDT", interval="1m"):
+        self.symbol = symbol
+        self.interval = interval
+        self.ws_url = f"wss://wbs.mexc.com/ws"
+        
+        # Initialize the GMN
+        self.gmn = GraphMetanetwork()
+        self.gmn.initialize_nodes(
+            time_frames=["1m", "5m", "1h", "1d"],
+            indicators=["price", "volume", "rsi", "macd", "fibonacci"]
+        )
+
+    async def connect(self):
+        async with websockets.connect(self.ws_url) as websocket:
+            # Subscribe to candlestick data
+            subscribe_message = json.dumps({
+                "op": "sub.kline",
+                "symbol": self.symbol,
+                "interval": self.interval
+            })
+            await websocket.send(subscribe_message)
+
+            while True:
+                try:
+                    data = await websocket.recv()
+                    self.process_data(json.loads(data))
+                except Exception as e:
+                    print(f"Error receiving data: {e}")
+                    break
+
+    def process_data(self, data):
+        # Process incoming data and update GMN
+        if 'data' in data:
+            df = pd.DataFrame(data['data'])
+            df.to_csv(f"data/raw/{self.symbol}_{self.interval}.csv", mode='a', header=False)
+            print(f"Data received and stored for {self.symbol} at interval {self.interval}")
+            
+            # Calculate technical indicators here and store in market_data dict
+            market_data = {
+                "price": df[['price']],
+                "volume": df[['volume']],
+                # Calculate RSI, MACD, Fibonacci levels...
+                "rsi": self.calculate_rsi(df),
+                "macd": self.calculate_macd(df),
+                "fibonacci": self.calculate_fibonacci(df)
+            }
+            self.gmn.update_graph(market_data)
+            print(f"GMN updated with new data for {self.symbol} at interval {self.interval}")
+
+    def calculate_rsi(self, df):
+        # Implement RSI calculation
+        # This is a placeholder implementation
+        return pd.DataFrame({'rsi': [50] * len(df)})
+
+    def calculate_macd(self, df):
+        # Implement MACD calculation
+        # This is a placeholder implementation
+        return pd.DataFrame({'macd': [0] * len(df)})
+
+    def calculate_fibonacci(self, df):
+        # Implement Fibonacci levels calculation
+        # This is a placeholder implementation
+        return pd.DataFrame({'fibonacci': [0] * len(df)})
+
+if __name__ == "__main__":
+    data_ingestion = DataIngestion()
+    asyncio.run(data_ingestion.connect())
+
+// File: models\agents\agent_1.py
+# models/agents/agent.py
+
+import torch
+import numpy as np
+from models.lnn.lnn_model import LiquidNeuralNetwork
+
+class TradingAgent:
+    def __init__(self, time_frame):
+        self.time_frame = time_frame
+        self.model = LiquidNeuralNetwork(input_size=INPUT_SIZE, hidden_size=64, output_size=1)
+        self.model.load_state_dict(torch.load("models/lnn/lnn_model.pth"))
+        self.model.eval()
+        self.position = None  # 'long', 'short', or None
+
+    def make_decision(self, market_data):
+        # Prepare data for the model
+        X = self.prepare_input(market_data)
+        with torch.no_grad():
+            output = self.model(X.unsqueeze(0).unsqueeze(0))
+            prediction = output.item()
+
+        # Simple decision logic based on prediction
+        if prediction > THRESHOLD_BUY:
+            if self.position != 'long':
+                self.enter_position('long')
+        elif prediction < THRESHOLD_SELL:
+            if self.position != 'short':
+                self.enter_position('short')
+        else:
+            self.exit_position()
+
+    def prepare_input(self, market_data):
+        # Extract features from market_data for the model
+        features = np.array([...])  # Replace with actual feature extraction
+        return torch.tensor(features, dtype=torch.float32)
+
+    def enter_position(self, position_type):
+        # Code to execute trade via MEXC API
+        print(f"Entering {position_type} position.")
+        self.position = position_type
+
+    def exit_position(self):
+        if self.position is not None:
+            # Code to exit trade via MEXC API
+            print(f"Exiting {self.position} position.")
+            self.position = None
+
+
+// File: models\agents\rl_agent.py
+# models/agents/rl_agent.py
+
+import gym
+import numpy as np
+import torch
+from stable_baselines3 import PPO
+
+class TradingEnvironment(gym.Env):
+    def __init__(self, market_data):
+        super(TradingEnvironment, self).__init__()
+        self.market_data = market_data
+        self.current_step = 0
+        self.action_space = gym.spaces.Discrete(3)  # Buy, Sell, Hold
+        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(OBSERVATION_SPACE_SIZE,), dtype=np.float32)
+
+    def reset(self):
+        self.current_step = 0
+        return self._next_observation()
+
+    def _next_observation(self):
+        # Return the next market observation
+        obs = self.market_data.iloc[self.current_step]
+        return obs.values
+
+    def step(self, action):
+        # Execute one time step within the environment
+        self.current_step += 1
+
+        reward = self._calculate_reward(action)
+        done = self.current_step >= len(self.market_data) - 1
+        obs = self._next_observation() if not done else np.zeros(self.observation_space.shape)
+
+        return obs, reward, done, {}
+
+    def _calculate_reward(self, action):
+        # Implement reward calculation
+        return reward
+
+def train_rl_agent():
+    # Load market data
+    market_data = pd.read_csv("data/distilled/distilled_data.csv")
+    env = TradingEnvironment(market_data)
+    model = PPO("MlpPolicy", env, verbose=1)
+    model.learn(total_timesteps=10000)
+    model.save("models/agents/ppo_agent")
+
+if __name__ == "__main__":
+    train_rl_agent()
+
+
+// File: models\gmn\gmn.py
+# models/gmn/gmn.py
+
+import networkx as nx
+import pandas as pd
+import numpy as np
+
+class GraphMetanetwork:
+    def __init__(self):
+        self.graph = nx.DiGraph()
+
+    def initialize_nodes(self, time_frames, indicators):
+        # Create nodes for time frames and indicators
+        for tf in time_frames:
+            self.graph.add_node(tf, type='time_frame')
+        for ind in indicators:
+            self.graph.add_node(ind, type='indicator')
+
+    def update_graph(self, market_data):
+        # Update nodes and edges with new market data
+        # market_data is a dict with keys as indicators and values as dataframes
+        for ind, df in market_data.items():
+            # Update node attributes
+            self.graph.nodes[ind]['data'] = df
+
+        # Update edges based on correlations or other relationships
+        self.calculate_correlations(market_data)
+
+    def calculate_correlations(self, market_data):
+        # Example: calculate correlations between indicators
+        indicators = list(market_data.keys())
+        for i in range(len(indicators)):
+            for j in range(i+1, len(indicators)):
+                ind1 = indicators[i]
+                ind2 = indicators[j]
+                corr = market_data[ind1]['value'].corr(market_data[ind2]['value'])
+                self.graph.add_edge(ind1, ind2, weight=corr)
+
+    def get_subgraph(self, nodes):
+        return self.graph.subgraph(nodes)
+
+    def visualize_graph(self):
+        # Optional: Code to visualize the graph
+        pass
+
+
+// File: models\lnn\lnn_model.py
+# models/lnn/lnn_model.py
+
+import torch
+import torch.nn as nn
+
+class LiquidNeuralNetwork(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size):
+        super(LiquidNeuralNetwork, self).__init__()
+        self.liquid_layer = nn.RNN(input_size, hidden_size, nonlinearity='relu')
+        self.fc = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        out, _ = self.liquid_layer(x)
+        out = self.fc(out[:, -1, :])
+        return out
+
+
+// File: models\lnn\train_lnn.py
+# models/lnn/train_lnn.py
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from models.lnn.lnn_model import LiquidNeuralNetwork
+from torch.utils.data import DataLoader, TensorDataset
+
+def train_lnn():
+    # Load distilled dataset
+    data = pd.read_csv("data/distilled/distilled_data.csv")
+    X = data.iloc[:, :-1].values  # Features
+    y = data.iloc[:, -1].values   # Labels
+
+    # Convert to tensors
+    X_tensor = torch.tensor(X, dtype=torch.float32)
+    y_tensor = torch.tensor(y, dtype=torch.float32)
+
+    # Create DataLoader
+    dataset = TensorDataset(X_tensor, y_tensor)
+    dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+
+    # Initialize model, loss function, optimizer
+    model = LiquidNeuralNetwork(input_size=X.shape[1], hidden_size=64, output_size=1)
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+    # Training loop
+    epochs = 10
+    for epoch in range(epochs):
+        for X_batch, y_batch in dataloader:
+            optimizer.zero_grad()
+            outputs = model(X_batch.unsqueeze(1))
+            loss = criterion(outputs.squeeze(), y_batch)
+            loss.backward()
+            optimizer.step()
+        print(f"Epoch {epoch+1}/{epochs}, Loss: {loss.item()}")
+
+    # Save the trained model
+    torch.save(model.state_dict(), "models/lnn/lnn_model.pth")
+
+if __name__ == "__main__":
+    train_lnn()
+
+
+// File: models\utils\risk_management.py
+# models/utils/risk_management.py
+
+class RiskManagement:
+    def __init__(self):
+        self.max_drawdown = 0
+        self.profit = 0
+
+    def update_metrics(self, trade_result):
+        # Update profit and drawdown
+        self.profit += trade_result['profit']
+        # Calculate drawdown
+        self.max_drawdown = max(self.max_drawdown, trade_result['drawdown'])
+
+    def check_risk(self):
+        # Implement risk checks
+        if self.max_drawdown > MAX_DRAWDOWN_THRESHOLD:
+            return False  # Stop trading
+        return True
+
+
+// File: tests\test_mexc_data_ingestion.py
+import pytest
+import asyncio
+import json
+from unittest.mock import Mock, patch
+from data.mexc_data_ingestion import DataIngestion
+
+@pytest.fixture
+def data_ingestion():
+    return DataIngestion(symbol="BTC_USDT", interval="Min1")
+
+@pytest.mark.asyncio
+async def test_connect_and_process_data(data_ingestion):
+    # Mock WebSocket connection
+    mock_websocket = Mock()
+    mock_websocket.recv.side_effect = [
+        json.dumps({
+            "data": {
+                "k": {
+                    "t": 1625097600000,
+                    "o": "35000.00",
+                    "h": "35100.00",
+                    "l": "34900.00",
+                    "c": "35050.00",
+                    "v": "100.5",
+                    "q": "3520250.00"
+                }
+            }
+        }),
+        Exception("WebSocket closed")
+    ]
+
+    # Mock GMN update method
+    with patch.object(data_ingestion.gmn, 'update_graph') as mock_update_graph:
+        # Mock WebSocket connection context
+        with patch('websockets.connect', return_value=mock_websocket):
+            # Run the connect method
+            await data_ingestion.connect()
+
+    # Assertions
+    assert mock_websocket.send.called
+    send_args = mock_websocket.send.call_args[0][0]
+    assert json.loads(send_args) == {
+        "method": "SUBSCRIPTION",
+        "params": ["perpetual@public.kline.v3.api@BTC_USDT@Min1"]
+    }
+
+    assert mock_update_graph.called
+    update_args = mock_update_graph.call_args[0][0]
+    assert "price" in update_args
+    assert "volume" in update_args
+    assert "rsi" in update_args
+    assert "macd" in update_args
+    assert "fibonacci" in update_args
+
+@pytest.mark.asyncio
+async def test_process_data(data_ingestion):
+    test_data = {
+        "data": {
+            "k": {
+                "t": 1625097600000,
+                "o": "35000.00",
+                "h": "35100.00",
+                "l": "34900.00",
+                "c": "35050.00",
+                "v": "100.5",
+                "q": "3520250.00"
+            }
+        }
+    }
+
+    # Mock GMN update method
+    with patch.object(data_ingestion.gmn, 'update_graph') as mock_update_graph:
+        # Mock CSV file writing
+        with patch('pandas.DataFrame.to_csv') as mock_to_csv:
+            await data_ingestion.process_data(test_data)
+
+    # Assertions
+    assert mock_to_csv.called
+    assert mock_update_graph.called
+
+    update_args = mock_update_graph.call_args[0][0]
+    assert "price" in update_args
+    assert "volume" in update_args
+    assert "rsi" in update_args
+    assert "macd" in update_args
+    assert "fibonacci" in update_args
+
+    assert len(update_args["price"]) == 1
+    assert update_args["price"]["value"].iloc[0] == 35050.00
+    assert update_args["volume"]["value"].iloc[0] == 100.5
+
+if __name__ == "__main__":
+    pytest.main()
+
+// File: tests\test_minimal.py
+def test_minimal():
+       assert True
+
