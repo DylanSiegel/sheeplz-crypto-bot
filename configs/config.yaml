@@ -1,0 +1,25 @@
+# File: configs/config.yaml
+
+symbol: BTC_USDT
+interval: Min1
+timeframes: ["1m", "5m", "15m", "1h", "4h"]
+indicators: ["price", "volume", "rsi", "macd", "fibonacci"]
+max_history_length: 1000
+lnn_model_path: models/lnn/lnn_model.pth
+lnn_hidden_size: 64
+lnn_training_epochs: 10
+training_history_length: 500
+lnn_learning_rate: 0.001
+threshold_buy: 0.7
+threshold_sell: 0.3
+risk_parameters:
+  max_drawdown: 0.1
+  max_position_size: 0.05
+trade_parameters:
+  leverage: 20
+  order_type: 1  # 1: Market order
+  volume: 1
+  open_type: 1  # 1: Isolated margin
+agent_loop_delay: 1
+reconnect_delay: 5
+log_level: INFO
