@@ -1,15 +1,21 @@
-# File: models/gmn/gmn.py
-
 import networkx as nx
 from collections import deque
 import numpy as np
-import talib
+# import talib  # We'll replace this
 import logging
 import asyncio
 import concurrent.futures
 import threading
 
+# Import the alternative TA library
+import pandas_ta as ta
+
 class CryptoGMN:
+    """
+    Graph Market Network (GMN) for managing and updating cryptocurrency market data.
+    Uses networkx to represent market data as a graph.
+    Calculates technical indicators using pandas_ta.
+    """
     def __init__(self, timeframes, indicators, max_history_length=1000):
         self.timeframes = timeframes
         self.indicators = indicators
@@ -20,6 +26,7 @@ class CryptoGMN:
         self.lock = threading.Lock()
 
     def _initialize_nodes(self):
+        """Initializes nodes in the graph for each timeframe and indicator."""
         for timeframe in self.timeframes:
             for indicator in self.indicators:
                 self.graph.add_node(
@@ -27,12 +34,12 @@ class CryptoGMN:
                     data=deque(maxlen=self.max_history_length)
                 )
 
-    async def update_graph(self, new_data_items):
+    async def update_graph(self, new_data_items, pool: multiprocessing.Pool):  # Receive the pool
         """Asynchronously updates the graph with new data."""
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(self.executor, self._update_node_data_batch, new_data_items)
+        await loop.run_in_executor(self.executor, self._update_node_data_batch, new_data_items, pool)
 
-    def _update_node_data_batch(self, new_data_items):
+    def _update_node_data_batch(self, new_data_items, pool):  # Receive the pool
         """Synchronously updates the graph nodes with new data."""
         with self.lock:
             for new_data_item in new_data_items:
@@ -44,21 +51,21 @@ class CryptoGMN:
                         self.graph.nodes[(timeframe, "price")]['data'].append(price)
                         self.graph.nodes[(timeframe, "volume")]['data'].append(volume)
 
-                        # Recalculate indicators
-                        prices = list(self.graph.nodes[(timeframe, "price")]['data'])
-                        if len(prices) >= 14:  # Minimum data length for indicators
-                            if 'rsi' in self.indicators:
-                                rsi = self.calculate_rsi(prices)
-                                if rsi is not None:
-                                    self.graph.nodes[(timeframe, "rsi")]['data'].append(rsi)
-                            if 'macd' in self.indicators:
-                                macd = self.calculate_macd(prices)
-                                if macd is not None:
-                                    self.graph.nodes[(timeframe, "macd")]['data'].append(macd)
-                            if 'fibonacci' in self.indicators:
-                                fibonacci = self.calculate_fibonacci(prices)
-                                if fibonacci is not None:
-                                    self.graph.nodes[(timeframe, "fibonacci")]['data'].append(fibonacci)
+                        # Asynchronous indicator calculations
+                        results = []
+                        for indicator_name in self.indicators:
+                            if indicator_name not in ("price", "volume"):  # Exclude price and volume
+                                results.append(pool.apply_async(
+                                    self.calculate_indicator,
+                                    (list(self.graph.nodes[(timeframe, "price")]['data']), indicator_name)
+                                ))
+
+                        for res, indicator_name in zip(results, self.indicators):
+                            if indicator_name not in ("price", "volume"):
+                                indicator_value = res.get()
+                                if indicator_value is not None:
+                                    self.graph.nodes[(timeframe, indicator_name)]['data'].append(indicator_value)
+
                     except Exception as e:
                         logging.error(f"Error updating data for timeframe {timeframe}: {e}, Data: {new_data_item}")
 
@@ -87,27 +94,25 @@ class CryptoGMN:
         """Shuts down the executor gracefully."""
         self.executor.shutdown(wait=True)
 
-    def calculate_rsi(self, prices, period=14):
-        """Calculates the Relative Strength Index (RSI)."""
+    def calculate_indicator(self, prices, indicator_name):
+        """
+        Calculates the specified technical indicator using pandas_ta.
+        """
         try:
-            rsi = talib.RSI(np.array(prices, dtype=np.float64), timeperiod=period)
-            return rsi[-1] if len(rsi) > 0 else None
+            if indicator_name == 'rsi':
+                return ta.rsi(pd.Series(prices), length=14).iloc[-1]
+            elif indicator_name == 'macd':
+                macd = ta.macd(pd.Series(prices), fast=12, slow=26, signal=9)
+                return macd['MACD_12_26_9'].iloc[-1]  # Access the MACD line
+            elif indicator_name == 'fibonacci':
+                # pandas_ta doesn't have a direct Fibonacci retracement indicator
+                # You'll need to implement your Fibonacci calculation logic here
+                return self.calculate_fibonacci(prices)
+            else:
+                logging.warning(f"Unsupported indicator: {indicator_name}")
+                return None
         except Exception as e:
-            logging.error(f"Error calculating RSI: {e}")
-            return None
-
-    def calculate_macd(self, prices, fastperiod=12, slowperiod=26, signalperiod=9):
-        """Calculates the Moving Average Convergence Divergence (MACD)."""
-        try:
-            macd, macdsignal, macdhist = talib.MACD(
-                np.array(prices, dtype=np.float64),
-                fastperiod=fastperiod,
-                slowperiod=slowperiod,
-                signalperiod=signalperiod
-            )
-            return macd[-1] if len(macd) > 0 else None
-        except Exception as e:
-            logging.error(f"Error calculating MACD: {e}")
+            logging.error(f"Error calculating indicator {indicator_name}: {e}")
             return None
 
     def calculate_fibonacci(self, prices, lookback=14):
