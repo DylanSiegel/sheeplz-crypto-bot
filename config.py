@@ -1,8 +1,6 @@
-# File: models/utils/config.py
-
 import yaml
+import logging
 from typing import List, Dict, Any
-
 
 class Config:
     def __init__(self, config_path: str):
@@ -40,6 +38,12 @@ class Config:
                 self.agent_loop_delay: int = self.config.get("agent_loop_delay", 1)
                 self.reconnect_delay: int = self.config.get("reconnect_delay", 5)
                 self.log_level = self.config.get("log_level", "INFO")
+
+                # Device
+                self.device = self.config.get("device", "cpu")
+
+                # Private Channels
+                self.private_channels: List[str] = self.config.get("private_channels", [])
 
         except FileNotFoundError:
             raise FileNotFoundError(f"Config file not found: {config_path}")

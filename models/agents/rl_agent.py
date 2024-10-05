@@ -2,7 +2,6 @@
 
 import gym
 import numpy as np
-import torch
 from stable_baselines3 import PPO
 
 class TradingEnvironment(gym.Env):

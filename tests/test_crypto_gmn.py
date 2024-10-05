@@ -1,84 +1,81 @@
-# File: tests/test_crypto_gmn.py
-
-import pytest
+import asyncio
+import logging
+import os
+from dotenv import load_dotenv
+from data.mexc_data_ingestion import Config, DataIngestion
 from models.gmn.gmn import CryptoGMN
 
-@pytest.fixture
-def gmn():
-    timeframes = ["1m"]
-    indicators = ["price", "volume", "rsi", "macd", "fibonacci"]
-    return CryptoGMN(timeframes, indicators, max_history_length=100)
+# Load environment variables
+load_dotenv()
 
-@pytest.mark.asyncio
-async def test_gmn_data_update(gmn):
-    new_data = [{
-        "t": 1625097600000,
-        "o": "35000.00",
-        "h": "35100.00",
-        "l": "34900.00",
-        "c": "35050.00",
-        "v": "100.5",
-        "q": "3520250.00"
-    }]
-    await gmn.update_graph(new_data)
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-    price_data = gmn.get_data("1m", "price")
-    volume_data = gmn.get_data("1m", "volume")
+class TestGMN(CryptoGMN):
+    def __init__(self, timeframes, indicators, max_history_length=1000):
+        super().__init__(timeframes, indicators, max_history_length)
+        self.received_data = []
 
-    assert price_data == [35050.00]
-    assert volume_data == [100.5]
+    async def update_graph(self, new_data_items):
+        await super().update_graph(new_data_items)
+        self.received_data.extend(new_data_items)
+        logging.info(f"Received {len(new_data_items)} new data items. Total: {len(self.received_data)}")
 
-@pytest.mark.asyncio
-async def test_gmn_indicator_calculations(gmn):
-    # Insert enough data to calculate indicators
-    for i in range(15):
-        await gmn.update_graph([{
-            "t": 1625097600000 + i * 60000,
-            "o": "35000.00",
-            "h": "35100.00",
-            "l": "34900.00",
-            "c": str(35050 + i),
-            "v": "100.5",
-            "q": "3520250.00"
-        }])
-
-    rsi_data = gmn.get_data("1m", "rsi")
-    macd_data = gmn.get_data("1m", "macd")
-    fibonacci_data = gmn.get_data("1m", "fibonacci")
-
-    assert len(rsi_data) == 1
-    assert len(macd_data) == 1
-    assert len(fibonacci_data) == 1
-
-@pytest.mark.asyncio
-async def test_gmn_concurrent_updates(gmn):
-    # Simulate concurrent updates
-    new_data_1 = [{
-        "t": 1625097600000,
-        "o": "35000.00",
-        "h": "35100.00",
-        "l": "34900.00",
-        "c": "35050.00",
-        "v": "100.5",
-        "q": "3520250.00"
-    }]
-    new_data_2 = [{
-        "t": 1625097660000,
-        "o": "35050.00",
-        "h": "35150.00",
-        "l": "34950.00",
-        "c": "35100.00",
-        "v": "101.0",
-        "q": "3530250.00"
-    }]
-
-    await asyncio.gather(
-        gmn.update_graph(new_data_1),
-        gmn.update_graph(new_data_2)
+async def test_data_ingestion():
+    # Configuration
+    config = Config(
+        symbol="BTC_USDT",
+        timeframes=["1m", "5m", "15m"],
+        private_channels=[],  # No private channels for this test
+        reconnect_delay=5,
+        max_reconnect_delay=60,
+        backoff_factor=2.0,
+        rate_limit=100,
+        processing_queue_size=1000
     )
 
-    price_data = gmn.get_data("1m", "price")
-    volume_data = gmn.get_data("1m", "volume")
+    # Initialize TestGMN
+    gmn = TestGMN(config.timeframes, ["price", "volume", "rsi", "macd", "fibonacci"])
 
-    assert price_data == [35050.00, 35100.00]
-    assert volume_data == [100.5, 101.0]
+    # Initialize DataIngestion
+    data_ingestion = DataIngestion(gmn=gmn, config=config)
+
+    # Run the ingestion process for a fixed duration
+    ingestion_task = asyncio.create_task(data_ingestion.connect())
+
+    # Let it run for 5 minutes
+    await asyncio.sleep(300)
+
+    # Stop the ingestion process
+    ingestion_task.cancel()
+    await data_ingestion.close()
+
+    # Analyze the received data
+    logging.info(f"Total data points received: {len(gmn.received_data)}")
+
+    # Check if data was received for all timeframes
+    timeframe_counts = {tf: 0 for tf in config.timeframes}
+    for item in gmn.received_data:
+        if 'interval' in item:
+            timeframe_counts[item['interval']] += 1
+
+    for tf, count in timeframe_counts.items():
+        logging.info(f"Data points for {tf}: {count}")
+        assert count > 0, f"No data received for timeframe {tf}"
+
+    # Check if all required fields are present in the data
+    required_fields = ['t', 'o', 'h', 'l', 'c', 'v']
+    for item in gmn.received_data[:10]:  # Check first 10 items
+        for field in required_fields:
+            assert field in item, f"Field {field} missing in data: {item}"
+
+    # Check if RSI, MACD, and Fibonacci levels are calculated
+    for tf in config.timeframes:
+        assert len(gmn.get_data(f"{tf}_rsi")) > 0, f"No RSI data for {tf}"
+        assert len(gmn.get_data(f"{tf}_macd")) > 0, f"No MACD data for {tf}"
+        assert len(gmn.get_data(f"{tf}_fibonacci")) > 0, f"No Fibonacci data for {tf}"
+
+    logging.info("All tests passed successfully!")
+
+if __name__ == "__main__":
+    asyncio.run(test_data_ingestion())

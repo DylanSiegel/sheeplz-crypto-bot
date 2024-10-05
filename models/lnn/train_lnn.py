@@ -6,7 +6,6 @@ import torch.nn as nn
 import torch.optim as optim
 from models.lnn.lnn_model import LiquidNeuralNetwork
 from models.utils.config import Config
-import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 import logging
 

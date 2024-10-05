@@ -1,6 +1,5 @@
 # File: models/agents/agent.py
 
-import asyncio
 import logging
 import numpy as np
 import torch
@@ -12,7 +11,6 @@ import aiohttp  # Ensure aiohttp is imported
 import hashlib
 import hmac
 import time
-import joblib
 
 class TradingAgent:
     def __init__(
