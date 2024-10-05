@@ -5,10 +5,10 @@ import asyncio
 import logging
 import tracemalloc
 import os
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict
 import torch
 import numpy as np
-import aiohttp  # Use aiohttp for asynchronous HTTP requests
+import aiohttp  # Asynchronous HTTP client
 import joblib    # For saving and loading scalers
 
 from data.mexc_data_ingestion import DataIngestion
@@ -43,14 +43,20 @@ async def main():
     timeframes = config.timeframes
     indicators = config.indicators
     max_history_length = config.max_history_length
+
+    # Initialize GMN
     gmn = CryptoGMN(timeframes, indicators, max_history_length=max_history_length)
+
+    # Initialize Data Ingestion
     data_ingestion = DataIngestion(gmn, config)
+
+    # Initialize Risk Manager
     risk_manager = RiskManager(config.risk_parameters)
 
     # Load or initialize scaler
     scaler = await load_scaler(scaler_path)
 
-    # LNN Model (Load or train)
+    # Initialize or train LNN Model
     lnn_model_path = config.lnn_model_path
     try:
         model_state_dict = torch.load(lnn_model_path, map_location=torch.device('cpu'))
@@ -58,8 +64,6 @@ async def main():
         model = LiquidNeuralNetwork(input_size, config.lnn_hidden_size, 1)
         model.load_state_dict(model_state_dict)
         model.eval()
-        # Decide if half precision is necessary
-        # model.half()
         logging.info("Loaded pre-trained LNN model.")
     except FileNotFoundError:
         logging.info("Pre-trained LNN model not found. Training a new model...")
@@ -67,12 +71,15 @@ async def main():
             model = await train_and_save_lnn(gmn, lnn_model_path, config=config, scaler=scaler)
             if model is None:
                 logging.error("Failed to train LNN model. Exiting.")
+                await shutdown(gmn, data_ingestion, risk_manager, scaler)
                 return
         except Exception as e:
             logging.error(f"Error preparing training data or training the model: {e}")
+            await shutdown(gmn, data_ingestion, risk_manager, scaler)
             return
     except Exception as e:
         logging.error(f"Error loading LNN model: {e}")
+        await shutdown(gmn, data_ingestion, risk_manager, scaler)
         return
 
     # Initialize TradingAgent with the loaded scaler
@@ -80,11 +87,16 @@ async def main():
 
     tracemalloc.start()
 
+    # Create asyncio tasks
+    tasks = [
+        asyncio.create_task(data_ingestion.connect()),
+        asyncio.create_task(agent_loop(agent, gmn))
+    ]
+
     try:
-        await asyncio.gather(
-            data_ingestion.connect(),
-            agent_loop(agent, gmn)
-        )
+        await asyncio.gather(*tasks)
+    except asyncio.CancelledError:
+        logging.info("Main tasks have been cancelled.")
     except Exception as e:
         logging.error(f"Error in main execution: {e}")
     finally:
@@ -96,7 +108,32 @@ async def main():
             logging.info(stat)
 
         tracemalloc.stop()
+        await shutdown(gmn, data_ingestion, risk_manager, scaler, agent)
+
+async def shutdown(gmn: CryptoGMN, data_ingestion: DataIngestion, risk_manager: RiskManager, scaler: MinMaxScaler, agent: Optional[TradingAgent] = None):
+    """Gracefully shuts down all components."""
+    try:
         gmn.shutdown()
+    except Exception as e:
+        logging.error(f"Error shutting down GMN: {e}")
+
+    try:
+        await data_ingestion.close()
+    except AttributeError:
+        # If DataIngestion does not have a close method
+        pass
+    except Exception as e:
+        logging.error(f"Error shutting down Data Ingestion: {e}")
+
+    try:
+        await agent.close()
+    except AttributeError:
+        # If TradingAgent does not have a close method
+        pass
+    except Exception as e:
+        logging.error(f"Error shutting down Trading Agent: {e}")
+
+    logging.info("Shutdown complete.")
 
 async def agent_loop(agent: TradingAgent, gmn: CryptoGMN):
     """The main agent loop that retrieves data, makes decisions, and executes trades."""
@@ -138,7 +175,7 @@ async def train_and_save_lnn(
         optimizer = torch.optim.Adam(model.parameters(), lr=config.lnn_learning_rate)
 
         epochs = config.lnn_training_epochs
-        batch_size = config.get("lnn_batch_size", 32)  # Optional: Add batch_size to config.yaml
+        batch_size = config.config.get("lnn_batch_size", 32)  # Optional: Add batch_size to config.yaml
         dataset = torch.utils.data.TensorDataset(torch.tensor(X_train, dtype=torch.float32), torch.tensor(y_train, dtype=torch.float32))
         dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
@@ -240,7 +277,10 @@ async def load_scaler(scaler_path: str) -> MinMaxScaler:
     return scaler
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("Trading bot stopped by user.")
 
 
 // File: main.py
@@ -1011,6 +1051,668 @@ class RiskManager:
 
 
 // File: models\utils\__init__.py
+
+
+// File: tests\test_config.py
+# File: tests/test_config.py
+
+import pytest
+import os
+from models.utils.config import Config
+from unittest.mock import mock_open, patch
+import yaml
+
+def test_config_loading():
+    mock_yaml = """
+    symbol: BTC_USDT
+    interval: Min1
+    timeframes: ["1m", "5m", "15m", "1h", "4h"]
+    indicators: ["price", "volume", "rsi", "macd", "fibonacci"]
+    max_history_length: 1000
+    lnn_model_path: models/lnn/lnn_model.pth
+    lnn_hidden_size: 64
+    lnn_training_epochs: 10
+    training_history_length: 500
+    lnn_learning_rate: 0.001
+    threshold_buy: 0.7
+    threshold_sell: 0.3
+    risk_parameters:
+      max_drawdown: 0.1
+      max_position_size: 0.05
+    trade_parameters:
+      leverage: 20
+      order_type: 1
+      volume: 1
+      open_type: 1
+    agent_loop_delay: 1
+    reconnect_delay: 5
+    log_level: INFO
+    """
+    with patch("builtins.open", mock_open(read_data=mock_yaml)):
+        config = Config("configs/config.yaml")
+        assert config.symbol == "BTC_USDT"
+        assert config.interval == "Min1"
+        assert config.timeframes == ["1m", "5m", "15m", "1h", "4h"]
+        assert config.indicators == ["price", "volume", "rsi", "macd", "fibonacci"]
+        assert config.max_history_length == 1000
+        assert config.lnn_model_path == "models/lnn/lnn_model.pth"
+        assert config.lnn_hidden_size == 64
+        assert config.lnn_training_epochs == 10
+        assert config.training_history_length == 500
+        assert config.lnn_learning_rate == 0.001
+        assert config.threshold_buy == 0.7
+        assert config.threshold_sell == 0.3
+        assert config.risk_parameters == {"max_drawdown": 0.1, "max_position_size": 0.05}
+        assert config.trade_parameters == {
+            "leverage": 20,
+            "order_type": 1,
+            "volume": 1,
+            "open_type": 1
+        }
+        assert config.agent_loop_delay == 1
+        assert config.reconnect_delay == 5
+        assert config.log_level == "INFO"
+
+def test_config_file_not_found():
+    with pytest.raises(FileNotFoundError):
+        Config("configs/non_existent_config.yaml")
+
+def test_config_invalid_yaml():
+    invalid_yaml = "symbol: BTC_USDT\ninvalid_yaml: [unclosed"
+    with patch("builtins.open", mock_open(read_data=invalid_yaml)):
+        with pytest.raises(ValueError):
+            Config("configs/config.yaml")
+
+
+// File: tests\test_crypto_gmn.py
+# File: tests/test_crypto_gmn.py
+
+import pytest
+from models.gmn.gmn import CryptoGMN
+
+@pytest.fixture
+def gmn():
+    timeframes = ["1m"]
+    indicators = ["price", "volume", "rsi", "macd", "fibonacci"]
+    return CryptoGMN(timeframes, indicators, max_history_length=100)
+
+@pytest.mark.asyncio
+async def test_gmn_data_update(gmn):
+    new_data = [{
+        "t": 1625097600000,
+        "o": "35000.00",
+        "h": "35100.00",
+        "l": "34900.00",
+        "c": "35050.00",
+        "v": "100.5",
+        "q": "3520250.00"
+    }]
+    await gmn.update_graph(new_data)
+
+    price_data = gmn.get_data("1m", "price")
+    volume_data = gmn.get_data("1m", "volume")
+
+    assert price_data == [35050.00]
+    assert volume_data == [100.5]
+
+@pytest.mark.asyncio
+async def test_gmn_indicator_calculations(gmn):
+    # Insert enough data to calculate indicators
+    for i in range(15):
+        await gmn.update_graph([{
+            "t": 1625097600000 + i * 60000,
+            "o": "35000.00",
+            "h": "35100.00",
+            "l": "34900.00",
+            "c": str(35050 + i),
+            "v": "100.5",
+            "q": "3520250.00"
+        }])
+
+    rsi_data = gmn.get_data("1m", "rsi")
+    macd_data = gmn.get_data("1m", "macd")
+    fibonacci_data = gmn.get_data("1m", "fibonacci")
+
+    assert len(rsi_data) == 1
+    assert len(macd_data) == 1
+    assert len(fibonacci_data) == 1
+
+@pytest.mark.asyncio
+async def test_gmn_concurrent_updates(gmn):
+    # Simulate concurrent updates
+    new_data_1 = [{
+        "t": 1625097600000,
+        "o": "35000.00",
+        "h": "35100.00",
+        "l": "34900.00",
+        "c": "35050.00",
+        "v": "100.5",
+        "q": "3520250.00"
+    }]
+    new_data_2 = [{
+        "t": 1625097660000,
+        "o": "35050.00",
+        "h": "35150.00",
+        "l": "34950.00",
+        "c": "35100.00",
+        "v": "101.0",
+        "q": "3530250.00"
+    }]
+
+    await asyncio.gather(
+        gmn.update_graph(new_data_1),
+        gmn.update_graph(new_data_2)
+    )
+
+    price_data = gmn.get_data("1m", "price")
+    volume_data = gmn.get_data("1m", "volume")
+
+    assert price_data == [35050.00, 35100.00]
+    assert volume_data == [100.5, 101.0]
+
+
+// File: tests\test_crypto_trading_bot.py
+# File: tests/test_crypto_trading_bot.py
+
+import pytest
+import asyncio
+from unittest.mock import AsyncMock, patch
+from crypto_trading_bot import main, shutdown
+from models.gmn.gmn import CryptoGMN
+from models.agents.agent import TradingAgent
+from models.utils.risk_management import RiskManager
+from models.utils.config import Config
+from sklearn.preprocessing import MinMaxScaler
+
+@pytest.mark.asyncio
+async def test_main_success():
+    # Mock Config
+    with patch("models.utils.config.Config.__init__", return_value=None) as mock_config_init:
+        config = Config("configs/config.yaml")
+        config.timeframes = ["1m"]
+        config.indicators = ["price", "volume", "rsi", "macd", "fibonacci"]
+        config.max_history_length = 1000
+        config.lnn_model_path = "models/lnn/lnn_model.pth"
+        config.lnn_hidden_size = 64
+        config.lnn_training_epochs = 1
+        config.training_history_length = 500
+        config.lnn_learning_rate = 0.001
+        config.threshold_buy = 0.7
+        config.threshold_sell = 0.3
+        config.risk_parameters = {"max_drawdown": 0.1, "max_position_size": 0.05}
+        config.trade_parameters = {"leverage": 20, "order_type": 1, "volume": 1, "open_type": 1}
+        config.agent_loop_delay = 1
+        config.reconnect_delay = 5
+        config.log_level = "INFO"
+
+        # Mock CryptoGMN
+        with patch("crypto_trading_bot.CryptoGMN", return_value=AsyncMock(spec=CryptoGMN)) as mock_gmn_cls:
+            mock_gmn = mock_gmn_cls.return_value
+            mock_gmn.get_all_data.return_value = {
+                "1m": {
+                    "price": [35050.00] * 501,
+                    "volume": [100.5] * 501,
+                    "rsi": [50] * 501,
+                    "macd": [0.1] * 501,
+                    "fibonacci": [35000.00] * 501
+                }
+            }
+
+            # Mock DataIngestion
+            with patch("crypto_trading_bot.DataIngestion", return_value=AsyncMock()) as mock_data_ingestion_cls:
+                mock_data_ingestion = mock_data_ingestion_cls.return_value
+                mock_data_ingestion.connect = AsyncMock()
+
+                # Mock TradingAgent
+                with patch("crypto_trading_bot.TradingAgent", return_value=AsyncMock()) as mock_agent_cls:
+                    mock_agent = mock_agent_cls.return_value
+                    mock_agent.make_decision = AsyncMock()
+
+                    # Mock model loading
+                    with patch("torch.load", return_value={}):
+                        with patch.object(TradingAgent, 'close', new_callable=AsyncMock):
+                            # Run main and ensure it starts correctly
+                            task = asyncio.create_task(main())
+                            await asyncio.sleep(0.1)  # Allow some time for tasks
+                            task.cancel()
+                            with pytest.raises(asyncio.CancelledError):
+                                await task
+
+                            mock_data_ingestion.connect.assert_called_once()
+                            mock_agent.make_decision.assert_not_called()  # As no data was fed
+
+@pytest.mark.asyncio
+async def test_main_with_model_training():
+    # Similar to above, but simulate missing model and trigger training
+    pass  # Placeholder for further integration tests
+
+
+// File: tests\test_data_ingestion.py
+
+
+// File: tests\test_gmn.py
+# File: tests/test_gmn.py
+
+import pytest
+from models.gmn.gmn import CryptoGMN
+from collections import deque
+import asyncio
+
+@pytest.fixture
+def gmn():
+    timeframes = ["1m"]
+    indicators = ["price", "volume", "rsi", "macd", "fibonacci"]
+    return CryptoGMN(timeframes, indicators, max_history_length=100)
+
+@pytest.mark.asyncio
+async def test_gmn_update_graph(gmn):
+    new_data = [{
+        "t": 1625097600000,
+        "o": "35000.00",
+        "h": "35100.00",
+        "l": "34900.00",
+        "c": "35050.00",
+        "v": "100.5",
+        "q": "3520250.00"
+    }]
+    await gmn.update_graph(new_data)
+
+    price_data = gmn.get_data("1m", "price")
+    volume_data = gmn.get_data("1m", "volume")
+    rsi_data = gmn.get_data("1m", "rsi")
+    macd_data = gmn.get_data("1m", "macd")
+    fibonacci_data = gmn.get_data("1m", "fibonacci")
+
+    assert price_data == [35050.00]
+    assert volume_data == [100.5]
+    assert len(rsi_data) == 0  # Not enough data for RSI
+    assert len(macd_data) == 0  # Not enough data for MACD
+    assert len(fibonacci_data) == 0  # Not enough data for Fibonacci
+
+    # Add more data to trigger indicator calculations
+    for i in range(1, 15):
+        await gmn.update_graph([{
+            "t": 1625097600000 + i * 60000,
+            "o": "35000.00",
+            "h": "35100.00",
+            "l": "34900.00",
+            "c": str(35000 + i),
+            "v": "100.5",
+            "q": "3520250.00"
+        }])
+
+    price_data = gmn.get_data("1m", "price")
+    assert len(price_data) == 15
+    assert rsi_data is not None
+    assert len(rsi_data) == 1
+    assert macd_data is not None
+    assert len(macd_data) == 1
+    assert fibonacci_data is not None
+    assert len(fibonacci_data) == 1
+
+@pytest.mark.asyncio
+async def test_gmn_concurrent_updates(gmn):
+    # Simulate concurrent updates
+    new_data_1 = [{
+        "t": 1625097600000,
+        "o": "35000.00",
+        "h": "35100.00",
+        "l": "34900.00",
+        "c": "35050.00",
+        "v": "100.5",
+        "q": "3520250.00"
+    }]
+    new_data_2 = [{
+        "t": 1625097660000,
+        "o": "35050.00",
+        "h": "35150.00",
+        "l": "34950.00",
+        "c": "35100.00",
+        "v": "101.0",
+        "q": "3530250.00"
+    }]
+
+    await asyncio.gather(
+        gmn.update_graph(new_data_1),
+        gmn.update_graph(new_data_2)
+    )
+
+    price_data = gmn.get_data("1m", "price")
+    volume_data = gmn.get_data("1m", "volume")
+    assert price_data == [35050.00, 35100.00]
+    assert volume_data == [100.5, 101.0]
+
+
+// File: tests\test_lnn_model.py
+# File: tests/test_lnn_model.py
+
+import pytest
+import torch
+from models.lnn.lnn_model import LiquidNeuralNetwork
+
+def test_lnn_forward():
+    input_size = 5
+    hidden_size = 10
+    output_size = 1
+    batch_size = 2
+    seq_len = 1
+
+    model = LiquidNeuralNetwork(input_size, hidden_size, output_size)
+    model.eval()
+
+    # Create a dummy input tensor
+    dummy_input = torch.randn(batch_size, seq_len, input_size)
+    output = model(dummy_input)
+
+    # Check output shape
+    assert output.shape == (batch_size, output_size)
+
+def test_lnn_training_step():
+    input_size = 5
+    hidden_size = 10
+    output_size = 1
+
+    model = LiquidNeuralNetwork(input_size, hidden_size, output_size)
+    criterion = torch.nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+    # Dummy data
+    X = torch.randn(4, 1, input_size)
+    y = torch.tensor([1, 0, 1, 0], dtype=torch.float32)
+
+    # Forward pass
+    outputs = model(X).squeeze()
+    loss = criterion(outputs, y)
+
+    # Backward pass
+    loss.backward()
+    optimizer.step()
+
+    # Ensure loss is a scalar
+    assert loss.item() >= 0
+
+
+// File: tests\test_risk_management.py
+# File: tests/test_risk_management.py
+
+import pytest
+from models.utils.risk_management import RiskManager
+
+@pytest.fixture
+def risk_manager():
+    params = {
+        "max_drawdown": 0.1,
+        "max_position_size": 0.05
+    }
+    return RiskManager(params)
+
+def test_risk_within_limits(risk_manager):
+    current_drawdown = 0.05
+    current_position = 'long'
+    market_data = {}
+    assert risk_manager.check_risk(current_drawdown, current_position, market_data) == True
+
+def test_risk_exceeds_drawdown(risk_manager):
+    current_drawdown = 0.15
+    current_position = 'long'
+    market_data = {}
+    assert risk_manager.check_risk(current_drawdown, current_position, market_data) == False
+
+def test_risk_without_position(risk_manager):
+    current_drawdown = 0.05
+    current_position = None
+    market_data = {}
+    assert risk_manager.check_risk(current_drawdown, current_position, market_data) == True
+
+def test_risk_edge_case(risk_manager):
+    current_drawdown = 0.1
+    current_position = 'short'
+    market_data = {}
+    assert risk_manager.check_risk(current_drawdown, current_position, market_data) == False  # Assuming >= is considered exceeding
+
+
+// File: tests\test_rl_agent.py
+# File: tests/test_rl_agent.py
+
+import pytest
+from models.agents.rl_agent import TradingEnvironment, train_rl_agent
+import pandas as pd
+from unittest.mock import patch
+
+@pytest.fixture
+def mock_market_data():
+    data = {
+        "price": [100, 102, 98, 101, 99, 105, 103],
+        "volume": [10, 15, 10, 20, 15, 25, 20],
+        "rsi": [50, 55, 45, 60, 50, 65, 55],
+        "macd": [0.1, 0.2, -0.1, 0.3, 0.0, 0.4, 0.2],
+        "fibonacci": [99, 100, 98, 101, 99, 105, 103]
+    }
+    return pd.DataFrame(data)
+
+def test_trading_environment_reset(mock_market_data):
+    env = TradingEnvironment(mock_market_data)
+    obs = env.reset()
+    assert env.current_step == 0
+    assert len(obs) == len(mock_market_data.columns)
+
+def test_trading_environment_step(mock_market_data):
+    env = TradingEnvironment(mock_market_data)
+    env.reset()
+    obs, reward, done, info = env.step(0)  # Action: Buy
+    assert env.current_step == 1
+    assert not done
+    assert len(obs) == len(mock_market_data.columns)
+
+
+// File: tests\test_trading_agent.py
+# File: tests/test_trading_agent.py
+
+import pytest
+import asyncio
+from unittest.mock import AsyncMock, patch
+import torch
+import numpy as np
+from models.agents.agent import TradingAgent
+from models.utils.config import Config
+from models.utils.risk_management import RiskManager
+from sklearn.preprocessing import MinMaxScaler
+
+@pytest.fixture
+def mock_config():
+    config_data = {
+        "threshold_buy": 0.7,
+        "threshold_sell": 0.3,
+        "trade_parameters": {
+            "leverage": 20,
+            "order_type": 1,
+            "volume": 1,
+            "open_type": 1
+        }
+    }
+    with patch("models.utils.config.Config.__init__", return_value=None):
+        config = Config("configs/config.yaml")
+        config.threshold_buy = 0.7
+        config.threshold_sell = 0.3
+        config.trade_parameters = {
+            "leverage": 20,
+            "order_type": 1,
+            "volume": 1,
+            "open_type": 1
+        }
+        return config
+
+@pytest.fixture
+def mock_risk_manager():
+    return AsyncMock(spec=RiskManager)
+
+@pytest.fixture
+def mock_model():
+    model = AsyncMock(spec=torch.nn.Module)
+    model.eval = AsyncMock()
+    model.__call__ = AsyncMock(return_value=torch.sigmoid(torch.tensor([0.8])))
+    return model
+
+@pytest.fixture
+def trading_agent(mock_config, mock_risk_manager, mock_model):
+    scaler = MinMaxScaler()
+    scaler.fit([[1,2,3], [4,5,6]])  # Dummy fit
+    return TradingAgent(
+        timeframes=["1m"],
+        indicators=["price", "volume", "rsi", "macd", "fibonacci"],
+        model=mock_model,
+        config=mock_config,
+        risk_manager=mock_risk_manager,
+        scaler=scaler
+    )
+
+@pytest.mark.asyncio
+async def test_trading_agent_make_decision_buy(trading_agent):
+    # Mock market data indicating a buy signal
+    market_data = {
+        "1m": {
+            "price": [35050.00],
+            "volume": [100.5],
+            "rsi": [50],
+            "macd": [0.1],
+            "fibonacci": [35000.00]
+        }
+    }
+
+    with patch.object(trading_agent, '_execute_trade', new_callable=AsyncMock) as mock_execute_trade:
+        with patch.object(trading_agent.risk_manager, 'check_risk', return_value=True):
+            await trading_agent.make_decision(market_data)
+            mock_execute_trade.assert_called_with('buy')
+
+@pytest.mark.asyncio
+async def test_trading_agent_make_decision_sell(trading_agent):
+    # Mock market data indicating a sell signal
+    trading_agent.model.return_value = torch.sigmoid(torch.tensor([-0.5]))
+    market_data = {
+        "1m": {
+            "price": [35100.00],
+            "volume": [101.0],
+            "rsi": [60],
+            "macd": [0.2],
+            "fibonacci": [35050.00]
+        }
+    }
+
+    with patch.object(trading_agent, '_execute_trade', new_callable=AsyncMock) as mock_execute_trade:
+        with patch.object(trading_agent.risk_manager, 'check_risk', return_value=True):
+            await trading_agent.make_decision(market_data)
+            mock_execute_trade.assert_called_with('sell')
+
+@pytest.mark.asyncio
+async def test_trading_agent_make_decision_hold(trading_agent):
+    # Mock market data indicating a hold signal
+    trading_agent.model.return_value = torch.sigmoid(torch.tensor([0.5]))
+    market_data = {
+        "1m": {
+            "price": [35150.00],
+            "volume": [102.0],
+            "rsi": [55],
+            "macd": [0.15],
+            "fibonacci": [35100.00]
+        }
+    }
+
+    with patch.object(trading_agent, '_execute_trade', new_callable=AsyncMock) as mock_execute_trade:
+        with patch.object(trading_agent.risk_manager, 'check_risk', return_value=True):
+            await trading_agent.make_decision(market_data)
+            mock_execute_trade.assert_not_called()
+
+@pytest.mark.asyncio
+async def test_trading_agent_risk_check_failed(trading_agent):
+    # Mock market data indicating a buy signal but risk check fails
+    trading_agent.model.return_value = torch.sigmoid(torch.tensor([0.8]))
+    market_data = {
+        "1m": {
+            "price": [35200.00],
+            "volume": [103.0],
+            "rsi": [65],
+            "macd": [0.25],
+            "fibonacci": [35150.00]
+        }
+    }
+
+    with patch.object(trading_agent.risk_manager, 'check_risk', return_value=False):
+        with patch.object(trading_agent, '_execute_trade', new_callable=AsyncMock) as mock_execute_trade:
+            await trading_agent.make_decision(market_data)
+            mock_execute_trade.assert_not_called()
+
+
+// File: tests\test_trading_agent_portfolio.py
+
+
+// File: tests\test_train_lnn.py
+# File: tests/test_train_lnn.py
+
+import pytest
+from unittest.mock import patch, MagicMock
+from models.lnn.train_lnn import train_lnn
+
+@pytest.mark.asyncio
+async def test_train_lnn_success():
+    # Mock Config
+    with patch("models.utils.config.Config.__init__", return_value=None) as mock_config_init:
+        config = Config("configs/config.yaml")
+        config.lnn_hidden_size = 64
+        config.lnn_training_epochs = 1
+        config.training_history_length = 500
+        config.lnn_learning_rate = 0.001
+        config.lnn_model_path = "models/lnn/lnn_model.pth"
+
+        # Mock data loading
+        with patch("pandas.read_csv") as mock_read_csv:
+            mock_df = MagicMock()
+            mock_df.iloc.__getitem__.return_value = MagicMock()
+            mock_read_csv.return_value = mock_df
+
+            # Mock scaler
+            with patch("sklearn.preprocessing.MinMaxScaler.fit_transform", return_value=[[1,2,3], [4,5,6]]):
+                # Mock torch functionalities
+                with patch("torch.tensor") as mock_torch_tensor:
+                    mock_torch_tensor.return_value = MagicMock()
+                    with patch("torch.optim.Adam") as mock_optimizer:
+                        mock_optimizer.return_value.step = MagicMock()
+                        mock_optimizer.return_value.zero_grad = MagicMock()
+                        mock_optimizer.return_value.zero_grad.return_value = None
+                        mock_optimizer.return_value.step.return_value = None
+
+                        # Mock model save
+                        with patch("torch.save") as mock_torch_save:
+                            await train_lnn()
+                            mock_torch_save.assert_called()
+
+def test_train_lnn_file_not_found():
+    # Simulate FileNotFoundError during data loading
+    with patch("models.utils.config.Config.__init__", return_value=None):
+        config = Config("configs/config.yaml")
+        config.lnn_training_epochs = 1
+        config.lnn_model_path = "models/lnn/lnn_model.pth"
+
+        with patch("pandas.read_csv", side_effect=FileNotFoundError):
+            with patch("logging.error") as mock_logging_error:
+                with patch("models.lnn.train_lnn.Config", return_value=config):
+                    asyncio.run(train_lnn())
+                    mock_logging_error.assert_called_with("Training data file not found. Please provide a valid CSV file.")
+
+def test_train_lnn_exception():
+    # Simulate a generic exception during training
+    with patch("models.utils.config.Config.__init__", return_value=None):
+        config = Config("configs/config.yaml")
+        config.lnn_training_epochs = 1
+        config.lnn_model_path = "models/lnn/lnn_model.pth"
+
+        with patch("pandas.read_csv", return_value=MagicMock()):
+            with patch("sklearn.preprocessing.MinMaxScaler.fit_transform", side_effect=Exception("Scaling error")):
+                with patch("logging.error") as mock_logging_error:
+                    asyncio.run(train_lnn())
+                    mock_logging_error.assert_called_with("Error during LNN training: Scaling error")
+
+
+// File: tests\test_utils.py
 
 
 // File: tests\__init__.py
