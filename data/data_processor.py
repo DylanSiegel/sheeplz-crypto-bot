@@ -1,63 +1,144 @@
+import os
 import asyncio
+import aiohttp
+from typing import Dict, Any, List
+import pandas as pd
+from .indicator_calculations import IndicatorCalculator
+from .storage.data_storage import DataStorage
+from error_handler import ErrorHandler
 
 class DataProcessor:
-    def __init__(self, storage, indicator_calculator, error_handler, config):
+    """
+    Processes raw kline data, applies technical indicators, and stores the processed data.
+    """
+
+    def __init__(self, data_queue: asyncio.Queue, storage: DataStorage, indicator_calculator: IndicatorCalculator, error_handler: ErrorHandler, symbols: List[str], timeframes: List[str]):
+        """
+        Initializes the DataProcessor.
+
+        Args:
+            data_queue (asyncio.Queue): Queue to consume raw data from.
+            storage (DataStorage): Instance for storing processed data.
+            indicator_calculator (IndicatorCalculator): Instance for calculating technical indicators.
+            error_handler (ErrorHandler): Instance to handle errors.
+            symbols (List[str]): List of trading symbols.
+            timeframes (List[str]): List of kline timeframes.
+        """
+        self.data_queue = data_queue
         self.storage = storage
         self.indicator_calculator = indicator_calculator
         self.error_handler = error_handler
-        self.config = config
+        self.symbols = symbols
+        self.timeframes = timeframes
 
-    async def process_data(self, data_batch):
-        """Processes kline data and applies indicators asynchronously."""
-        processed_data = {}
-        for data in data_batch:
+    async def run(self):
+        """
+        Continuously consumes data from the queue and processes it.
+        """
+        while True:
             try:
-                kline_data = self._extract_kline_data(data)
-                timeframe = self._get_timeframe(data)
-                if timeframe not in processed_data:
-                    processed_data[timeframe] = []
-                processed_data[timeframe].append(kline_data)
+                data = await self.data_queue.get()
+                await self.process_data(data)
+                self.data_queue.task_done()
             except Exception as e:
-                self.error_handler.handle_error(f"Error extracting kline data: {e}", exc_info=True)
+                self.error_handler.handle_error(f"Error in DataProcessor run loop: {e}", exc_info=True, symbol=None, timeframe=None)
 
+    async def process_data(self, data: Dict[str, Any]):
+        """
+        Processes a single batch of kline data.
+
+        Args:
+            data (Dict[str, Any]): Raw kline data from the WebSocket.
+        """
         try:
-            indicators = await self._calculate_indicators_async(processed_data)
-            unified_feed = self._create_unified_feed(processed_data, indicators)
-            await self.storage.store_data(unified_feed)
-        except Exception as e:
-            self.error_handler.handle_error(f"Error calculating indicators or storing data: {e}", exc_info=True)
+            symbol, timeframe = self._extract_symbol_timeframe(data)
+            kline_data = self._extract_kline_data(data)
+            
+            # Load existing data
+            existing_df = await self.storage.load_dataframe(symbol, timeframe)
+            if existing_df is not None and not existing_df.empty:
+                df = pd.concat([existing_df, pd.DataFrame([kline_data])], ignore_index=True)
+            else:
+                df = pd.DataFrame([kline_data])
 
-    async def _calculate_indicators_async(self, processed_data):
-        """Calculates indicators asynchronously."""
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self.indicator_calculator.calculate_indicators, processed_data)
+            # Remove duplicates based on close_time
+            df.drop_duplicates(subset=['close_time'], keep='last', inplace=True)
+            # Sort by close_time
+            df.sort_values(by='close_time', inplace=True)
+            # Reset index
+            df.reset_index(drop=True, inplace=True)
 
-    def _extract_kline_data(self, data):
-        # Extract kline data (fill with your logic)
-        return {
-            'open': data['d']['k']['o'],
-            'high': data['d']['k']['h'],
-            'low': data['d']['k']['l'],
-            'close': data['d']['k']['c'],
-            'volume': data['d']['k']['v'],
-            'close_time': data['d']['k']['T']
-        }
+            # Calculate indicators
+            indicators = self.indicator_calculator.calculate_indicators(symbol, {timeframe: df})
 
-    def _get_timeframe(self, data):
-        # Extract timeframe (assuming format is 'spot@public.kline.v3.api@BTCUSDT@kline_1m')
-        return data.get('c', '').split('@')[-1].split('_')[-1]
-
-    def _create_unified_feed(self, klines, indicators):
-        """Combines kline data and indicators into a unified feed."""
-        unified_feed = {}
-        for timeframe, data in klines.items():
-            unified_feed[timeframe] = {
-                'price': [entry['close'] for entry in data],
-                'volume': [entry['volume'] for entry in data],
-                'open': [entry['open'] for entry in data],
-                'high': [entry['high'] for entry in data],
-                'low': [entry['low'] for entry in data],
-                'close_time': [entry['close_time'] for entry in data],
+            # Consolidate data
+            unified_feed = {
+                'symbol': symbol,
+                'timeframe': timeframe,
+                'data': df.to_dict(orient='records'),
                 'indicators': indicators.get(timeframe, {})
             }
-        return unified_feed
+
+            # Store the unified feed
+            await self.storage.store_data(unified_feed)
+            # Optionally, send to GMN
+            await self.send_to_gmn(unified_feed)
+        except Exception as e:
+            self.error_handler.handle_error(f"Error processing data: {e}", exc_info=True, symbol=None, timeframe=None)
+
+    def _extract_symbol_timeframe(self, data: Dict[str, Any]) -> tuple[str, str]:
+        """
+        Extracts the symbol and timeframe from the stream name.
+
+        Args:
+            data (Dict[str, Any]): Raw kline data.
+
+        Returns:
+            tuple[str, str]: Symbol and timeframe.
+        """
+        stream = data.get('stream', '')
+        parts = stream.split('@')
+        if len(parts) < 5:
+            raise ValueError(f"Invalid stream format: {stream}")
+        symbol = parts[3]
+        timeframe = parts[4].replace('kline_', '')
+        return symbol, timeframe
+
+    def _extract_kline_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Extracts relevant kline data from the message.
+
+        Args:
+            data (Dict[str, Any]): Raw kline data.
+
+        Returns:
+            Dict[str, Any]: Extracted kline information.
+        """
+        k = data.get('data', {}).get('k', {})
+        if not k:
+            raise ValueError("Missing kline data in the message")
+        return {
+            'open': float(k['o']),
+            'high': float(k['h']),
+            'low': float(k['l']),
+            'close': float(k['c']),
+            'volume': float(k['v']),
+            'close_time': int(k['T'])
+        }
+
+    async def send_to_gmn(self, unified_feed: Dict[str, Any]):
+        """
+        Sends the unified feed to the GMN module.
+
+        Args:
+            unified_feed (Dict[str, Any]): Processed data with indicators.
+        """
+        gmn_endpoint = os.getenv("GMN_ENDPOINT", "http://localhost:8000/api/gmn")  # Replace with actual endpoint
+
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.post(gmn_endpoint, json=unified_feed) as response:
+                    if response.status != 200:
+                        self.error_handler.handle_error(f"GMN API error: {response.status}", symbol=unified_feed.get('symbol'), timeframe=unified_feed.get('timeframe'))
+            except Exception as e:
+                self.error_handler.handle_error(f"Error sending data to GMN: {e}", exc_info=True, symbol=unified_feed.get('symbol'), timeframe=unified_feed.get('timeframe'))

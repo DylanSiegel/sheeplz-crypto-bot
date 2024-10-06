@@ -1,3 +1,43 @@
+
+
+sheeplz-crypto-bot/
+├── config/
+│   └── .env
+├── data/
+│   ├── __init__.py
+│   ├── data_processor.py
+│   ├── indicator_calculations.py
+│   ├── mexc_websocket_connector.py
+│   └── storage/
+│       ├── __init__.py
+│       └── data_storage.py
+├── error_handler.py
+├── main.py
+├── tests/
+│   ├── __init__.py
+│   ├── test_mexc_websocket_connector.py
+│   ├── test_indicator_calculations.py
+│   └── test_data_storage.py
+├── requirements.txt
+└── README.md
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Trading Platform for BTC/USD Perpetual Futures on MEXC
 Introduction
 Welcome to the Trading Platform for BTC/USD Perpetual Futures on MEXC. This project is a cutting-edge, AI-driven trading platform designed to optimize trading strategies for BTC/USD perpetual futures contracts on the MEXC exchange. It integrates advanced technologies such as Graph-Based Metanetworks (GMNs), Dataset Distillation, Liquid Neural Networks (LNNs), and sophisticated AI trading methodologies.

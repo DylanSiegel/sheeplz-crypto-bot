@@ -1,3 +1,126 @@
+Develop a data pipeline that pulls multiple kline data from the MEXC WebSocket API across timeframes (1 min, 15 min, 30 min, 4 hr, daily, weekly, monthly), integrates technical analysis (TA) for each timeframe, and consolidates it into a single, processed feed. Ensure all data is fully processed before being fed into the Graph-Based Metanetwork (GMN) module, with the data pipeline aligned with MEXC V3 WebSocket API for real-time analysis and streamlined performance.
+
+Here's a summary of the Python-relevant WebSocket information from the MEXC API v3 documentation:
+
+General WebSocket Details
+
+Base Endpoint: wss://wbs.mexc.com/ws
+
+Connection Duration: 24 hours (automatic disconnection after that)
+
+Keep-Alive: Send PING messages to maintain the connection.
+
+Symbol Case: All symbols are uppercase (e.g., BTCUSDT).
+
+Subscription Limit: Maximum 30 subscriptions per connection.
+
+Listen Key Duration (User Data Streams): 60 minutes (can be extended with keep-alive requests)
+
+Python SDK
+
+MEXC provides a Python SDK (mexc-api-sdk) for easier interaction with the API:
+
+https://github.com/mexcdevelop/mexc-api-sdk
+
+The SDK likely simplifies WebSocket handling, including connection management, subscriptions, and message parsing. Refer to the SDK documentation for specifics.
+
+Subscribing/Unsubscribing
+
+JSON Payload Structure:
+
+{
+    "method": "SUBSCRIPTION" or "UNSUBSCRIPTION",
+    "params": ["stream_name1", "stream_name2", ...]
+}
+content_copy
+Use code with caution.
+Json
+
+Example (Python):
+
+import json
+
+# Assuming you have a WebSocket connection object `ws`
+
+# Subscribe to a stream
+subscription_data = {
+    "method": "SUBSCRIPTION",
+    "params": ["spot@public.deals.v3.api@BTCUSDT"]
+}
+ws.send(json.dumps(subscription_data))
+
+# Unsubscribe from a stream
+unsubscription_data = {
+    "method": "UNSUBSCRIPTION",
+    "params": ["spot@public.deals.v3.api@BTCUSDT"] 
+}
+ws.send(json.dumps(unsubscription_data))
+content_copy
+Use code with caution.
+Python
+
+Important Stream Examples
+
+Market Data:
+
+spot@public.deals.v3.api@BTCUSDT: Trade streams (real-time trade information).
+
+spot@public.kline.v3.api@BTCUSDT@Min15: Kline/Candlestick streams (updates every second).
+
+spot@public.increase.depth.v3.api@BTCUSDT: Diff. Depth stream (incremental order book changes).
+
+User Data:
+
+Requires a Listen Key: Obtain using the POST /api/v3/userDataStream endpoint.
+
+spot@private.account.v3.api: Account updates (balance changes).
+
+spot@private.deals.v3.api: Account deals (your trades).
+
+spot@private.orders.v3.api: Account order updates.
+
+Data Handling in Python
+
+Receive Messages: Use ws.recv() to receive messages from the WebSocket server.
+
+Parse JSON:
+
+import json
+
+message = ws.recv() 
+data = json.loads(message) 
+# Process the `data` dictionary based on the stream you subscribed to.
+content_copy
+Use code with caution.
+Python
+
+Additional Notes
+
+The MEXC API documentation provides detailed information on the format of data received for each stream.
+
+Explore the Python SDK for more convenient ways to work with WebSockets and manage connections.
+
+Carefully handle rate limits and potential disconnections, especially for user data streams that require listen keys.
+
+Sharing this Information
+
+Feel free to share this summarized information with others. Emphasize the following:
+
+Python SDK: Encourage using the SDK for simplified WebSocket interaction.
+
+Stream Names: Provide clear examples of important stream names.
+
+Data Parsing: Highlight the use of json.loads() for parsing JSON data.
+
+Listen Keys (User Data): Stress the need for listen keys and their limited validity.
+
+Documentation: Direct people to the official MEXC API documentation for comprehensive details.
+
+# MEXC API Configuration- C:\Users\dylan\Desktop\sheeplz-crypto-bot\configs
+MEXC_API_KEY=
+MEXC_API_SECRET=
+MEXC_WS_URL=wss://wbs.mexc.com/ws
+
 // File: data\data_processor.py
 import asyncio
 
