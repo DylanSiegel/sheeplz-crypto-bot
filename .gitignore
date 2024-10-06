@@ -130,7 +130,7 @@ env.bak/
 venv.bak/
 config/secrets.env
 config/config.ini
-
+configs/secrets.env
 # Spyder project settings
 .spyderproject
 .spyproject

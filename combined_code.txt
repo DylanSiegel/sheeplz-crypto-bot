@@ -1,203 +1,268 @@
-Develop a data pipeline that pulls multiple kline data from the MEXC WebSocket API across timeframes (1 min, 15 min, 30 min, 4 hr, daily, weekly, monthly), integrates technical analysis (TA) for each timeframe, and consolidates it into a single, processed feed. Ensure all data is fully processed before being fed into the Graph-Based Metanetwork (GMN) module, with the data pipeline aligned with MEXC V3 WebSocket API for real-time analysis and streamlined performance.
+// File: main.py
+import asyncio
+from data.mexc_websocket_connector import MexcWebsocketConnector
+from data.data_processor import DataProcessor
+from data.indicator_calculations import IndicatorCalculator
+from data.storage.data_storage import DataStorage
+from data.storage.data_storage_postgresql import DataStoragePostgreSQL  # If using PostgreSQL
+from error_handler import ErrorHandler
+from dotenv import load_dotenv
+import os
 
-Here's a summary of the Python-relevant WebSocket information from the MEXC API v3 documentation:
+def load_configuration():
+    """
+    Loads configuration from the .env file.
 
-General WebSocket Details
+    Returns:
+        Tuple[List[str], List[str], str]: Symbols, timeframes, storage path.
+    """
+    load_dotenv(os.path.join(os.path.dirname(__file__), 'configs/.env'))
+    symbols = os.getenv("SYMBOLS", "BTCUSDT").split(",")
+    timeframes = os.getenv("TIMEFRAMES", "1m,15m,30m,4h,1d,1w,1M").split(",")
+    storage_path = os.getenv("DATA_STORAGE_PATH", "./data_storage")
+    return symbols, timeframes, storage_path
 
-Base Endpoint: wss://wbs.mexc.com/ws
+async def main():
+    """
+    Main entry point for the data pipeline.
+    """
+    symbols, timeframes, storage_path = load_configuration()
 
-Connection Duration: 24 hours (automatic disconnection after that)
+    # Initialize components
+    data_queue = asyncio.Queue()
+    error_handler = ErrorHandler()
+    
+    # Choose storage method:
+    # For CSV storage:
+    storage = DataStorage(storage_path=storage_path)
+    
+    # For PostgreSQL storage:
+    # storage = DataStoragePostgreSQL()
+    
+    indicator_calculator = IndicatorCalculator(error_handler=error_handler)
+    processor = DataProcessor(data_queue, storage, indicator_calculator, error_handler, symbols, timeframes)
+    connector = MexcWebsocketConnector(data_queue, symbols, timeframes, error_handler)
 
-Keep-Alive: Send PING messages to maintain the connection.
+    # Create tasks
+    tasks = [
+        asyncio.create_task(connector.connect()),
+        asyncio.create_task(processor.run())
+    ]
 
-Symbol Case: All symbols are uppercase (e.g., BTCUSDT).
+    # Run tasks until complete
+    await asyncio.gather(*tasks)
 
-Subscription Limit: Maximum 30 subscriptions per connection.
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Pipeline terminated by user.")
 
-Listen Key Duration (User Data Streams): 60 minutes (can be extended with keep-alive requests)
-
-Python SDK
-
-MEXC provides a Python SDK (mexc-api-sdk) for easier interaction with the API:
-
-https://github.com/mexcdevelop/mexc-api-sdk
-
-The SDK likely simplifies WebSocket handling, including connection management, subscriptions, and message parsing. Refer to the SDK documentation for specifics.
-
-Subscribing/Unsubscribing
-
-JSON Payload Structure:
-
-{
-    "method": "SUBSCRIPTION" or "UNSUBSCRIPTION",
-    "params": ["stream_name1", "stream_name2", ...]
-}
-content_copy
-Use code with caution.
-Json
-
-Example (Python):
-
-import json
-
-# Assuming you have a WebSocket connection object `ws`
-
-# Subscribe to a stream
-subscription_data = {
-    "method": "SUBSCRIPTION",
-    "params": ["spot@public.deals.v3.api@BTCUSDT"]
-}
-ws.send(json.dumps(subscription_data))
-
-# Unsubscribe from a stream
-unsubscription_data = {
-    "method": "UNSUBSCRIPTION",
-    "params": ["spot@public.deals.v3.api@BTCUSDT"] 
-}
-ws.send(json.dumps(unsubscription_data))
-content_copy
-Use code with caution.
-Python
-
-Important Stream Examples
-
-Market Data:
-
-spot@public.deals.v3.api@BTCUSDT: Trade streams (real-time trade information).
-
-spot@public.kline.v3.api@BTCUSDT@Min15: Kline/Candlestick streams (updates every second).
-
-spot@public.increase.depth.v3.api@BTCUSDT: Diff. Depth stream (incremental order book changes).
-
-User Data:
-
-Requires a Listen Key: Obtain using the POST /api/v3/userDataStream endpoint.
-
-spot@private.account.v3.api: Account updates (balance changes).
-
-spot@private.deals.v3.api: Account deals (your trades).
-
-spot@private.orders.v3.api: Account order updates.
-
-Data Handling in Python
-
-Receive Messages: Use ws.recv() to receive messages from the WebSocket server.
-
-Parse JSON:
-
-import json
-
-message = ws.recv() 
-data = json.loads(message) 
-# Process the `data` dictionary based on the stream you subscribed to.
-content_copy
-Use code with caution.
-Python
-
-Additional Notes
-
-The MEXC API documentation provides detailed information on the format of data received for each stream.
-
-Explore the Python SDK for more convenient ways to work with WebSockets and manage connections.
-
-Carefully handle rate limits and potential disconnections, especially for user data streams that require listen keys.
-
-Sharing this Information
-
-Feel free to share this summarized information with others. Emphasize the following:
-
-Python SDK: Encourage using the SDK for simplified WebSocket interaction.
-
-Stream Names: Provide clear examples of important stream names.
-
-Data Parsing: Highlight the use of json.loads() for parsing JSON data.
-
-Listen Keys (User Data): Stress the need for listen keys and their limited validity.
-
-Documentation: Direct people to the official MEXC API documentation for comprehensive details.
-
-# MEXC API Configuration- C:\Users\dylan\Desktop\sheeplz-crypto-bot\configs
-MEXC_API_KEY=
-MEXC_API_SECRET=
-MEXC_WS_URL=wss://wbs.mexc.com/ws
 
 // File: data\data_processor.py
+import os
 import asyncio
+import aiohttp
+from typing import Dict, Any, List
+import pandas as pd
+from .indicator_calculations import IndicatorCalculator
+from .storage.data_storage import DataStorage
+from error_handler import ErrorHandler
 
 class DataProcessor:
-    def __init__(self, storage, indicator_calculator, error_handler, config):
+    """
+    Processes raw kline data, applies technical indicators, and stores the processed data.
+    """
+
+    def __init__(self, data_queue: asyncio.Queue, storage: DataStorage, indicator_calculator: IndicatorCalculator, error_handler: ErrorHandler, symbols: List[str], timeframes: List[str]):
+        """
+        Initializes the DataProcessor.
+
+        Args:
+            data_queue (asyncio.Queue): Queue to consume raw data from.
+            storage (DataStorage): Instance for storing processed data.
+            indicator_calculator (IndicatorCalculator): Instance for calculating technical indicators.
+            error_handler (ErrorHandler): Instance to handle errors.
+            symbols (List[str]): List of trading symbols.
+            timeframes (List[str]): List of kline timeframes.
+        """
+        self.data_queue = data_queue
         self.storage = storage
         self.indicator_calculator = indicator_calculator
         self.error_handler = error_handler
-        self.config = config
+        self.symbols = symbols
+        self.timeframes = timeframes
 
-    async def process_data(self, data_batch):
-        """Processes kline data and applies indicators asynchronously."""
-        processed_data = {}
-        for data in data_batch:
+    async def run(self):
+        """
+        Continuously consumes data from the queue and processes it.
+        """
+        while True:
             try:
-                kline_data = self._extract_kline_data(data)
-                timeframe = self._get_timeframe(data)
-                if timeframe not in processed_data:
-                    processed_data[timeframe] = []
-                processed_data[timeframe].append(kline_data)
+                data = await self.data_queue.get()
+                await self.process_data(data)
+                self.data_queue.task_done()
             except Exception as e:
-                self.error_handler.handle_error(f"Error extracting kline data: {e}", exc_info=True)
+                self.error_handler.handle_error(f"Error in DataProcessor run loop: {e}", exc_info=True, symbol=None, timeframe=None)
 
+    async def process_data(self, data: Dict[str, Any]):
+        """
+        Processes a single batch of kline data.
+
+        Args:
+            data (Dict[str, Any]): Raw kline data from the WebSocket.
+        """
         try:
-            indicators = await self._calculate_indicators_async(processed_data)
-            unified_feed = self._create_unified_feed(processed_data, indicators)
-            await self.storage.store_data(unified_feed)
-        except Exception as e:
-            self.error_handler.handle_error(f"Error calculating indicators or storing data: {e}", exc_info=True)
+            symbol, timeframe = self._extract_symbol_timeframe(data)
+            kline_data = self._extract_kline_data(data)
+            
+            # Load existing data
+            existing_df = await self.storage.load_dataframe(symbol, timeframe)
+            if existing_df is not None and not existing_df.empty:
+                df = pd.concat([existing_df, pd.DataFrame([kline_data])], ignore_index=True)
+            else:
+                df = pd.DataFrame([kline_data])
 
-    async def _calculate_indicators_async(self, processed_data):
-        """Calculates indicators asynchronously."""
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self.indicator_calculator.calculate_indicators, processed_data)
+            # Remove duplicates based on close_time
+            df.drop_duplicates(subset=['close_time'], keep='last', inplace=True)
+            # Sort by close_time
+            df.sort_values(by='close_time', inplace=True)
+            # Reset index
+            df.reset_index(drop=True, inplace=True)
 
-    def _extract_kline_data(self, data):
-        # Extract kline data (fill with your logic)
-        return {
-            'open': data['d']['k']['o'],
-            'high': data['d']['k']['h'],
-            'low': data['d']['k']['l'],
-            'close': data['d']['k']['c'],
-            'volume': data['d']['k']['v'],
-            'close_time': data['d']['k']['T']
-        }
+            # Calculate indicators
+            indicators = self.indicator_calculator.calculate_indicators(symbol, {timeframe: df})
 
-    def _get_timeframe(self, data):
-        # Extract timeframe (assuming format is 'spot@public.kline.v3.api@BTCUSDT@kline_1m')
-        return data.get('c', '').split('@')[-1].split('_')[-1]
-
-    def _create_unified_feed(self, klines, indicators):
-        """Combines kline data and indicators into a unified feed."""
-        unified_feed = {}
-        for timeframe, data in klines.items():
-            unified_feed[timeframe] = {
-                'price': [entry['close'] for entry in data],
-                'volume': [entry['volume'] for entry in data],
-                'open': [entry['open'] for entry in data],
-                'high': [entry['high'] for entry in data],
-                'low': [entry['low'] for entry in data],
-                'close_time': [entry['close_time'] for entry in data],
+            # Consolidate data
+            unified_feed = {
+                'symbol': symbol,
+                'timeframe': timeframe,
+                'data': df.to_dict(orient='records'),
                 'indicators': indicators.get(timeframe, {})
             }
-        return unified_feed
+
+            # Store the unified feed
+            await self.storage.store_data(unified_feed)
+            # Optionally, send to GMN
+            await self.send_to_gmn(unified_feed)
+        except Exception as e:
+            self.error_handler.handle_error(f"Error processing data: {e}", exc_info=True, symbol=None, timeframe=None)
+
+    def _extract_symbol_timeframe(self, data: Dict[str, Any]) -> tuple[str, str]:
+        """
+        Extracts the symbol and timeframe from the stream name.
+
+        Args:
+            data (Dict[str, Any]): Raw kline data.
+
+        Returns:
+            tuple[str, str]: Symbol and timeframe.
+        """
+        stream = data.get('stream', '')
+        parts = stream.split('@')
+        if len(parts) < 5:
+            raise ValueError(f"Invalid stream format: {stream}")
+        symbol = parts[3]
+        timeframe = parts[4].replace('kline_', '')
+        return symbol, timeframe
+
+    def _extract_kline_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Extracts relevant kline data from the message.
+
+        Args:
+            data (Dict[str, Any]): Raw kline data.
+
+        Returns:
+            Dict[str, Any]: Extracted kline information.
+        """
+        k = data.get('data', {}).get('k', {})
+        if not k:
+            raise ValueError("Missing kline data in the message")
+        return {
+            'open': float(k['o']),
+            'high': float(k['h']),
+            'low': float(k['l']),
+            'close': float(k['c']),
+            'volume': float(k['v']),
+            'close_time': int(k['T'])
+        }
+
+    async def send_to_gmn(self, unified_feed: Dict[str, Any]):
+        """
+        Sends the unified feed to the GMN module.
+
+        Args:
+            unified_feed (Dict[str, Any]): Processed data with indicators.
+        """
+        gmn_endpoint = os.getenv("GMN_ENDPOINT", "http://localhost:8000/api/gmn")  # Replace with actual endpoint
+
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.post(gmn_endpoint, json=unified_feed) as response:
+                    if response.status != 200:
+                        self.error_handler.handle_error(f"GMN API error: {response.status}", symbol=unified_feed.get('symbol'), timeframe=unified_feed.get('timeframe'))
+            except Exception as e:
+                self.error_handler.handle_error(f"Error sending data to GMN: {e}", exc_info=True, symbol=unified_feed.get('symbol'), timeframe=unified_feed.get('timeframe'))
+
+// File: data\error_handler.py
+import logging
+import traceback
+
+class ErrorHandler:
+    """
+    Centralized error handling and logging.
+    """
+
+    def __init__(self, log_file: str = "error.log"):
+        """
+        Initializes the ErrorHandler with a specified log file.
+
+        Args:
+            log_file (str, optional): Path to the log file. Defaults to "error.log".
+        """
+        self.logger = logging.getLogger("DataPipelineErrorHandler")
+        self.logger.setLevel(logging.ERROR)
+        fh = logging.FileHandler(log_file)
+        fh.setLevel(logging.ERROR)
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        fh.setFormatter(formatter)
+        self.logger.addHandler(fh)
+
+    def handle_error(self, message: str, exc_info: bool = False, symbol: str = None, timeframe: str = None):
+        """
+        Logs an error message with optional contextual information.
+
+        Args:
+            message (str): Error message.
+            exc_info (bool, optional): If True, includes traceback. Defaults to False.
+            symbol (str, optional): Trading symbol related to the error. Defaults to None.
+            timeframe (str, optional): Timeframe related to the error. Defaults to None.
+        """
+        context = f" (Symbol: {symbol}, Timeframe: {timeframe})" if symbol and timeframe else ""
+        full_message = f"{message}{context}"
+        if exc_info:
+            self.logger.error(full_message, exc_info=True)
+        else:
+            self.logger.error(full_message)
 
 
 // File: data\indicator_calculations.py
 import pandas as pd
 from finta import TA
-from .error_handler import ErrorHandler
 from typing import Dict, Any, List
 import concurrent.futures
+from error_handler import ErrorHandler
 
 class IndicatorCalculator:
+    """
+    Calculates technical indicators for kline data.
+    """
+
     def __init__(self, error_handler: ErrorHandler):
         """
         Initializes the IndicatorCalculator with an error handler.
+
         Args:
             error_handler (ErrorHandler): Instance to handle errors during calculations.
         """
@@ -205,34 +270,51 @@ class IndicatorCalculator:
 
     def calculate_indicators(self, symbol: str, data: Dict[str, pd.DataFrame]) -> Dict[str, Dict[str, Any]]:
         """
-        Calculates indicators for all timeframes.
+        Calculates indicators for all provided timeframes.
+
         Args:
-            symbol (str): The trading symbol (e.g., 'BTC_USDT').
+            symbol (str): The trading symbol (e.g., 'BTCUSDT').
             data (Dict[str, pd.DataFrame]): Dictionary where keys are timeframes and values are DataFrames.
+
         Returns:
             Dict[str, Dict[str, Any]]: Dictionary of indicators keyed by timeframe.
         """
         indicators = {}
         try:
             with concurrent.futures.ThreadPoolExecutor() as executor:
-                futures = {executor.submit(self._calculate_for_timeframe, symbol, timeframe, df): timeframe for timeframe, df in data.items()}
+                futures = {
+                    executor.submit(self._calculate_for_timeframe, symbol, timeframe, df): timeframe
+                    for timeframe, df in data.items()
+                }
                 for future in concurrent.futures.as_completed(futures):
                     timeframe = futures[future]
                     try:
                         indicators[timeframe] = future.result()
                     except Exception as e:
-                        self.error_handler.handle_error(f"Error calculating indicators for {symbol} {timeframe}: {e}", exc_info=True)
+                        self.error_handler.handle_error(
+                            f"Error calculating indicators for {symbol} {timeframe}: {e}",
+                            exc_info=True,
+                            symbol=symbol,
+                            timeframe=timeframe
+                        )
         except Exception as e:
-            self.error_handler.handle_error(f"Error in calculate_indicators: {e}", exc_info=True)
+            self.error_handler.handle_error(
+                f"Error in calculate_indicators: {e}",
+                exc_info=True,
+                symbol=symbol,
+                timeframe=''
+            )
         return indicators
 
     def _calculate_for_timeframe(self, symbol: str, timeframe: str, df: pd.DataFrame) -> Dict[str, Any]:
         """
         Helper function to calculate indicators for a specific timeframe.
+
         Args:
-            symbol (str): The trading symbol (e.g., 'BTC_USDT').
+            symbol (str): The trading symbol (e.g., 'BTCUSDT').
             timeframe (str): The timeframe being processed.
             df (pd.DataFrame): DataFrame containing OHLC data for the timeframe.
+
         Returns:
             Dict[str, Any]: Calculated indicators for the timeframe.
         """
@@ -247,48 +329,60 @@ class IndicatorCalculator:
             indicators['macd'] = self.calculate_macd(df)
             indicators['fibonacci'] = self.calculate_fibonacci(df)
         except Exception as e:
-            self.error_handler.handle_error(f"Error calculating indicators for {symbol} {timeframe}: {e}", exc_info=True)
+            self.error_handler.handle_error(
+                f"Error calculating indicators for {symbol} {timeframe}: {e}",
+                exc_info=True,
+                symbol=symbol,
+                timeframe=timeframe
+            )
         return indicators
 
     def calculate_rsi(self, df: pd.DataFrame) -> List[float]:
         """
         Calculates the RSI (Relative Strength Index).
+
         Args:
             df (pd.DataFrame): DataFrame containing OHLC data.
+
         Returns:
             List[float]: RSI values.
         """
         try:
-            rsi_values = TA.RSI(df).fillna(0).tolist()
+            rsi_series = TA.RSI(df)
+            rsi_values = rsi_series.fillna(0).tolist()
             return rsi_values
         except Exception as e:
-            self.error_handler.handle_error(f"Error calculating RSI: {e}", exc_info=True)
+            self.error_handler.handle_error(f"Error calculating RSI: {e}", exc_info=True, symbol=None, timeframe=None)
             return []
 
     def calculate_macd(self, df: pd.DataFrame) -> Dict[str, List[float]]:
         """
         Calculates the MACD (Moving Average Convergence Divergence).
+
         Args:
             df (pd.DataFrame): DataFrame containing OHLC data.
+
         Returns:
             Dict[str, List[float]]: MACD values, signal line, and histogram.
         """
         try:
-            macd_values = TA.MACD(df).fillna(0)
+            macd_df = TA.MACD(df)
             return {
-                'macd': macd_values['MACD'].tolist(),
-                'macd_signal': macd_values['SIGNAL'].tolist(),
-                'macd_hist': macd_values['HISTOGRAM'].tolist()
+                'macd': macd_df['MACD'].fillna(0).tolist(),
+                'macd_signal': macd_df['SIGNAL'].fillna(0).tolist(),
+                'macd_hist': macd_df['HISTOGRAM'].fillna(0).tolist()
             }
         except Exception as e:
-            self.error_handler.handle_error(f"Error calculating MACD: {e}", exc_info=True)
+            self.error_handler.handle_error(f"Error calculating MACD: {e}", exc_info=True, symbol=None, timeframe=None)
             return {'macd': [], 'macd_signal': [], 'macd_hist': []}
 
     def calculate_fibonacci(self, df: pd.DataFrame) -> Dict[str, float]:
         """
         Calculates Fibonacci Retracement levels manually.
+
         Args:
             df (pd.DataFrame): DataFrame containing OHLC data.
+
         Returns:
             Dict[str, float]: Fibonacci retracement levels.
         """
@@ -305,61 +399,140 @@ class IndicatorCalculator:
             }
             return fib_levels
         except Exception as e:
-            self.error_handler.handle_error(f"Error calculating Fibonacci Retracement: {e}", exc_info=True)
+            self.error_handler.handle_error(f"Error calculating Fibonacci Retracement: {e}", exc_info=True, symbol=None, timeframe=None)
             return {}
 
 
 // File: data\mexc_websocket_connector.py
 import os
 import json
-import websockets
 import asyncio
+import websockets
 from dotenv import load_dotenv
+from typing import List
+from error_handler import ErrorHandler
 
-load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(__file__), '../config/.env'))
 
 class MexcWebsocketConnector:
-    def __init__(self, data_queue):
+    """
+    Connects to the MEXC WebSocket API, subscribes to kline streams, and feeds data into a queue.
+    """
+
+    def __init__(self, data_queue: asyncio.Queue, symbols: List[str], timeframes: List[str], error_handler: ErrorHandler):
+        """
+        Initializes the MexcWebsocketConnector.
+
+        Args:
+            data_queue (asyncio.Queue): Queue to put received data for processing.
+            symbols (List[str]): List of trading symbols (e.g., ['BTCUSDT', 'ETHUSDT']).
+            timeframes (List[str]): List of kline timeframes (e.g., ['1m', '15m']).
+            error_handler (ErrorHandler): Instance to handle errors.
+        """
         self.ws_url = os.getenv("MEXC_WS_URL", "wss://wbs.mexc.com/ws")
         self.api_key = os.getenv("MEXC_API_KEY")
         self.api_secret = os.getenv("MEXC_API_SECRET")
-        self.reconnect_delay = 5.0
+        self.reconnect_delay = 5.0  # Seconds
         self.data_queue = data_queue
+        self.symbols = symbols
+        self.timeframes = timeframes
+        self.max_subscriptions = 30  # As per API limit
+        self.error_handler = error_handler
 
     async def connect(self):
+        """
+        Establishes WebSocket connection and manages subscription and data reception.
+        Reconnects automatically on connection loss.
+        """
         while True:
             try:
                 async with websockets.connect(self.ws_url) as ws:
                     await self._subscribe(ws)
-                    await self._receive_batched_klines(ws)
+                    # Start keep-alive and data reception concurrently
+                    await asyncio.gather(
+                        self._receive_data(ws),
+                        self._keep_alive(ws)
+                    )
             except Exception as e:
-                print(f"WebSocket connection error: {e}")
+                self.error_handler.handle_error(f"WebSocket connection error: {e}", exc_info=True)
+                print(f"WebSocket connection error: {e}. Reconnecting in {self.reconnect_delay} seconds...")
                 await asyncio.sleep(self.reconnect_delay)
 
     async def _subscribe(self, ws):
-        subscribe_message = {
-            "method": "SUBSCRIBE",
-            "params": ["spot@public.kline.v3.api@BTCUSDT@kline_1m", "spot@public.kline.v3.api@BTCUSDT@kline_5m"],
-            "id": 1
-        }
-        await ws.send(json.dumps(subscribe_message))
+        """
+        Subscribes to the specified kline streams.
 
-    async def _receive_batched_klines(self, ws):
-        """Receives and processes kline data in batches."""
-        kline_batch = []
-        while True:
+        Args:
+            ws (websockets.WebSocketClientProtocol): Active WebSocket connection.
+        """
+        subscription_params = []
+        for symbol in self.symbols:
+            for timeframe in self.timeframes:
+                stream_name = f"spot@public.kline.v3.api@{symbol}@kline_{timeframe}"
+                subscription_params.append(stream_name)
+                # If subscription_params reach max_subscriptions, send subscription
+                if len(subscription_params) == self.max_subscriptions:
+                    await self._send_subscription(ws, subscription_params)
+                    subscription_params = []
+        # Subscribe to any remaining streams
+        if subscription_params:
+            await self._send_subscription(ws, subscription_params)
+
+    async def _send_subscription(self, ws, params: List[str], method: str = "SUBSCRIPTION", request_id: int = 1):
+        """
+        Sends subscription or unsubscription requests to the WebSocket.
+
+        Args:
+            ws (websockets.WebSocketClientProtocol): Active WebSocket connection.
+            params (List[str]): List of stream names to subscribe/unsubscribe.
+            method (str): "SUBSCRIPTION" or "UNSUBSCRIPTION".
+            request_id (int): Identifier for the request.
+        """
+        subscription_message = {
+            "method": method,
+            "params": params,
+            "id": request_id
+        }
+        await ws.send(json.dumps(subscription_message))
+        print(f"{method.capitalize()} to streams: {params}")
+
+    async def _receive_data(self, ws):
+        """
+        Receives data from the WebSocket and puts relevant kline data into the queue.
+
+        Args:
+            ws (websockets.WebSocketClientProtocol): Active WebSocket connection.
+        """
+        async for message in ws:
             try:
-                message = await ws.recv()
                 data = json.loads(message)
-                if "spot@public.kline.v3.api" in data.get("c", ""):
-                    kline_batch.append(data)
-                else:
-                    if kline_batch:
-                        await self.data_queue.put(kline_batch)
-                        kline_batch = []  # Reset batch
+                stream = data.get('stream')
+                if not stream:
+                    continue  # Ignore non-stream messages
+
+                # Check if the message is a kline update
+                if "kline" in stream:
+                    await self.data_queue.put(data)
+            except json.JSONDecodeError:
+                self.error_handler.handle_error(f"Failed to decode message: {message}", symbol=None, timeframe=None)
             except Exception as e:
-                print(f"Error receiving kline data: {e}")
-                break
+                self.error_handler.handle_error(f"Error processing message: {e}", exc_info=True, symbol=None, timeframe=None)
+
+    async def _keep_alive(self, ws):
+        """
+        Sends PING messages periodically to keep the WebSocket connection alive.
+
+        Args:
+            ws (websockets.WebSocketClientProtocol): Active WebSocket connection.
+        """
+        try:
+            while True:
+                await asyncio.sleep(60)  # Send PING every 60 seconds
+                ping_message = {"method": "PING"}
+                await ws.send(json.dumps(ping_message))
+                print("Sent PING to WebSocket.")
+        except Exception as e:
+            self.error_handler.handle_error(f"Error sending PING: {e}", exc_info=True, symbol=None, timeframe=None)
 
 
 // File: data\__init__.py
@@ -374,27 +547,165 @@ __all__ = ['MexcWebsocketConnector', 'DataProcessor', 'WebSocketManager', 'DataS
 import asyncio
 import pandas as pd
 import os
+from typing import Dict, Any, List
+from dotenv import load_dotenv
+from error_handler import ErrorHandler
+
+load_dotenv(os.path.join(os.path.dirname(__file__), '../../config/.env'))
 
 class DataStorage:
-    def __init__(self, storage_path="data_storage"):
-        self.storage_path = storage_path
-        os.makedirs(self.storage_path, exist_ok=True)
+    """
+    Handles storage of processed data. Supports multiple storage backends.
+    """
 
-    async def store_data(self, unified_feed):
-        """Stores unified feed data asynchronously."""
+    def __init__(self, storage_path: str = None, db_config: Dict[str, Any] = None, error_handler: ErrorHandler = None):
+        """
+        Initializes the DataStorage.
+        
+        Args:
+            storage_path (str, optional): Path for file-based storage. Defaults to environment variable.
+            db_config (Dict[str, Any], optional): Configuration for database storage. Defaults to None.
+            error_handler (ErrorHandler, optional): Instance to handle errors. Defaults to None.
+        """
+        self.storage_path = storage_path or os.getenv("DATA_STORAGE_PATH", "./data_storage")
+        os.makedirs(self.storage_path, exist_ok=True)
+        self.db_config = db_config  # For future expansion to database storage
+        self.error_handler = error_handler
+
+    async def store_data(self, unified_feed: Dict[str, Any]):
+        """
+        Stores unified feed data asynchronously.
+        
+        Args:
+            unified_feed (Dict[str, Any]): Processed data ready for storage.
+        """
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._store_data_sync, unified_feed)
 
-    def _store_data_sync(self, unified_feed):
-        """Synchronous helper function for data storage."""
-        symbol = "BTC_USDT"  # Assuming single symbol; adjust if needed.
-        for timeframe, content in unified_feed.items():
-            df = pd.DataFrame(content)  # Create DataFrame from content
+    def _store_data_sync(self, unified_feed: Dict[str, Any]):
+        """
+        Synchronously stores data to the chosen storage backend.
+        
+        Args:
+            unified_feed (Dict[str, Any]): Processed data ready for storage.
+        """
+        symbol = unified_feed.get('symbol', 'UNKNOWN')
+        timeframe = unified_feed.get('timeframe', 'UNKNOWN')
+        data = unified_feed.get('data', [])
+        indicators = unified_feed.get('indicators', {})
+
+        if not data:
+            print(f"No data to store for {symbol} {timeframe}")
+            return
+
+        # For file-based storage (CSV)
+        self._store_to_csv(symbol, timeframe, data, indicators)
+
+        # For database storage, implement respective methods here
+        # Example: self._store_to_postgresql(symbol, timeframe, data, indicators)
+
+    def _store_to_csv(self, symbol: str, timeframe: str, data: List[Dict[str, Any]], indicators: Dict[str, Any]):
+        """
+        Stores data to a CSV file.
+        
+        Args:
+            symbol (str): Trading symbol.
+            timeframe (str): Kline timeframe.
+            data (List[Dict[str, Any]]): List of kline data records.
+            indicators (Dict[str, Any]): Calculated technical indicators.
+        """
+        try:
+            df = pd.DataFrame(data)
+            # Add indicators to DataFrame
+            for key, value in indicators.items():
+                if isinstance(value, list) and len(value) == len(df):
+                    df[key] = value
+                elif isinstance(value, dict):
+                    for sub_key, sub_value in value.items():
+                        if isinstance(sub_value, list) and len(sub_value) == len(df):
+                            df[f"{key}_{sub_key}"] = sub_value
+                else:
+                    # For scalar or mismatched lengths, skip or handle accordingly
+                    pass
+
             filename = f"{symbol}_{timeframe}.csv"
             filepath = os.path.join(self.storage_path, filename)
+            if os.path.exists(filepath):
+                existing_df = pd.read_csv(filepath)
+                df = pd.concat([existing_df, df], ignore_index=True)
+                df.drop_duplicates(subset=['close_time'], keep='last', inplace=True)
             df.to_csv(filepath, index=False)
             print(f"Data stored in {filepath}")
+        except Exception as e:
+            if self.error_handler:
+                self.error_handler.handle_error(f"Error storing data to {filepath}: {e}", exc_info=True, symbol=symbol, timeframe=timeframe)
+            else:
+                print(f"Error storing data to {filepath}: {e}")
 
+    async def load_dataframe(self, symbol: str, timeframe: str) -> pd.DataFrame:
+        """
+        Loads existing DataFrame from storage.
+        
+        Args:
+            symbol (str): Trading symbol.
+            timeframe (str): Kline timeframe.
+        
+        Returns:
+            pd.DataFrame: Loaded DataFrame or empty DataFrame if file doesn't exist.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._load_dataframe_sync, symbol, timeframe)
+
+    def _load_dataframe_sync(self, symbol: str, timeframe: str) -> pd.DataFrame:
+        """
+        Synchronously loads DataFrame from storage.
+        
+        Args:
+            symbol (str): Trading symbol.
+            timeframe (str): Kline timeframe.
+        
+        Returns:
+            pd.DataFrame: Loaded DataFrame or empty DataFrame if file doesn't exist.
+        """
+        filename = f"{symbol}_{timeframe}.csv"
+        filepath = os.path.join(self.storage_path, filename)
+        if os.path.exists(filepath):
+            try:
+                df = pd.read_csv(filepath)
+                return df
+            except Exception as e:
+                if self.error_handler:
+                    self.error_handler.handle_error(f"Error loading data from {filepath}: {e}", exc_info=True, symbol=symbol, timeframe=timeframe)
+                return pd.DataFrame()
+        else:
+            return pd.DataFrame()
+
+    # Placeholder methods for database storage implementations
+    def _store_to_postgresql(self, symbol: str, timeframe: str, data: List[Dict[str, Any]], indicators: Dict[str, Any]):
+        """
+        Stores data to a PostgreSQL database.
+        
+        Args:
+            symbol (str): Trading symbol.
+            timeframe (str): Kline timeframe.
+            data (List[Dict[str, Any]]): List of kline data records.
+            indicators (Dict[str, Any]): Calculated technical indicators.
+        """
+        # Implement PostgreSQL storage logic here
+        pass
+
+    def _store_to_mongodb(self, symbol: str, timeframe: str, data: List[Dict[str, Any]], indicators: Dict[str, Any]):
+        """
+        Stores data to a MongoDB database.
+        
+        Args:
+            symbol (str): Trading symbol.
+            timeframe (str): Kline timeframe.
+            data (List[Dict[str, Any]]): List of kline data records.
+            indicators (Dict[str, Any]): Calculated technical indicators.
+        """
+        # Implement MongoDB storage logic here
+        pass
 
 // File: data\storage\__init__.py
 
