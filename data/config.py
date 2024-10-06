@@ -1,39 +1,45 @@
-from typing import List, Dict, Any, Union, Optional
-from pydantic import BaseSettings, validator, PositiveInt, Field
+from pydantic import BaseModel, Field, field_validator
+from typing import List, Dict, Any
+import yaml
 
-class Config(BaseSettings):
-    """Configuration settings for data ingestion and processing."""
+class DataIngestionConfig(BaseModel):
+    """Configuration for Data Ingestion and market data settings."""
 
     symbol: str = "BTC_USDT"
-    timeframes: List[str] = [
-        "1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w", "1M"
-    ] 
-    private_channels: List[Union[str, Dict[str, Any]]] = Field(default_factory=list)
-    indicators: Dict[str, Any] = Field(default_factory=dict)
-    reconnect_delay: PositiveInt = 5
-    max_reconnect_delay: PositiveInt = 300
-    backoff_factor: float = 2.0
-    rate_limit: PositiveInt = 90  
-    processing_queue_size: PositiveInt = 1000
-    max_reconnect_attempts: int = 10
-    max_retry_attempts: int = 3
-    data_directory: str = "data" 
+    interval: str = "Min1"
+    timeframes: List[str] = ["1m", "5m", "15m", "1h", "4h"]
+    indicators: List[str] = ["price", "volume", "rsi", "macd", "fibonacci"]
 
-    class Config:
-        env_file = '.env'
-        env_file_encoding = 'utf-8'
+    # Private Channels (Optional)
+    private_channels: List[str] = []
 
-    @validator('timeframes', pre=True)
+    # Batch Processing Parameters
+    batch_size: int = Field(default=100, ge=1, description="Number of messages per batch to process.")
+    batch_time_limit: float = Field(default=5.0, ge=0.1, description="Time limit (in seconds) for batching.")
+    rate_limit: int = Field(default=100, ge=1, description="Max number of messages to send per second.")
+    reconnect_delay: int = Field(default=5, ge=1, description="Delay (in seconds) between reconnect attempts.")
+    max_reconnect_attempts: int = Field(default=10, ge=1, description="Maximum number of allowed reconnect attempts.")
+    max_reconnect_delay: float = Field(default=300.0, ge=1.0, description="Maximum delay between reconnect attempts.")
+
+    @field_validator('timeframes', mode='before')
     def validate_timeframes(cls, v):
+        """Validates that 'timeframes' is either a comma-separated string or a list."""
         if isinstance(v, str):
             return [tf.strip() for tf in v.split(',')]
         elif isinstance(v, list):
             return v
         else:
-            raise ValueError("Timeframes must be a comma-separated string or a list.")
+            raise ValueError("timeframes must be either a comma-separated string or a list.")
 
-    def get_indicator_param(
-        self, indicator_name: str, param_name: str, default_value: Optional[Any] = None
-    ) -> Any:
-        """Gets a parameter value for a specific indicator from the config."""
-        return self.indicators.get(f"{indicator_name}_{param_name}", default_value)
+    def load_from_yaml(self, config_path: str) -> None:
+        """Loads configuration from a YAML file and updates the instance attributes."""
+        try:
+            with open(config_path, "r") as f:
+                config_data: Dict[str, Any] = yaml.safe_load(f)
+                for key, value in config_data.items():
+                    if hasattr(self, key):
+                        setattr(self, key, value)
+        except FileNotFoundError as e:
+            raise FileNotFoundError(f"Configuration file '{config_path}' not found: {e.filename}")
+        except yaml.YAMLError as e:
+            raise ValueError(f"Error parsing the YAML config file '{config_path}': {e}")

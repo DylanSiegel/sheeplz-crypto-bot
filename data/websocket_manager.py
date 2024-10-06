@@ -1,77 +1,63 @@
 import asyncio
-import hashlib
-import hmac
-import time
 import logging
-from typing import Any, Optional, Dict
 import websockets
-from websockets.client import WebSocketClientProtocol
-
 
 class WebSocketManager:
-    """Manages WebSocket connections, authentication, and rate limiting."""
+    """Manages the WebSocket connection."""
 
-    def __init__(
-        self, ws_url: str, api_key: str, api_secret: str, rate_limit: int, config: Any
-    ):
+    def __init__(self, ws_url: str, api_key: str, api_secret: str, rate_limit: int, config=None):
         self.ws_url = ws_url
         self.api_key = api_key
         self.api_secret = api_secret
         self.rate_limit = rate_limit
         self.config = config
-        self.ws: Optional[WebSocketClientProtocol] = None
-        self._lock = asyncio.Lock()
-        self._last_message_time = 0
-        self._rate_limit_interval = 1.0 / rate_limit if rate_limit > 0 else 0
+        self.ws = None  # The websocket connection object
+        self.logger = logging.getLogger(__name__)
 
     async def __aenter__(self):
-        self.ws = await websockets.connect(self.ws_url)
+        """Establishes the WebSocket connection."""
+        # The connector will handle setting the listen key in the ws_url now.
+        self.ws = await websockets.connect(self.ws_url)  
         return self.ws
 
-    async def __aexit__(self, exc_type, exc_value, traceback):
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Closes the WebSocket connection."""
         await self.close()
 
-    async def send_message(
-        self, message: str, ws: Optional[WebSocketClientProtocol] = None
-    ):
-        async with self._lock:
-            now = time.time()
-            elapsed = now - self._last_message_time
-            if elapsed < self._rate_limit_interval:
-                await asyncio.sleep(self._rate_limit_interval - elapsed)
-            if ws is None:
-                ws = self.ws
-            if ws is not None:
+    async def send_message(self, message: str, ws=None):
+        """Sends a message over the WebSocket connection."""
+        try:
+            if ws:
                 await ws.send(message)
-                self._last_message_time = time.time()
+            elif self.ws:
+                await self.ws.send(message)  # Use self.ws if no ws argument is provided
             else:
-                logging.error("WebSocket is not connected.")
+                raise ValueError("No active WebSocket connection.")
 
-    async def receive_message(
-        self, ws: Optional[WebSocketClientProtocol] = None
-    ) -> Optional[str]:
-        if ws is None:
-            ws = self.ws
-        if ws is not None:
-            try:
-                message = await ws.recv()
-                return message
-            except websockets.exceptions.ConnectionClosed as e:
-                logging.error(f"WebSocket connection closed: {e}")
-                return None
-        else:
-            logging.error("WebSocket is not connected.")
-            return None
+        except websockets.exceptions.ConnectionClosed:
+            self.logger.error("WebSocket connection closed when sending message.")
+            raise  # Re-raise the exception to be handled by the connector
+
+        except Exception as e:
+            self.logger.exception(f"Error sending message: {e}")
+            raise
+
+    async def receive_message(self, ws):
+        """Receives a message from the WebSocket."""
+        try:
+            message = await ws.recv()
+            return message
+        except websockets.exceptions.ConnectionClosed:
+            self.logger.error("WebSocket connection closed when receiving message.")
+            raise  # Re-raise the exception
+
+        except Exception as e:
+            self.logger.exception(f"Error receiving message: {e}")
+            raise
 
     async def close(self):
-        if self.ws is not None:
+        """Closes the WebSocket connection."""
+        if self.ws and not self.ws.closed:
             await self.ws.close()
-            self.ws = None
-
-    def _generate_signature(self, params: Dict[str, Any]) -> str:
-        sorted_params = sorted(params.items())
-        encoded_params = '&'.join(f"{k}={v}" for k, v in sorted_params)
-        message = encoded_params.encode('utf-8')
-        secret = self.api_secret.encode('utf-8')
-        signature = hmac.new(secret, message, hashlib.sha256).hexdigest()
-        return signature
+            self.ws = None  # Reset the websocket object
+            self.logger.info("WebSocket connection closed.")
