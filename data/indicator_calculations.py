@@ -1,6 +1,6 @@
 import pandas as pd
 from finta import TA
-from error_handler import ErrorHandler
+from .error_handler import ErrorHandler
 from typing import Dict, Any, List
 
 class IndicatorCalculator:

@@ -563,163 +563,221 @@ if __name__ == "__main__":
 
 // File: data\config.py
 from pydantic import BaseModel, Field, field_validator
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Union, Literal
 import yaml
 
-class DataIngestionConfig(BaseModel):
+
+class Config(BaseModel):
     """Configuration for Data Ingestion and market data settings."""
 
     symbol: str = "BTC_USDT"
-    interval: str = "Min1"
+    interval: str = "1m"  # Default interval, but multiple timeframes are supported.
     timeframes: List[str] = ["1m", "5m", "15m", "1h", "4h"]
     indicators: List[str] = ["price", "volume", "rsi", "macd", "fibonacci"]
+
+    # Websocket and Reconnection Settings
+    ws_url: str = "wss://wbs.mexc.com/ws"  # Default; can be overridden by environment variable.
+    reconnect_delay: float = 5.0        # Base delay for reconnection attempts
+    max_reconnect_attempts: int = 10    # Maximum reconnection attempts
+    max_reconnect_delay: float = 300.0  # Maximum delay between reconnection attempts
+    backoff_factor: float = 2.0          # Exponential backoff factor
+
+    # Batch Processing Parameters
+    batch_size: int = 100               # Number of messages per batch
+    batch_time_limit: float = 5.0       # Time limit (seconds) for batching
 
     # Private Channels (Optional)
     private_channels: List[str] = []
 
-    # Batch Processing Parameters
-    batch_size: int = Field(default=100, ge=1, description="Number of messages per batch to process.")
-    batch_time_limit: float = Field(default=5.0, ge=0.1, description="Time limit (in seconds) for batching.")
-    rate_limit: int = Field(default=100, ge=1, description="Max number of messages to send per second.")
-    reconnect_delay: int = Field(default=5, ge=1, description="Delay (in seconds) between reconnect attempts.")
-    max_reconnect_attempts: int = Field(default=10, ge=1, description="Maximum number of allowed reconnect attempts.")
-    max_reconnect_delay: float = Field(default=300.0, ge=1.0, description="Maximum delay between reconnect attempts.")
-
-    @field_validator('timeframes', mode='before')
+    @field_validator('timeframes')
     def validate_timeframes(cls, v):
         """Validates that 'timeframes' is either a comma-separated string or a list."""
         if isinstance(v, str):
             return [tf.strip() for tf in v.split(',')]
-        elif isinstance(v, list):
-            return v
-        else:
-            raise ValueError("timeframes must be either a comma-separated string or a list.")
+        return v
 
     def load_from_yaml(self, config_path: str) -> None:
-        """Loads configuration from a YAML file and updates the instance attributes."""
+        """Loads configuration from a YAML file."""
         try:
             with open(config_path, "r") as f:
-                config_data: Dict[str, Any] = yaml.safe_load(f)
+                config_data = yaml.safe_load(f)
                 for key, value in config_data.items():
                     if hasattr(self, key):
                         setattr(self, key, value)
-        except FileNotFoundError as e:
-            raise FileNotFoundError(f"Configuration file '{config_path}' not found: {e.filename}")
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Configuration file '{config_path}' not found.")
         except yaml.YAMLError as e:
-            raise ValueError(f"Error parsing the YAML config file '{config_path}': {e}")
+            raise ValueError(f"Error parsing YAML: {e}")
 
 
 // File: data\data_processor.py
-# File: data/data_processor.py
-
 import logging
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Union
+import pandas as pd
 from marshmallow import Schema, fields, validates, ValidationError
-from indicator_calculations import IndicatorCalculator
-from error_handler import ErrorHandler
-from datetime import datetime
+from data.config import Config
+from data.indicator_calculations import IndicatorCalculator
+from data.error_handler import ErrorHandler
+from datetime import datetime, timezone
 
-class DataSchema(Schema):
-    """Schema to validate the incoming data structure."""
-    data = fields.Dict(required=True)
-    channel = fields.Str(required=True)
-    symbol = fields.Str(required=False)  # Optional, default to 'unknown'
 
-    @validates('data')
-    def validate_data(self, value):
-        if not isinstance(value, dict):
-            raise ValidationError('Data must be a dictionary')
-        if 'price' not in value or not isinstance(value['price'], (float, int)) or value['price'] <= 0:
-            raise ValidationError('Invalid or missing price field in data')
-        if 'volume' in value and not isinstance(value['volume'], (float, int)):
-            raise ValidationError('Invalid volume field in data')
+class KlineSchema(Schema):
+    """Schema to validate kline data."""
+    T = fields.Int(required=True, data_key='T', attribute="close_time")   # Close Time
+    a = fields.Float(required=True, data_key='a', attribute="volume")     # Volume
+    c = fields.Float(required=True, data_key='c', attribute="close")       # Close Price
+    h = fields.Float(required=True, data_key='h', attribute="high")        # High Price
+    i = fields.Str(required=True, data_key='i', attribute="timeframe")    # Interval (rename 'i' to 'timeframe')
+    l = fields.Float(required=True, data_key='l', attribute="low")         # Low Price
+    o = fields.Float(required=True, data_key='o', attribute="open")        # Open Price
+    t = fields.Int(required=True, data_key='t', attribute="open_time")    # Open Time
+    v = fields.Float(required=True, data_key='v', attribute="quantity")    # Quantity (Base Asset Volume)
 
 
 class DataProcessor:
-    def __init__(self, gmn, indicator_calculator: IndicatorCalculator, error_handler: ErrorHandler):
+
+    def __init__(self, gmn, indicator_calculator: IndicatorCalculator, error_handler: ErrorHandler, config: Config):
         self.gmn = gmn
         self.indicator_calculator = indicator_calculator
         self.error_handler = error_handler
         self.logger = logging.getLogger(__name__)
+        self.kline_schema = KlineSchema()  # Initialize the schema once
+        self.config = config
 
     async def process_data(self, data_batch: List[Dict[str, Any]]) -> None:
-        """Processes a batch of data messages."""
+        """
+        Processes a batch of data messages.
+
+        Args:
+            data_batch (List[Dict[str, Any]]): List of raw data messages from WebSocket.
+        """
+        processed_data = {}  # Store kline data organized by timeframe
+
         for data in data_batch:
             try:
-                # Validate incoming data using the schema
-                schema = DataSchema()
-                validated_data = schema.load(data)
+                if data.get('method') == 'PONG':  # Correct ping/pong handling
+                    continue  # Heartbeat; ignore and proceed to the next message
 
-                if 'kline' in validated_data['channel']:
-                    await self._process_kline_data(validated_data)
-                else:
-                    self.logger.warning(f"Unhandled channel: {validated_data['channel']}")
-            except ValidationError as e:
-                self.error_handler.handle_error(f"Validation error in data: {e.messages}")
+                channel = data.get('c')  # Use 'c' for the channel
+                if not channel or not channel.startswith("spot@public.kline.v3.api"):
+                    continue  # Skip non-kline messages
+
+                # Extract timeframe and other essential fields
+                # Assuming the channel format is "spot@public.kline.v3.api@<symbol>@<timeframe>"
+                parts = channel.split('@')
+                if len(parts) < 4:
+                    self.logger.warning(f"Invalid channel format: {channel}")
+                    continue
+
+                timeframe = parts[-1].split('.')[0]  # Extract timeframe
+                if timeframe not in self.config.timeframes:
+                    self.logger.warning(f"Received unsupported timeframe: {timeframe}")
+                    continue
+
+                kline_data = data.get('d', {}).get('k', {})  # Accessing the correct path for Kline data
+                if not kline_data:  # Skip if Kline data is missing or empty
+                    continue
+
+                # Validate the Kline data
+                try:
+                    validated_kline = self.kline_schema.load(kline_data)
+
+                except ValidationError as e:
+                    self.error_handler.handle_error(
+                        f"Kline validation error: {e.messages}",
+                        data=data,
+                        exc_info=True
+                    )
+                    continue  # Skip this invalid message
+
+                # Organize klines by timeframe
+                if timeframe not in processed_data:
+                    processed_data[timeframe] = []
+                processed_data[timeframe].append(validated_kline)  # Append the validated Kline data
+
             except Exception as e:
-                self.error_handler.handle_error(f"Error processing data: {e}", exc_info=True)
+                self.error_handler.handle_error(
+                    f"Error processing message: {e}",
+                    data=data,
+                    exc_info=True
+                )
 
-    async def _process_kline_data(self, data: Dict[str, Any]) -> None:
-        """Processes kline (candlestick) data."""
+        if not processed_data:
+            self.logger.info("No kline data to process in this batch.")
+            return  # No kline data in this batch
+
         try:
-            kline_data = data['data']
-            symbol = data.get('symbol', 'unknown')
+            data_frames = {}
+            for timeframe, klines in processed_data.items():
+                df = pd.DataFrame(klines)
+                df = self._add_data_lineage(df, timeframe)
+                data_frames[timeframe] = df
 
-            # Validate kline_data structure
-            if not isinstance(kline_data, dict):
-                raise ValueError(f"Invalid kline data format: {kline_data}")
+            # Calculate indicators
+            indicators = self.indicator_calculator.calculate_indicators("BTC_USDT", data_frames)  # Pass data_frames
 
-            # Add lineage and transform the data
-            transformed_data = self._transform_data(self._add_data_lineage(kline_data))
+            # Create unified feed
+            unified_feed = self.create_unified_feed(data_frames, indicators)
 
-            # Deduplicate data
-            if self._is_duplicate(symbol, '1m', transformed_data):
-                self.logger.info(f"Duplicate data for {symbol} at 1m detected, skipping.")
-                return
+            # Store unified feed
+            await self.gmn.store_data(unified_feed)
 
-            # Update the graph with the new kline data
-            await self.gmn.update_graph([transformed_data])
-
-            # Calculate indicators (ensure enough data is present)
-            if self._enough_data_for_indicators(symbol, '1m'):
-                indicators = self.indicator_calculator.calculate_indicators(symbol, '1m', transformed_data)
-                self.gmn.store_indicators(symbol, '1m', indicators)
-
-        except KeyError as e:
-            self.error_handler.handle_error(f"KeyError in processing kline data: {e}")
-        except ValueError as e:
-            self.error_handler.handle_error(f"ValueError in processing kline data: {e}")
         except Exception as e:
-            self.error_handler.handle_error(f"Unhandled error in kline processing: {e}", exc_info=True)
+            self.error_handler.handle_error(f"Error processing batch data: {e}", exc_info=True)
 
-    def _transform_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Transforms the incoming data if necessary."""
-        # Example transformation: round values
-        data['price'] = round(data['price'], 2)
-        if 'volume' in data:
-            data['volume'] = round(data['volume'], 2)
-        return data
+    def _add_data_lineage(self, df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+        """
+        Adds data lineage and transforms data.
 
-    def _add_data_lineage(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Adds lineage metadata to the data."""
-        data['source'] = 'mexc_websocket'
-        data['processed_at'] = datetime.utcnow().isoformat()
-        return data
+        Args:
+            df (pd.DataFrame): DataFrame containing kline data.
+            timeframe (str): The timeframe of the kline data.
 
-    def _is_duplicate(self, symbol: str, timeframe: str, data: Dict[str, Any]) -> bool:
-        """Check if the incoming data is a duplicate."""
-        existing_data = self.gmn.get_data(symbol, timeframe)
-        if existing_data and existing_data[-1]['price'] == data['price'] and existing_data[-1]['volume'] == data.get('volume'):
-            return True
-        return False
+        Returns:
+            pd.DataFrame: Transformed DataFrame with added metadata.
+        """
+        df['source'] = 'mexc_websocket'
+        df['symbol'] = 'BTC_USDT'  # Or get from config if needed
+        df['timeframe'] = timeframe
+        df['processed_at'] = datetime.now(timezone.utc)
+        # Rename columns to more descriptive names if needed
+        df = df.rename(columns={
+            'c': 'close',
+            'v': 'volume',
+            'o': 'open',
+            'h': 'high',
+            'l': 'low',
+            'T': 'close_time',
+            't': 'open_time',
+            'a': 'quantity'
+        })
+        return df
 
-    def _enough_data_for_indicators(self, symbol: str, timeframe: str) -> bool:
-        """Checks if there is enough data to calculate indicators."""
-        data = self.gmn.get_data(symbol, timeframe)
-        if len(data['price']) < 14:  # Example: 14 periods needed for indicators like RSI
-            self.logger.info(f"Not enough data to calculate indicators for {symbol} at {timeframe}")
-            return False
-        return True
+    def create_unified_feed(self, klines: Dict[str, pd.DataFrame], indicators: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Combines the kline data and indicators into a single unified feed for GMN.
+
+        Args:
+            klines (Dict[str, pd.DataFrame]): Dictionary of DataFrames keyed by timeframe.
+            indicators (Dict[str, Dict[str, Any]]): Dictionary of indicators keyed by timeframe.
+
+        Returns:
+            Dict[str, Any]: Unified data feed containing all relevant data and indicators.
+        """
+        unified_feed = {}
+        for timeframe, df in klines.items():
+            unified_feed[timeframe] = {
+                'price': df['close'].tolist(),
+                'volume': df['volume'].tolist(),
+                'open': df['open'].tolist(),
+                'high': df['high'].tolist(),
+                'low': df['low'].tolist(),
+                'close_time': df['close_time'].tolist(),
+                'open_time': df['open_time'].tolist(),
+                'quantity': df['quantity'].tolist(),
+                'indicators': indicators.get(timeframe, {})
+            }
+        return unified_feed
 
 
 // File: data\error_handler.py
@@ -739,7 +797,7 @@ class ErrorHandler:
         self.logger = logging.getLogger(__name__)
         # self.config = config  # Uncomment if using config for alerting or other settings
 
-    def handle_error(self, message: str, exc_info=False, alert=False):
+    def handle_error(self, message: str, exc_info=False, alert=False, data=None):
         """
         Handles errors by logging the error and optionally sending alerts.
 
@@ -747,9 +805,13 @@ class ErrorHandler:
             message (str): The error message to log.
             exc_info (bool): If True, includes the traceback in the log and prints it.
             alert (bool): If True, sends an alert notification (if implemented).
+            data (Any): Optional additional data related to the error.
         """
         # 1. Log the error
-        self.logger.error(message, exc_info=exc_info)  # Log the error message, with traceback if exc_info=True
+        if data is not None:
+            self.logger.error(f"{message} | Data: {data}", exc_info=exc_info)
+        else:
+            self.logger.error(message, exc_info=exc_info)  # Log the error message, with traceback if exc_info=True
         if exc_info:
             traceback.print_exc()  # Optionally print the full traceback to the console
 
@@ -763,107 +825,98 @@ class ErrorHandler:
 
 // File: data\indicator_calculations.py
 import pandas as pd
-import pandas_ta as ta
-from error_handler import ErrorHandler
+from finta import TA
+from .error_handler import ErrorHandler
+from typing import Dict, Any, List
 
 class IndicatorCalculator:
-    def __init__(self, data_storage):
-        self.data_storage = data_storage
-        self.error_handler = ErrorHandler()  # Initialize the error handler
-
-    def calculate_indicators(self, symbol: str, timeframe: str, data: pd.DataFrame):
+    def __init__(self, error_handler: ErrorHandler):
         """
-        Calculates technical indicators based on the provided data.
+        Initializes the IndicatorCalculator with an error handler.
 
         Args:
-            symbol (str): The trading symbol (e.g., 'BTCUSDT').
-            timeframe (str): The timeframe (e.g., '1m', '5m').
-            data (pd.DataFrame): The market data, containing 'close' prices.
+            error_handler (ErrorHandler): Instance to handle errors during calculations.
+        """
+        self.error_handler = error_handler
+
+    def calculate_indicators(self, symbol: str, data: Dict[str, pd.DataFrame]) -> Dict[str, Dict[str, Any]]:
+        """
+        Calculates indicators for all timeframes.
+
+        Args:
+            symbol (str): The trading symbol (e.g., 'BTC_USDT').
+            data (Dict[str, pd.DataFrame]): Dictionary where keys are timeframes and values are DataFrames.
 
         Returns:
-            dict: A dictionary containing calculated indicators.
+            Dict[str, Dict[str, Any]]: Dictionary of indicators keyed by timeframe.
+        """
+        indicators = {}
+        for timeframe, df in data.items():
+            try:
+                indicators[timeframe] = {}
+                indicators[timeframe]['rsi'] = self.calculate_rsi(df)
+                indicators[timeframe]['macd'] = self.calculate_macd(df)
+                indicators[timeframe]['fibonacci'] = self.calculate_fibonacci(df)
+            except Exception as e:
+                self.error_handler.handle_error(
+                    f"Error calculating indicators for {symbol} {timeframe}: {e}",
+                    exc_info=True
+                )
+        return indicators
+
+    def calculate_rsi(self, df: pd.DataFrame) -> List[float]:
+        """
+        Calculates the RSI (Relative Strength Index).
+
+        Args:
+            df (pd.DataFrame): DataFrame containing OHLC data.
+
+        Returns:
+            List[float]: RSI values.
         """
         try:
-            indicators = {}
-
-            # Calculate RSI
-            rsi_values = self.calculate_rsi(data['close'])
-            indicators['rsi'] = rsi_values
-
-            # Calculate MACD
-            macd_values, macd_signal, macd_hist = self.calculate_macd(data['close'])
-            indicators['macd'] = macd_values
-            indicators['macd_signal'] = macd_signal
-            indicators['macd_hist'] = macd_hist
-
-            # Calculate Bollinger Bands
-            bbands_values = self.calculate_bbands(data['close'])
-            indicators['bbands'] = bbands_values
-
-            # Calculate Fibonacci Retracement
-            fib_values = self.calculate_fibonacci(data['close'])
-            indicators['fibonacci'] = fib_values
-
-            return indicators
-
-        except KeyError as e:
-            # Log specific key errors (e.g., missing columns in data)
-            self.error_handler.handle_error(f"KeyError: Missing data column - {e}", exc_info=True)
-        except Exception as e:
-            # Handle all other exceptions
-            self.error_handler.handle_error(f"Error calculating indicators: {e}", exc_info=True)
-
-        # Return an empty dictionary if the calculation fails
-        return {}
-
-    def calculate_rsi(self, close_prices: pd.Series):
-        """Calculates the RSI (Relative Strength Index)."""
-        try:
-            rsi_values = ta.rsi(close_prices, length=14)
-            return rsi_values.tolist()
+            rsi_values = TA.RSI(df).fillna(0).tolist()
+            return rsi_values
         except Exception as e:
             self.error_handler.handle_error(f"Error calculating RSI: {e}", exc_info=True)
             return []
 
-    def calculate_macd(self, close_prices: pd.Series):
-        """Calculates the MACD (Moving Average Convergence Divergence)."""
+    def calculate_macd(self, df: pd.DataFrame) -> Dict[str, List[float]]:
+        """
+        Calculates the MACD (Moving Average Convergence Divergence).
+
+        Args:
+            df (pd.DataFrame): DataFrame containing OHLC data.
+
+        Returns:
+            Dict[str, List[float]]: MACD values, signal line, and histogram.
+        """
         try:
-            macd = ta.macd(close_prices, fast=12, slow=26, signal=9)
-            macd_values = macd['MACD_12_26_9'].tolist()
-            macd_signal = macd['MACDs_12_26_9'].tolist()
-            macd_hist = macd['MACDh_12_26_9'].tolist()
-            return macd_values, macd_signal, macd_hist
-        except KeyError as e:
-            self.error_handler.handle_error(f"Error calculating MACD: Missing key - {e}", exc_info=True)
-            return [], [], []
+            macd_values = TA.MACD(df).fillna(0)
+            return {
+                'macd': macd_values['MACD'].tolist(),
+                'macd_signal': macd_values['SIGNAL'].tolist(),
+                'macd_hist': macd_values['HISTOGRAM'].tolist()
+            }
         except Exception as e:
             self.error_handler.handle_error(f"Error calculating MACD: {e}", exc_info=True)
-            return [], [], []
+            return {'macd': [], 'macd_signal': [], 'macd_hist': []}
 
-    def calculate_bbands(self, close_prices: pd.Series):
-        """Calculates Bollinger Bands."""
-        try:
-            bbands = ta.bbands(close_prices, length=20, std=2)
-            return bbands['BBM_20_2'].tolist()
-        except Exception as e:
-            self.error_handler.handle_error(f"Error calculating Bollinger Bands: {e}", exc_info=True)
-            return []
+    def calculate_fibonacci(self, df: pd.DataFrame) -> List[float]:
+        """
+        Calculates Fibonacci Retracement levels manually.
 
-    def calculate_fibonacci(self, close_prices: pd.Series):
-        """Calculates Fibonacci Retracement levels."""
+        Args:
+            df (pd.DataFrame): DataFrame containing OHLC data.
+
+        Returns:
+            List[float]: Fibonacci retracement levels.
+        """
         try:
-            fib_values = []
-            for i in range(len(close_prices)):
-                if i < 14:
-                    fib_values.append(float('nan'))
-                else:
-                    recent_prices = close_prices.iloc[i - 14:i]
-                    high = max(recent_prices)
-                    low = min(recent_prices)
-                    close = recent_prices.iloc[-1]
-                    diff = high - low
-                    fib_values.append((close - low) / diff if diff != 0 else float('nan'))
-            return fib_values
+            high = df['high'].max()
+            low = df['low'].min()
+            fib_levels = [high - ((high - low) * ratio) for ratio in [0.236, 0.382, 0.5, 0.618, 0.786]]
+            return fib_levels
         except Exception as e:
             self.error_handler.handle_error(f"Error calculating Fibonacci Retracement: {e}", exc_info=True)
             return []
@@ -880,9 +933,9 @@ from asyncio import Queue
 from dotenv import load_dotenv
 import websockets
 import requests
-
-from .config import Config
-from .websocket_manager import WebSocketManager  # Corrected import
+from data.config import Config
+from data.websocket_manager import WebSocketManager
+from data.error_handler import ErrorHandler
 
 load_dotenv()
 
@@ -929,32 +982,39 @@ class MexcRestAPI:
 
 
 class MexcWebsocketConnector:
-    """
-    Connects to the MEXC WebSocket API, handles subscriptions,
-    and passes raw data to a processing queue.
-    """
 
     def __init__(self, config: Config, data_queue: Queue):
+        """
+        Initializes the WebSocket connector with configuration and data queue.
+
+        Args:
+            config (Config): Configuration settings.
+            data_queue (Queue): Asynchronous queue to hold incoming data batches.
+        """
         self.config = config
         self.data_queue = data_queue
-        self.ws_url = os.getenv("MEXC_WS_URL", "wss://wbs.mexc.com/ws")
+        self.ws_url = config.ws_url  # Get ws_url from config
         self.api_key = os.getenv("MEXC_API_KEY")
         self.api_secret = os.getenv("MEXC_API_SECRET")
         self.websocket_manager = WebSocketManager(
-            self.ws_url, self.api_key, self.api_secret, config.rate_limit, config=config
+            self.ws_url, self.api_key, self.api_secret, rate_limit=0, config=config  # rate_limit not needed here
         )
 
         self.reconnect_attempts = 0
         self._last_reconnect_time = 0
         self.connected_event = asyncio.Event()
 
-        # Initialize REST API client
         self.rest_api = MexcRestAPI(self.api_key, self.api_secret)
         self.listen_key = None
         self.listen_key_task = None
 
+        # Initialize error handler
+        self.error_handler = ErrorHandler()
+
     async def connect(self) -> None:
-        """Connects to the WebSocket and handles reconnections with backoff."""
+        """
+        Connects to the WebSocket and handles reconnections with backoff.
+        """
         try:
             # Get the initial listenKey
             self.listen_key = self.rest_api.get_listen_key()
@@ -975,33 +1035,49 @@ class MexcWebsocketConnector:
                 await self._handle_reconnection_delay()
 
         except Exception as e:
-            logging.exception(f"Failed to establish WebSocket connection: {e}")
+            self.error_handler.handle_error(f"Failed to establish WebSocket connection: {e}", exc_info=True)
 
     async def _connect_and_receive(self):
-        """Handles the WebSocket connection and data reception."""
+        """
+        Handles the WebSocket connection and data reception.
+        """
         connection_url = f"{self.ws_url}?listenKey={self.listen_key}"
         async with websockets.connect(connection_url, ping_interval=20, ping_timeout=20) as ws:
             self.connected_event.set()
             logging.info("WebSocket connection established.")
 
             # Subscribe to multiple timeframes
-            subscribe_message = {
-                "method": "SUBSCRIBE",
-                "params": [f"spot@public.kline.v3.api@BTCUSDT@{tf}" for tf in self.config.timeframes],
-                "id": 1
-            }
-            await self.websocket_manager.send_message(json.dumps(subscribe_message), ws)
-            logging.info(f"Subscribed to timeframes: {self.config.timeframes}")
+            await self._subscribe(ws)
 
-            # Start receiving data
-            await self._receive_data_loop(ws)
+            # Start receiving data, batch process
+            await self._receive_batched_klines(ws)
 
-    async def _receive_data_loop(self, ws) -> None:
-        """Receives data from WebSocket and processes it in batches."""
+    async def _subscribe(self, ws):
+        """
+        Subscribe to the defined timeframes.
+
+        Args:
+            ws: WebSocket connection.
+        """
+        subscribe_message = {
+            "method": "SUBSCRIBE",
+            "params": [f"spot@public.kline.v3.api@BTCUSDT@{tf}" for tf in self.config.timeframes],
+            "id": 1
+        }
+        await self.websocket_manager.send_message(json.dumps(subscribe_message), ws=ws)  # Added ws=ws
+        logging.info(f"Subscribed to timeframes: {self.config.timeframes}")
+
+    async def _receive_batched_klines(self, ws) -> None:
+        """
+        Receives data from WebSocket and processes multiple klines for all timeframes.
+
+        Args:
+            ws: WebSocket connection.
+        """
         try:
             data_batch = []
-            batch_size = self.config.batch_size  # Ensure Config has batch_size
-            batch_time_limit = self.config.batch_time_limit  # Ensure Config has batch_time_limit
+            batch_size = self.config.batch_size
+            batch_time_limit = self.config.batch_time_limit
             batch_start_time = time.time()
 
             while True:
@@ -1010,15 +1086,13 @@ class MexcWebsocketConnector:
                     data = json.loads(message)
                     data_batch.append(data)
 
-                    # Check if batch size or time limit is reached
                     current_time = time.time()
                     if len(data_batch) >= batch_size or (current_time - batch_start_time) >= batch_time_limit:
                         if data_batch:
                             await self.data_queue.put(data_batch.copy())
-                            logging.debug(f"Batch of {len(data_batch)} messages put into queue.")
+                            logging.debug(f"Batch of {len(data_batch)} klines put into queue.")
                             data_batch.clear()
-                            batch_start_time = current_time  # Reset timer after each batch
-
+                            batch_start_time = current_time
                 except asyncio.CancelledError:
                     logging.info("Receive data loop cancelled.")
                     break
@@ -1029,7 +1103,7 @@ class MexcWebsocketConnector:
                     logging.error(f"WebSocket closed with error: {e.reason}")
                     break
                 except Exception as e:
-                    logging.exception(f"Error in receive_data_loop: {e}")
+                    self.error_handler.handle_error(f"Error in _receive_batched_klines: {e}", exc_info=True)
                     break
 
             # Put remaining data in queue
@@ -1038,39 +1112,41 @@ class MexcWebsocketConnector:
                 logging.debug(f"Final batch of {len(data_batch)} messages put into queue.")
 
         except Exception as e:
-            logging.exception(f"Exception in _receive_data_loop: {e}")
+            self.error_handler.handle_error(f"Exception in _receive_batched_klines: {e}", exc_info=True)
 
     async def _refresh_listen_key_periodically(self):
-        """Periodically refreshes the listenKey before it expires."""
+        """
+        Periodically refreshes the listenKey before it expires.
+        """
         try:
             while True:
                 await asyncio.sleep(30 * 60)  # Refresh every 30 minutes
                 try:
                     self.rest_api.refresh_listen_key(self.listen_key)
                 except Exception as e:
-                    logging.error(f"Error refreshing listenKey: {e}")
+                    self.error_handler.handle_error(f"Error refreshing listenKey: {e}", exc_info=True)
         except asyncio.CancelledError:
             logging.info("ListenKey refresh task cancelled.")
 
     async def _handle_reconnection_delay(self) -> None:
-        """Handles delay between reconnection attempts with exponential backoff and jitter."""
+        """
+        Handles delay between reconnection attempts with exponential backoff and jitter.
+        """
         current_time = time.monotonic()
-        backoff_delay = self.config.reconnect_delay * (
-            self.config.backoff_factor ** self.reconnect_attempts
-        )
+        backoff_delay = self.config.reconnect_delay * (self.config.backoff_factor ** self.reconnect_attempts)
         jitter = backoff_delay * RECONNECT_JITTER
         wait_time = min(backoff_delay + jitter, self.config.max_reconnect_delay)
         next_reconnect = self._last_reconnect_time + wait_time
         sleep_duration = max(0, next_reconnect - current_time)
-        logging.info(
-            f"Next reconnection attempt in {sleep_duration:.2f} seconds..."
-        )
+        logging.info(f"Next reconnection attempt in {sleep_duration:.2f} seconds...")
         await asyncio.sleep(sleep_duration)
         self._last_reconnect_time = time.monotonic()
         self.reconnect_attempts += 1
 
     async def close(self) -> None:
-        """Closes the WebSocket connection and cancels background tasks."""
+        """
+        Closes the WebSocket connection and cancels background tasks.
+        """
         if self.listen_key_task:
             self.listen_key_task.cancel()
             try:
@@ -1087,10 +1163,21 @@ import asyncio
 import logging
 import websockets
 
+
 class WebSocketManager:
     """Manages the WebSocket connection."""
 
     def __init__(self, ws_url: str, api_key: str, api_secret: str, rate_limit: int, config=None):
+        """
+        Initializes the WebSocketManager.
+
+        Args:
+            ws_url (str): WebSocket URL.
+            api_key (str): API key for authentication.
+            api_secret (str): API secret for authentication.
+            rate_limit (int): Rate limit for sending messages.
+            config: Additional configuration if needed.
+        """
         self.ws_url = ws_url
         self.api_key = api_key
         self.api_secret = api_secret
@@ -1102,7 +1189,7 @@ class WebSocketManager:
     async def __aenter__(self):
         """Establishes the WebSocket connection."""
         # The connector will handle setting the listen key in the ws_url now.
-        self.ws = await websockets.connect(self.ws_url)  
+        self.ws = await websockets.connect(self.ws_url)
         return self.ws
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -1110,7 +1197,13 @@ class WebSocketManager:
         await self.close()
 
     async def send_message(self, message: str, ws=None):
-        """Sends a message over the WebSocket connection."""
+        """
+        Sends a message over the WebSocket connection.
+
+        Args:
+            message (str): The message to send.
+            ws: Optional WebSocket connection to use.
+        """
         try:
             if ws:
                 await ws.send(message)
@@ -1118,24 +1211,29 @@ class WebSocketManager:
                 await self.ws.send(message)  # Use self.ws if no ws argument is provided
             else:
                 raise ValueError("No active WebSocket connection.")
-
         except websockets.exceptions.ConnectionClosed:
             self.logger.error("WebSocket connection closed when sending message.")
             raise  # Re-raise the exception to be handled by the connector
-
         except Exception as e:
             self.logger.exception(f"Error sending message: {e}")
             raise
 
     async def receive_message(self, ws):
-        """Receives a message from the WebSocket."""
+        """
+        Receives a message from the WebSocket.
+
+        Args:
+            ws: WebSocket connection to receive from.
+
+        Returns:
+            str: The received message.
+        """
         try:
             message = await ws.recv()
             return message
         except websockets.exceptions.ConnectionClosed:
             self.logger.error("WebSocket connection closed when receiving message.")
             raise  # Re-raise the exception
-
         except Exception as e:
             self.logger.exception(f"Error receiving message: {e}")
             raise
@@ -1153,31 +1251,138 @@ from .config import Config
 from .mexc_websocket_connector import MexcWebsocketConnector
 from .data_processor import DataProcessor
 from .websocket_manager import WebSocketManager
+from .storage.data_storage import DataStorage
 
-__all__ = ['Config', 'MexcWebsocketConnector', 'DataProcessor', 'WebSocketManager']
+__all__ = ['Config', 'MexcWebsocketConnector', 'DataProcessor', 'WebSocketManager', 'DataStorage']
 
 
 // File: data\storage\data_storage.py
-# data_storage.py
 import pandas as pd
+import os
+from typing import Dict, Any
+
 
 class DataStorage:
-    def __init__(self):
-        self.data = {}
+    def __init__(self, storage_path: str = "data_storage"):
+        """
+        Initializes the DataStorage with a specified storage path.
 
-    def store_data(self, symbol: str, timeframe: str, data: pd.DataFrame):
-        if symbol not in self.data:
-            self.data[symbol] = {}
-        self.data[symbol][timeframe] = data
-        self.save_to_file(symbol, timeframe, data)
+        Args:
+            storage_path (str): Directory path where CSV files will be saved.
+        """
+        self.data = {}
+        self.storage_path = storage_path
+        os.makedirs(self.storage_path, exist_ok=True)
+
+    def store_data(self, unified_feed: Dict[str, Any]) -> None:
+        """
+        Stores the unified feed data for all timeframes.
+
+        Args:
+            unified_feed (Dict[str, Any]): The unified feed containing data and indicators for each timeframe.
+        """
+        symbol = "BTC_USDT"  # Assuming single symbol; adjust if multiple symbols
+
+        for timeframe, content in unified_feed.items():
+            if symbol not in self.data:
+                self.data[symbol] = {}
+            if timeframe not in self.data[symbol]:
+                self.data[symbol][timeframe] = {}
+
+            # Store price and volume
+            self.data[symbol][timeframe]['price'] = content.get('price', [])
+            self.data[symbol][timeframe]['volume'] = content.get('volume', [])
+            self.data[symbol][timeframe]['open'] = content.get('open', [])
+            self.data[symbol][timeframe]['high'] = content.get('high', [])
+            self.data[symbol][timeframe]['low'] = content.get('low', [])
+            self.data[symbol][timeframe]['close_time'] = content.get('close_time', [])
+            self.data[symbol][timeframe]['open_time'] = content.get('open_time', [])
+            self.data[symbol][timeframe]['quantity'] = content.get('quantity', [])
+
+            # Store indicators
+            self.data[symbol][timeframe]['indicators'] = content.get('indicators', {})
+
+            # Save to file
+            self.save_to_file(symbol, timeframe, content)
+
+    def save_to_file(self, symbol: str, timeframe: str, content: Dict[str, Any]) -> None:
+        """
+        Saves the unified feed to a CSV file per timeframe.
+
+        Args:
+            symbol (str): The trading symbol.
+            timeframe (str): The timeframe.
+            content (Dict[str, Any]): The data and indicators.
+        """
+        # Prepare a DataFrame
+        df = pd.DataFrame({
+            'open': content.get('open', []),
+            'high': content.get('high', []),
+            'low': content.get('low', []),
+            'close': content.get('price', []),
+            'volume': content.get('volume', []),
+            'quantity': content.get('quantity', []),
+            'open_time': content.get('open_time', []),
+            'close_time': content.get('close_time', []),
+        })
+
+        # Add indicators
+        indicators = content.get('indicators', {})
+        for indicator, values in indicators.items():
+            if isinstance(values, dict):
+                for sub_indicator, sub_values in values.items():
+                    column_name = f"{indicator}_{sub_indicator}"
+                    df[column_name] = sub_values
+            else:
+                df[indicator] = values
+
+        # Define filename
+        filename = os.path.join(self.storage_path, f"{symbol}_{timeframe}.csv")
+        df.to_csv(filename, index=False)
+        self._log_storage(filename)
+
+    def _log_storage(self, filename: str):
+        """Logs the storage action."""
+        print(f"Data saved to {filename}")
 
     def get_data(self, symbol: str, timeframe: str) -> pd.DataFrame:
-        return self.data.get(symbol, {}).get(timeframe)
+        """
+        Retrieves stored data for a given symbol and timeframe.
 
-    def save_to_file(self, symbol: str, timeframe: str, data: pd.DataFrame):
-        filename = f"{symbol}_{timeframe}.csv"
-        data.to_csv(filename, index=False)
-        print(f"Data saved to {filename}")
+        Args:
+            symbol (str): The trading symbol.
+            timeframe (str): The timeframe.
+
+        Returns:
+            pd.DataFrame: DataFrame containing the stored data.
+        """
+        if symbol in self.data and timeframe in self.data[symbol]:
+            data = self.data[symbol][timeframe]
+            df = pd.DataFrame({
+                'open': data.get('open', []),
+                'high': data.get('high', []),
+                'low': data.get('low', []),
+                'close': data.get('price', []),
+                'volume': data.get('volume', []),
+                'quantity': data.get('quantity', []),
+                'open_time': data.get('open_time', []),
+                'close_time': data.get('close_time', []),
+            })
+            # Add indicators
+            indicators = data.get('indicators', {})
+            for indicator, values in indicators.items():
+                if isinstance(values, dict):
+                    for sub_indicator, sub_values in values.items():
+                        column_name = f"{indicator}_{sub_indicator}"
+                        df[column_name] = sub_values
+                else:
+                    df[indicator] = values
+            return df
+        return pd.DataFrame()
+
+
+// File: data\storage\__init__.py
+
 
 // File: models\__init__.py
 
@@ -2162,70 +2367,145 @@ class RiskManager:
 
 
 // File: tests\test_processed_data.py
-# File: tests/test_processed_data.py
-
-import asyncio
 import pytest
+from unittest.mock import AsyncMock, MagicMock
 from data.data_processor import DataProcessor
-from models.gmn.crypto_gmn import CryptoGMN
-from data.config import Config as DataIngestionConfig
+from data.config import Config
+from data.indicator_calculations import IndicatorCalculator
+from data.error_handler import ErrorHandler
 
-@pytest.fixture(scope="module")
-def config():
-    """Load data ingestion configuration."""
-    return DataIngestionConfig()
-
-@pytest.fixture(scope="module")
-def gmn(config):
-    """Create a CryptoGMN instance."""
-    return CryptoGMN(config.timeframes, config.max_history_length, 5)
-
-@pytest.fixture(scope="module")
-def data_processor(gmn):
-    """Create a DataProcessor instance."""
-    return DataProcessor(gmn)
 
 @pytest.mark.asyncio
-async def test_processed_data_sample(data_processor):
+async def test_processed_data():
     """
-    Test to check the processed data sample and ensure it's ready for GMN calculations.
+    Tests that DataProcessor correctly processes kline data, applies indicators,
+    and creates a unified feed.
     """
+    # Setup mock gmn with store_data as an AsyncMock
+    mock_gmn = MagicMock()
+    mock_gmn.store_data = AsyncMock()
 
-    # Example raw data batch that would be processed in the data flow
-    raw_data_batch = [
-        {'channel': 'push.kline', 'data': {'price': 50000, 'volume': 1.5}},
-        {'channel': 'push.kline', 'data': {'price': 50100, 'volume': 1.6}},
-        {'channel': 'push.kline', 'data': {'price': 50200, 'volume': 1.7}},
-        {'channel': 'push.kline', 'data': {'price': 50300, 'volume': 1.8}},
-        {'channel': 'push.kline', 'data': {'price': 50400, 'volume': 2.0}},
-        # Add more data for multiple timeframes/indicators as necessary
+    # Setup IndicatorCalculator with mock error_handler
+    mock_error_handler = MagicMock(spec=ErrorHandler)
+    indicator_calculator = IndicatorCalculator(mock_error_handler)
+
+    # Initialize Config
+    config = Config()
+
+    # Initialize DataProcessor
+    processor = DataProcessor(mock_gmn, indicator_calculator, mock_error_handler, config)
+
+    # Sample kline data for multiple timeframes
+    sample_kline_data = get_sample_kline_data()
+
+    # Process the kline data
+    await processor.process_data(sample_kline_data)
+
+    # Ensure store_data was called
+    assert mock_gmn.store_data.called, "store_data was not called"
+
+    # Get the unified_feed argument
+    unified_feed = mock_gmn.store_data.call_args[0][0]
+
+    # Validate the unified feed
+    validate_unified_feed(unified_feed)
+
+
+def get_sample_kline_data():
+    """Generates sample kline data for 1m and 5m timeframes."""
+    return [
+        {
+            'method': 'some_method',
+            'c': 'spot@public.kline.v3.api@1m',
+            'd': {
+                'k': {
+                    'T': 1638316800000,
+                    'a': 100.0,
+                    'c': 30000.0,
+                    'h': 30050.0,
+                    'i': '1m',
+                    'l': 29950.0,
+                    'o': 29975.0,
+                    't': 1638316740000,
+                    'v': 50.0
+                }
+            }
+        },
+        {
+            'method': 'some_method',
+            'c': 'spot@public.kline.v3.api@5m',
+            'd': {
+                'k': {
+                    'T': 1638317100000,
+                    'a': 150.0,
+                    'c': 30050.0,
+                    'h': 30100.0,
+                    'i': '5m',
+                    'l': 30000.0,
+                    'o': 30025.0,
+                    't': 1638317040000,
+                    'v': 75.0
+                }
+            }
+        },
+        {
+            'method': 'PONG',  # Heartbeat message
+            'c': 'some_other_channel',
+            'd': {}
+        }
     ]
 
-    # Process the raw data through the data processor
-    await data_processor.process_data(raw_data_batch)
 
-    # Fetch the processed data from the GMN
-    processed_data = data_processor.gmn.get_all_data()
+def validate_unified_feed(unified_feed):
+    """Helper function to validate the structure and content of the unified feed."""
+    assert '1m' in unified_feed
+    assert '5m' in unified_feed
 
-    # Check if the processed data contains required indicators and is in expected format
-    assert '1m' in processed_data, "Processed data missing '1m' timeframe"
-    assert 'price' in processed_data['1m'], "Processed data missing 'price' indicator in '1m' timeframe"
-    assert 'volume' in processed_data['1m'], "Processed data missing 'volume' indicator in '1m' timeframe"
-    
-    # Print the processed data for debugging and analysis
-    print("Processed Data Sample for GMN Calculations:")
-    print(processed_data)
+    for timeframe in ['1m', '5m']:
+        assert 'price' in unified_feed[timeframe]
+        assert 'volume' in unified_feed[timeframe]
+        assert 'open' in unified_feed[timeframe]
+        assert 'high' in unified_feed[timeframe]
+        assert 'low' in unified_feed[timeframe]
+        assert 'close_time' in unified_feed[timeframe]
+        assert 'open_time' in unified_feed[timeframe]
+        assert 'quantity' in unified_feed[timeframe]
+        assert 'indicators' in unified_feed[timeframe]
 
-    # Validate structure of processed data for GMN calculations
-    assert isinstance(processed_data['1m']['price'], list), "Price data is not in the correct format (list)"
-    assert isinstance(processed_data['1m']['volume'], list), "Volume data is not in the correct format (list)"
-    assert len(processed_data['1m']['price']) > 0, "Price data list is empty"
-    assert len(processed_data['1m']['volume']) > 0, "Volume data list is empty"
+        # Validate indicators
+        assert 'rsi' in unified_feed[timeframe]['indicators'], "Missing RSI indicator"
+        assert 'macd' in unified_feed[timeframe]['indicators'], "Missing MACD indicator"
+        assert 'fibonacci' in unified_feed[timeframe]['indicators'], "Missing Fibonacci indicator"
 
-    # You can add further checks to ensure that all other indicators are processed properly
+        # Validate the contents of '1m'
+        if timeframe == '1m':
+            assert unified_feed['1m']['price'] == [30000.0]
+            assert unified_feed['1m']['volume'] == [50.0]
+            assert unified_feed['1m']['open'] == [29975.0]
+            assert unified_feed['1m']['high'] == [30050.0]
+            assert unified_feed['1m']['low'] == [29950.0]
+            assert unified_feed['1m']['quantity'] == [100.0]
+            validate_indicators(unified_feed['1m']['indicators'])
 
-if __name__ == "__main__":
-    pytest.main(["-v", "tests/test_processed_data.py"])
+        # Validate the contents of '5m'
+        if timeframe == '5m':
+            assert unified_feed['5m']['price'] == [30050.0]
+            assert unified_feed['5m']['volume'] == [75.0]
+            assert unified_feed['5m']['open'] == [30025.0]
+            assert unified_feed['5m']['high'] == [30100.0]
+            assert unified_feed['5m']['low'] == [30000.0]
+            assert unified_feed['5m']['quantity'] == [150.0]
+            validate_indicators(unified_feed['5m']['indicators'])
+
+
+def validate_indicators(indicators):
+    """Helper function to validate the indicator contents."""
+    assert isinstance(indicators['rsi'], list), "RSI should be a list"
+    assert isinstance(indicators['macd'], dict), "MACD should be a dictionary"
+    assert 'macd' in indicators['macd'], "Missing MACD line"
+    assert 'macd_signal' in indicators['macd'], "Missing MACD signal line"
+    assert 'macd_hist' in indicators['macd'], "Missing MACD histogram"
+    assert isinstance(indicators['fibonacci'], list), "Fibonacci should be a list"
 
 
 // File: tests\__init__.py

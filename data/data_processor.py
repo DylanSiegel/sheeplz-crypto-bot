@@ -3,8 +3,8 @@ from typing import Dict, Any, List, Union
 import pandas as pd
 from marshmallow import Schema, fields, validates, ValidationError
 from data.config import Config
-from .indicator_calculations import IndicatorCalculator
-from error_handler import ErrorHandler
+from data.indicator_calculations import IndicatorCalculator
+from data.error_handler import ErrorHandler
 from datetime import datetime, timezone
 
 

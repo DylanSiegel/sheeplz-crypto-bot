@@ -8,9 +8,9 @@ from asyncio import Queue
 from dotenv import load_dotenv
 import websockets
 import requests
-from .config import Config
-from .websocket_manager import WebSocketManager
-from .error_handler import ErrorHandler
+from data.config import Config
+from data.websocket_manager import WebSocketManager
+from data.error_handler import ErrorHandler
 
 load_dotenv()
 
