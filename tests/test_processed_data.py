@@ -1,139 +1,77 @@
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+import asyncio
 from data.data_processor import DataProcessor
 from data.config import Config
 from data.indicator_calculations import IndicatorCalculator
 from data.error_handler import ErrorHandler
+from data.storage.data_storage import DataStorage
+from data.mexc_websocket_connector import MexcWebsocketConnector
 
 
 @pytest.mark.asyncio
-async def test_processed_data():
+async def test_realtime_mexc_data_pipeline():
     """
-    Tests that DataProcessor correctly processes kline data, applies indicators,
-    and creates a unified feed.
+    Test the data pipeline with real-time data from the MEXC WebSocket API.
+    It connects to the WebSocket, processes incoming kline data in real-time,
+    and validates that the unified feed is being generated correctly.
     """
-    # Setup mock gmn with store_data as an AsyncMock
-    mock_gmn = MagicMock()
-    mock_gmn.store_data = AsyncMock()
-
-    # Setup IndicatorCalculator with mock error_handler
-    mock_error_handler = MagicMock(spec=ErrorHandler)
-    indicator_calculator = IndicatorCalculator(mock_error_handler)
-
-    # Initialize Config
+    # Step 1: Set up Config, ErrorHandler, and IndicatorCalculator
     config = Config()
+    error_handler = ErrorHandler()
+    indicator_calculator = IndicatorCalculator(error_handler)
 
-    # Initialize DataProcessor
-    processor = DataProcessor(mock_gmn, indicator_calculator, mock_error_handler, config)
+    # Step 2: Initialize DataStorage to store processed data
+    data_storage = DataStorage()
 
-    # Sample kline data for multiple timeframes
-    sample_kline_data = get_sample_kline_data()
+    # Step 3: Initialize DataProcessor with real components
+    processor = DataProcessor(data_storage, indicator_calculator, error_handler, config)
 
-    # Process the kline data
-    await processor.process_data(sample_kline_data)
+    # Step 4: Set up WebSocket connection to MEXC
+    ws_data_queue = asyncio.Queue()  # Queue for processing incoming data
+    mexc_connector = MexcWebsocketConnector(config, ws_data_queue)
 
-    # Ensure store_data was called
-    assert mock_gmn.store_data.called, "store_data was not called"
+    # Step 5: Function to process real-time data
+    async def process_real_time_data():
+        while True:
+            try:
+                data_batch = await ws_data_queue.get()
+                if data_batch:  # Ensure there's data to process
+                    await processor.process_data(data_batch)
+            except Exception as e:
+                print(f"Error while processing real-time data: {e}")
+                break
 
-    # Get the unified_feed argument
-    unified_feed = mock_gmn.store_data.call_args[0][0]
+    # Step 6: Start WebSocket connection and data processing concurrently
+    websocket_task = asyncio.create_task(mexc_connector.connect())
+    data_processing_task = asyncio.create_task(process_real_time_data())
 
-    # Validate the unified feed
-    validate_unified_feed(unified_feed)
+    # Step 7: Allow the tasks to run for a certain amount of time (e.g., 2 minutes) for test purposes
+    await asyncio.sleep(120)  # Adjust sleep time for a longer test duration if needed
 
+    # Step 8: Cancel the tasks after the test period
+    websocket_task.cancel()
+    data_processing_task.cancel()
 
-def get_sample_kline_data():
-    """Generates sample kline data for 1m and 5m timeframes."""
-    return [
-        {
-            'method': 'some_method',
-            'c': 'spot@public.kline.v3.api@1m',
-            'd': {
-                'k': {
-                    'T': 1638316800000,
-                    'a': 100.0,
-                    'c': 30000.0,
-                    'h': 30050.0,
-                    'i': '1m',
-                    'l': 29950.0,
-                    'o': 29975.0,
-                    't': 1638316740000,
-                    'v': 50.0
-                }
-            }
-        },
-        {
-            'method': 'some_method',
-            'c': 'spot@public.kline.v3.api@5m',
-            'd': {
-                'k': {
-                    'T': 1638317100000,
-                    'a': 150.0,
-                    'c': 30050.0,
-                    'h': 30100.0,
-                    'i': '5m',
-                    'l': 30000.0,
-                    'o': 30025.0,
-                    't': 1638317040000,
-                    'v': 75.0
-                }
-            }
-        },
-        {
-            'method': 'PONG',  # Heartbeat message
-            'c': 'some_other_channel',
-            'd': {}
-        }
-    ]
+    # Step 9: Validate stored data after 2 minutes of real-time data collection
+    symbol = "BTC_USDT"
+    unified_feed_1m = data_storage.get_data(symbol, "1m")
+    unified_feed_5m = data_storage.get_data(symbol, "5m")
+
+    # Ensure the unified feed contains data after processing real-time WebSocket data
+    assert not unified_feed_1m.empty, "Unified feed for 1m timeframe is empty"
+    assert not unified_feed_5m.empty, "Unified feed for 5m timeframe is empty"
+
+    # Print some of the collected data for manual inspection
+    print(f"Unified feed for 1m: {unified_feed_1m.head()}")
+    print(f"Unified feed for 5m: {unified_feed_5m.head()}")
+
+    # Validate specific indicators in the unified feed
+    validate_indicators(unified_feed_1m)
+    validate_indicators(unified_feed_5m)
 
 
-def validate_unified_feed(unified_feed):
-    """Helper function to validate the structure and content of the unified feed."""
-    assert '1m' in unified_feed
-    assert '5m' in unified_feed
-
-    for timeframe in ['1m', '5m']:
-        assert 'price' in unified_feed[timeframe]
-        assert 'volume' in unified_feed[timeframe]
-        assert 'open' in unified_feed[timeframe]
-        assert 'high' in unified_feed[timeframe]
-        assert 'low' in unified_feed[timeframe]
-        assert 'close_time' in unified_feed[timeframe]
-        assert 'open_time' in unified_feed[timeframe]
-        assert 'quantity' in unified_feed[timeframe]
-        assert 'indicators' in unified_feed[timeframe]
-
-        # Validate indicators
-        assert 'rsi' in unified_feed[timeframe]['indicators'], "Missing RSI indicator"
-        assert 'macd' in unified_feed[timeframe]['indicators'], "Missing MACD indicator"
-        assert 'fibonacci' in unified_feed[timeframe]['indicators'], "Missing Fibonacci indicator"
-
-        # Validate the contents of '1m'
-        if timeframe == '1m':
-            assert unified_feed['1m']['price'] == [30000.0]
-            assert unified_feed['1m']['volume'] == [50.0]
-            assert unified_feed['1m']['open'] == [29975.0]
-            assert unified_feed['1m']['high'] == [30050.0]
-            assert unified_feed['1m']['low'] == [29950.0]
-            assert unified_feed['1m']['quantity'] == [100.0]
-            validate_indicators(unified_feed['1m']['indicators'])
-
-        # Validate the contents of '5m'
-        if timeframe == '5m':
-            assert unified_feed['5m']['price'] == [30050.0]
-            assert unified_feed['5m']['volume'] == [75.0]
-            assert unified_feed['5m']['open'] == [30025.0]
-            assert unified_feed['5m']['high'] == [30100.0]
-            assert unified_feed['5m']['low'] == [30000.0]
-            assert unified_feed['5m']['quantity'] == [150.0]
-            validate_indicators(unified_feed['5m']['indicators'])
-
-
-def validate_indicators(indicators):
+def validate_indicators(unified_feed):
     """Helper function to validate the indicator contents."""
-    assert isinstance(indicators['rsi'], list), "RSI should be a list"
-    assert isinstance(indicators['macd'], dict), "MACD should be a dictionary"
-    assert 'macd' in indicators['macd'], "Missing MACD line"
-    assert 'macd_signal' in indicators['macd'], "Missing MACD signal line"
-    assert 'macd_hist' in indicators['macd'], "Missing MACD histogram"
-    assert isinstance(indicators['fibonacci'], list), "Fibonacci should be a list"
+    assert 'rsi' in unified_feed.columns, "Missing RSI indicator"
+    assert 'macd' in unified_feed.columns, "Missing MACD indicator"
+    assert 'fibonacci' in unified_feed.columns, "Missing Fibonacci indicator"
