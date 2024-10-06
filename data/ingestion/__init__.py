@@ -1,5 +1,5 @@
 # data/ingestion/__init__.py
-from .mexc_data_ingestion import DataIngestion
-from .websocket_handler import WebSocketHandler
+from .mexc_websocket_connector import MexcWebsocketConnector
+from .websocket_manager import WebSocketManager
 
-__all__ = ['DataIngestion', 'WebSocketHandler']
+__all__ = ['MexcWebsocketConnector', 'WebSocketManager']
