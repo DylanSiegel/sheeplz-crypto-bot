@@ -1,13 +1,567 @@
-#data\__init__.py
-from .config import Config
-from .mexc_websocket_connector import MexcWebsocketConnector
-from .data_processor import DataProcessor
-from .websocket_manager import WebSocketManager
+// File: clean.py
+import subprocess
+import os
 
-__all__ = ['Config', 'MexcWebsocketConnector', 'DataProcessor', 'WebSocketManager']
+def clean_project(project_dir):
+  """
+  Cleans a Python project by removing unused imports and variables using Autoflake.
 
-#data\config.py
+  Args:
+    project_dir: The path to the root directory of the Python project.
+  """
 
+  exclude_paths = [
+      "venv",
+      "migrations",
+      ".mypy_cache",
+      "__pycache__",
+      # Add any other directories or file names to exclude
+  ]
+
+  for root, _, files in os.walk(project_dir):
+      for file in files:
+          if file.endswith(".py") and not any(exclude in root for exclude in exclude_paths):
+              file_path = os.path.join(root, file)
+              try:
+                  subprocess.run(
+                      [
+                          "autoflake",
+                          "--in-place",
+                          "--remove-unused-variables",
+                          "--remove-all-unused-imports",
+                          file_path,
+                      ],
+                      check=True,
+                  )
+                  print(f"Cleaned: {file_path}")
+              except subprocess.CalledProcessError as e:
+                  print(f"Error cleaning {file_path}: {e}")
+
+if __name__ == "__main__":
+  project_directory = r"C:\Users\dylan\Desktop\sheeplz-crypto-bot"  # Your project directory
+  clean_project(project_directory)
+
+// File: config.py
+import yaml
+import logging
+from typing import List, Dict, Any
+from pydantic import BaseModel, field_validator, PositiveInt
+
+class Config(BaseModel):
+    """Configuration for DataIngestion and indicators."""
+
+    symbol: str = "BTC_USDT"
+    interval: str = "Min1"
+    timeframes: List[str] = ["1m", "5m", "15m", "1h", "4h"]
+    indicators: List[str] = ["price", "volume", "rsi", "macd", "fibonacci"]
+
+    # GMN Parameters
+    max_history_length: int = 1000
+
+    # LNN Parameters
+    lnn_model_path: str = "models/lnn/lnn_model.pth"
+    lnn_hidden_size: int = 64
+    lnn_training_epochs: int = 10
+    training_history_length: int = 500
+    lnn_learning_rate: float = 0.001
+
+    # Agent Parameters
+    threshold_buy: float = 0.7
+    threshold_sell: float = 0.3
+
+    # Risk Management
+    risk_parameters: Dict[str, Any] = {}
+
+    # Trade Execution
+    trade_parameters: Dict[str, Any] = {}
+
+    # System
+    agent_loop_delay: PositiveInt = 1
+    reconnect_delay: PositiveInt = 5
+    log_level: str = "INFO"
+
+    # Device
+    device: str = "cpu"
+
+    # Private Channels
+    private_channels: List[str] = []
+
+    @field_validator('timeframes', mode='before')
+    def validate_timeframes(cls, v):
+        if isinstance(v, str):
+            return [tf.strip() for tf in v.split(',')]
+        elif isinstance(v, list):
+            return v
+        else:
+            raise ValueError("timeframes must be a comma-separated string or a list")
+
+    def load_from_yaml(self, config_path: str):
+        """Loads configuration from a YAML file."""
+        try:
+            with open(config_path, "r") as f:
+                config_data: Dict[str, Any] = yaml.safe_load(f)
+                for key, value in config_data.items():
+                    if hasattr(self, key):
+                        setattr(self, key, value)
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Config file not found: {config_path}")
+        except yaml.YAMLError as e:
+            raise ValueError(f"Error parsing YAML config file: {e}")
+
+// File: crypto_trading_bot.py
+# crypto_trading_bot.py
+import asyncio
+import logging
+import tracemalloc
+import os
+from typing import Tuple, Optional, Dict, List, Any
+import torch
+import numpy as np
+import aiohttp
+import joblib
+from sklearn.preprocessing import MinMaxScaler
+
+from data.mexc_data_ingestion import DataIngestion, Config as DataIngestionConfig
+from models.agents.agent import TradingAgent
+from models.gmn.gmn import CryptoGMN
+from models.lnn.lnn_model import LiquidNeuralNetwork
+from models.utils.risk_management import RiskManager
+from models.utils.config import Config
+
+# Load configuration
+config = Config("configs/config.yaml")
+
+# Configure logging
+log_file_path = os.path.join(os.getcwd(), "logs", "trading_bot.log")
+os.makedirs(os.path.dirname(log_file_path), exist_ok=True)  # Ensure log directory exists
+
+logging.basicConfig(
+    level=getattr(logging, config.log_level.upper(), logging.INFO),
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_file_path),
+        logging.StreamHandler()
+    ]
+)
+
+# Initialize scaler path (should be defined before use in functions)
+scaler_path = "models/lnn/scaler.joblib"
+
+async def main():
+    """Main function to run the crypto trading bot."""
+    try:
+        timeframes = config.timeframes
+        indicators = config.indicators
+        max_history_length = config.max_history_length
+
+        # Initialize GMN
+        gmn = CryptoGMN(timeframes, indicators, max_history_length=max_history_length)
+
+        # Initialize Data Ingestion Config and DataIngestion
+        data_ingestion_config = DataIngestionConfig(
+            symbol=config.symbol,
+            timeframes=config.timeframes,
+            private_channels=config.private_channels,
+            reconnect_delay=config.reconnect_delay,
+            # ... add other data ingestion config parameters as needed
+        )
+        data_ingestion = DataIngestion(gmn, data_ingestion_config)
+
+        # Initialize Risk Manager
+        risk_manager = RiskManager(config.risk_parameters)
+
+        # Load or initialize and fit scaler  (moved here)
+        scaler = await load_or_fit_scaler(scaler_path, gmn, config.training_history_length) # Modified
+
+        # Initialize or train LNN Model
+        lnn_model_path = config.lnn_model_path
+        model = await load_or_train_lnn(gmn, lnn_model_path, config, scaler) # Function handles both loading and training
+
+        if model is None:  # Check if model loading/training failed
+            logging.error("Failed to load or train LNN model. Exiting.")
+            await shutdown(gmn=gmn, data_ingestion=data_ingestion, risk_manager=risk_manager, scaler=scaler)
+            return
+
+        # Initialize TradingAgent *after* model is successfully loaded or trained
+        agent = TradingAgent(timeframes, indicators, model, config, risk_manager, scaler)
+
+        tracemalloc.start()  # Start tracemalloc after objects are initialized
+        tasks = [
+            asyncio.create_task(data_ingestion.connect()),
+            asyncio.create_task(agent_loop(agent, gmn))
+        ]
+
+
+        try:
+            await asyncio.gather(*tasks)
+
+        except asyncio.CancelledError:
+            logging.info("Main tasks cancelled.")
+        except Exception as e:
+            logging.exception(f"Unhandled exception in main loop: {e}") # Log traceback
+        finally:
+            # Memory profiling
+            snapshot = tracemalloc.take_snapshot()
+            top_stats = snapshot.statistics('lineno')
+            logging.info("Top 10 memory allocations:")
+            for stat in top_stats[:10]:
+                logging.info(stat)
+
+            tracemalloc.stop()
+            await shutdown(gmn=gmn, data_ingestion=data_ingestion, risk_manager=risk_manager, scaler=scaler, agent=agent)
+
+    except KeyboardInterrupt:
+        logging.info("Trading bot stopped by user.")
+        # If tasks are running, cancel them here before shutdown.
+
+
+async def agent_loop(agent: TradingAgent, gmn: CryptoGMN):
+    """Agent loop."""
+    while True:
+        try: # Handle exceptions within the agent loop
+            market_data = gmn.get_all_data() # More efficient
+
+            if not all(market_data.values()): # Check if all timeframes have data
+                await asyncio.sleep(config.agent_loop_delay)
+                continue
+
+            await agent.make_decision(market_data)
+
+        except Exception as e:
+            logging.error(f"Error in agent loop: {e}", exc_info=True)  # Include traceback
+        await asyncio.sleep(config.agent_loop_delay)
+
+
+
+
+
+async def load_or_train_lnn(gmn, model_path, config, scaler):
+    """Loads or trains the LNN model."""
+    try:
+        model = LiquidNeuralNetwork(len(config.timeframes) * len(config.indicators), config.lnn_hidden_size, 1)
+        model.load_state_dict(torch.load(model_path, map_location=config.device)) # Load on specified device
+        model.to(config.device) # Move model to device after loading
+        model.eval()
+        logging.info("Loaded pre-trained LNN model.")
+        return model
+    except FileNotFoundError:
+        logging.info("Pre-trained LNN model not found. Training a new model...")
+        return await train_and_save_lnn(gmn, model_path, config, scaler)
+    except Exception as e:
+        logging.error(f"Error loading LNN model: {e}", exc_info=True)
+        return None
+
+
+async def train_and_save_lnn(gmn, model_path, config, scaler):
+    """Trains and saves LNN model."""
+
+    try:
+        X_train, y_train = await prepare_lnn_training_data(gmn, config.training_history_length, scaler) # Pass scaler here
+
+        if X_train is None or y_train is None:
+            return None # Return None on failure
+
+
+        # Convert to tensors
+        X_train = torch.tensor(X_train, dtype=torch.float32, device=config.device) # Create on correct device
+        y_train = torch.tensor(y_train, dtype=torch.float32, device=config.device) # Use config.device here
+
+        input_size = X_train.shape[1]
+        model = LiquidNeuralNetwork(input_size, config.lnn_hidden_size, 1).to(config.device)  # Send to device
+        # ... (rest of training loop, including criterion, optimizer)
+
+
+        # Save the trained model
+        torch.save(model.state_dict(), model_path)  # Use state_dict
+        model.eval()
+        logging.info(f"LNN model trained and saved to {model_path}")
+
+        return model
+
+    except Exception as e:
+        logging.error(f"Error during LNN training: {e}", exc_info=True) # Log traceback
+        return None
+
+
+
+async def prepare_lnn_training_data(gmn: CryptoGMN, history_length: int, scaler: MinMaxScaler) -> Tuple[np.ndarray, np.ndarray]: # Changed
+    """Prepares training data."""
+    try:
+        market_data = gmn.get_all_data()
+        # ... (data preparation logic, same as before)
+
+
+        # Fit and Transform with the scaler
+        X_scaled = scaler.fit_transform(X) # Fit the scaler here
+        # ... (rest of the method)
+
+    except Exception as e:
+        logging.error(f"Error preparing LNN training data: {e}", exc_info=True)  # More detailed
+        return None, None
+
+
+async def load_or_fit_scaler(scaler_path: str, gmn: CryptoGMN, history_length: int) -> MinMaxScaler:  # Changed
+    """Loads scaler or fits a new one."""
+    try:
+        scaler = joblib.load(scaler_path)
+        logging.info(f"Loaded scaler from {scaler_path}")
+    except FileNotFoundError:
+        logging.info("Scaler file not found. Fitting a new scaler...")
+        # Prepare data for scaler fitting
+        X, _ = await prepare_lnn_training_data(gmn, history_length, None)  # Use unscaled data
+        if X is None:
+            raise ValueError("Failed to prepare data for scaler fitting.")
+
+        scaler = MinMaxScaler()
+        scaler.fit(X)
+        joblib.dump(scaler, scaler_path)
+        logging.info(f"New scaler fitted and saved to {scaler_path}")
+
+    return scaler
+
+
+async def shutdown(gmn: CryptoGMN = None, data_ingestion: DataIngestion = None, risk_manager: RiskManager = None, scaler: MinMaxScaler = None, agent: Optional[TradingAgent] = None):
+    # ... (same as before)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("Trading bot stopped by user.")
+
+// File: main.py
+import asyncio
+import logging
+import tracemalloc
+import os
+from typing import Optional, List
+
+import torch
+import numpy as np
+import joblib
+from sklearn.preprocessing import MinMaxScaler
+
+from data.ingestion.mexc_data_ingestion import DataIngestion
+from data.config import Config as DataIngestionConfig
+from models.agents.agent import TradingAgent
+from models.gmn.gmn import CryptoGMN
+from models.lnn.lnn_model import LiquidNeuralNetwork
+from models.utils.risk_management import RiskManager
+from models.utils.config import Config
+
+config = Config("configs/config.yaml")
+
+log_file_path = os.path.join(os.getcwd(), "logs", "trading_bot.log")
+os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
+
+logging.basicConfig(
+    level=getattr(logging, config.log_level.upper(), logging.INFO),
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_file_path),
+        logging.StreamHandler()
+    ]
+)
+
+scaler_path = "models/lnn/scaler.joblib"
+
+bot_tasks: List[asyncio.Task] = []
+
+async def main():
+    global bot_tasks
+
+    try:
+        timeframes = config.timeframes
+        max_history_length = config.max_history_length
+
+        gmn = CryptoGMN(timeframes, config.indicators, max_history_length=max_history_length, config=config)
+
+        data_ingestion_config = DataIngestionConfig(
+            symbol=config.symbol,
+            timeframes=config.timeframes,
+            private_channels=config.private_channels,
+            reconnect_delay=config.reconnect_delay,
+            max_retry_attempts=config.max_retry_attempts
+        )
+        data_ingestion = DataIngestion(gmn, data_ingestion_config)
+
+        risk_manager = RiskManager(config.risk_parameters)
+        scaler = await load_scaler(scaler_path)  # No need to pass gmn and history_length
+        model = await load_or_train_lnn(gmn, config.lnn_model_path, config, scaler)
+
+        if model is None:
+            logging.error("Failed to load or train LNN model. Exiting.")
+            await shutdown()  # Call simplified shutdown
+            return
+
+        agent = TradingAgent(timeframes, config.indicators, model, config, risk_manager, scaler)
+        tracemalloc.start()
+        bot_tasks = [
+            asyncio.create_task(data_ingestion.connect()),
+            asyncio.create_task(agent_loop(agent, gmn))
+        ]
+
+        try:
+            await asyncio.gather(*bot_tasks)
+        except asyncio.CancelledError:
+            logging.info("Main tasks cancelled.")
+        except Exception as e:
+            logging.exception(f"Unhandled exception in main loop: {e}")
+        finally:
+            snapshot = tracemalloc.take_snapshot()
+            top_stats = snapshot.statistics('lineno')
+            logging.info("Top 10 memory allocations:")
+            for stat in top_stats[:10]:
+                logging.info(stat)
+
+            tracemalloc.stop()
+            await shutdown()
+
+    except KeyboardInterrupt:
+        logging.info("Trading bot stopped by user.")
+
+
+async def agent_loop(agent: TradingAgent, gmn: CryptoGMN):
+    while True:
+        try:
+            market_data = gmn.get_all_data()
+            if not all(market_data.values()):
+                await asyncio.sleep(config.agent_loop_delay)
+                continue
+            await agent.make_decision(market_data)
+        except Exception as e:
+            logging.error(f"Error in agent loop: {e}", exc_info=True)
+        await asyncio.sleep(config.agent_loop_delay)
+
+
+async def load_or_train_lnn(gmn, model_path, config, scaler):
+    try:
+        input_size = len(config.timeframes) * len(config.indicators)
+        model = LiquidNeuralNetwork(input_size, config.lnn_hidden_size, 1).to(config.device)
+        model.load_state_dict(torch.load(model_path, map_location=config.device))
+        model.eval()
+        logging.info("Loaded pre-trained LNN model.")
+        return model
+    except FileNotFoundError:
+        logging.info("Pre-trained LNN model not found. Training a new model...")
+        return await train_and_save_lnn(gmn, model_path, config, scaler)
+    except Exception as e:
+        logging.exception(f"Error loading LNN model: {e}")
+        return None
+
+
+async def train_and_save_lnn(gmn, model_path, config, scaler):
+    try:
+        X_train, y_train = await prepare_lnn_training_data(gmn, config.training_history_length, scaler)
+        if X_train is None or y_train is None:
+            return None
+        X_train = torch.tensor(X_train, dtype=torch.float32, device=config.device)
+        y_train = torch.tensor(y_train, dtype=torch.float32, device=config.device)
+        input_size = X_train.shape[1]
+        model = LiquidNeuralNetwork(input_size, config.lnn_hidden_size, 1).to(config.device)
+        criterion = torch.nn.BCEWithLogitsLoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=config.lnn_learning_rate)
+        epochs = config.lnn_training_epochs
+        batch_size = 32
+        dataset = torch.utils.data.TensorDataset(X_train, y_train)
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+        for epoch in range(epochs):
+            model.train()
+            epoch_loss = 0.0
+            for batch_X, batch_y in dataloader:
+                optimizer.zero_grad()
+                outputs = model(batch_X.unsqueeze(1))
+                loss = criterion(outputs.squeeze(), batch_y)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+            avg_loss = epoch_loss / len(dataloader)
+            logging.info(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}")
+
+        torch.save(model.state_dict(), model_path)
+        model.eval()
+        logging.info(f"LNN model trained and saved to {model_path}")
+        joblib.dump(scaler, scaler_path)
+        logging.info(f"Scaler saved to {scaler_path}")
+        return model
+    except Exception as e:
+        logging.error(f"Error during LNN training: {e}", exc_info=True)
+        return None
+
+
+async def prepare_lnn_training_data(gmn: CryptoGMN, history_length: int, scaler: MinMaxScaler):
+    try:
+        market_data = gmn.get_all_data()
+        if not market_data or len(market_data['1m']['price']) < history_length + 1:
+            logging.error("Not enough data to prepare training dataset.")
+            return None, None
+
+        X = []
+        y = []
+        for i in range(history_length, len(market_data['1m']['price']) - 1):
+            features = []
+            for timeframe in gmn.timeframes:
+                for indicator in gmn.indicators:
+                    data_series = market_data[timeframe].get(indicator)
+                    if data_series and len(data_series) > i:
+                        value = data_series[i]
+                        if isinstance(value, dict):
+                            features.extend(list(value.values()))
+                        else:
+                            features.append(value)
+                    else:
+                        features.append(0.0)
+
+            future_price = market_data['1m']['price'][i + 1]
+            current_price = market_data['1m']['price'][i]
+            price_change = (future_price - current_price) / current_price
+            y.append(1 if price_change > 0 else 0)
+            X.append(features)
+
+        X = np.array(X, dtype=np.float32)
+        y = np.array(y, dtype=np.float32)
+        X_scaled = scaler.fit_transform(X)  # Fit and transform inside the function
+        return X_scaled, y
+
+    except Exception as e:
+        logging.error(f"Error preparing LNN training data: {e}", exc_info=True)
+        return None, None
+
+
+async def load_scaler(scaler_path: str) -> MinMaxScaler:
+    """Loads a saved scaler or creates a new one."""
+    try:
+        scaler = joblib.load(scaler_path)
+        logging.info(f"Loaded scaler from {scaler_path}")
+        return scaler
+    except FileNotFoundError:
+        logging.warning(f"Scaler file not found at {scaler_path}. Initializing a new scaler.")
+        return MinMaxScaler()
+
+
+async def shutdown():
+    """Shuts down the application gracefully."""
+    global bot_tasks
+    for task in bot_tasks:
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+    logging.info("Shutdown complete.")
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("Trading bot stopped by user. Shutting down...")
+        asyncio.run(shutdown())
+
+// File: data\config.py
 from typing import List, Dict, Any, Union, Optional
 from pydantic import BaseSettings, validator, PositiveInt, Field
 
@@ -59,8 +613,9 @@ class Config(BaseSettings):
 
     def get_fibonacci_lookback(self) -> int:
         return self.get_indicator_param("fibonacci", "lookback", 14)
-#data\data_processor.py
 
+
+// File: data\data_processor.py
 import logging
 from typing import Dict, Any, List
 
@@ -134,7 +689,9 @@ class DataProcessor:
             logging.info(f"Unsubscribed from channel: {method}")
         else:
             logging.debug(f"Unhandled method message: {method}")
-#data\mexc_websocket_connector.py
+
+
+// File: data\mexc_websocket_connector.py
 import asyncio
 import json
 import logging
@@ -280,7 +837,9 @@ class MexcWebsocketConnector:
     async def close(self):
         """Closes the WebSocket connection."""
         await self.websocket_manager.close()
-#data\websocket_manager.py
+
+
+// File: data\websocket_manager.py
 import asyncio
 import hashlib
 import hmac
@@ -289,20 +848,6 @@ import logging
 from typing import Any, Optional, Dict
 import websockets
 from websockets.client import WebSocketClientProtocol
-import asyncio
-import json
-import logging
-import os
-import time
-from typing import Dict, Any
-from asyncio import Queue
-from dotenv import load_dotenv
-import websockets
-
-from .config import Config
-from .websocket_manager import WebSocketManager
-
-load_dotenv()
 
 
 class WebSocketManager:
@@ -372,3 +917,1214 @@ class WebSocketManager:
         secret = self.api_secret.encode('utf-8')
         signature = hmac.new(secret, message, hashlib.sha256).hexdigest()
         return signature
+
+
+// File: data\__init__.py
+from .config import Config
+from .mexc_websocket_connector import MexcWebsocketConnector
+from .data_processor import DataProcessor
+from .websocket_manager import WebSocketManager
+
+__all__ = ['Config', 'MexcWebsocketConnector', 'DataProcessor', 'WebSocketManager']
+
+
+// File: models\__init__.py
+
+
+// File: models\agents\agent.py
+# File: models/agents/agent.py
+
+import logging
+import numpy as np
+import torch
+from sklearn.preprocessing import MinMaxScaler
+from models.utils.config import Config
+from models.utils.risk_management import RiskManager
+import os
+import aiohttp  # Ensure aiohttp is imported
+import hashlib
+import hmac
+import time
+
+class TradingAgent:
+    def __init__(
+        self, 
+        timeframes, 
+        indicators, 
+        model, 
+        config: Config, 
+        risk_manager: RiskManager, 
+        scaler: MinMaxScaler
+    ):
+        self.timeframes = timeframes
+        self.indicators = indicators
+        self.model = model
+        self.config = config
+        self.threshold_buy = config.threshold_buy
+        self.threshold_sell = config.threshold_sell
+        self.risk_manager = risk_manager
+        self.trade_parameters = config.trade_parameters
+        self.leverage = self.trade_parameters.get("leverage", 20)
+        self.position = None
+        self.scaler = scaler
+        self.api_key = os.getenv("MEXC_API_KEY")
+        self.api_secret = os.getenv("MEXC_API_SECRET")
+        self.base_url = 'https://contract.mexc.com/api/v1/'  # Update if necessary
+
+        self.peak_portfolio_value = 1.0  # Initialize for drawdown calculations
+        self.portfolio_value = 1.0  # Initialize portfolio value
+
+        # Initialize aiohttp session
+        self.session = aiohttp.ClientSession()
+
+    async def make_decision(self, market_data):
+        """Processes market data, makes predictions, and executes trades based on the model's output."""
+        try:
+            input_vector = self._prepare_input(market_data)
+            if input_vector is None:
+                logging.warning("Input vector is None. Skipping decision.")
+                return
+
+            # Model expects input in float32
+            input_tensor = torch.tensor([input_vector], dtype=torch.float32)
+
+            with torch.no_grad():
+                self.model.eval()
+                prediction = self.model(input_tensor)
+                prediction = torch.sigmoid(prediction)  # Apply sigmoid to get probability
+                prediction_value = prediction.item()
+
+            logging.info(f"Model Prediction Probability: {prediction_value:.4f}")
+
+            current_drawdown = self.calculate_current_drawdown()
+
+            if self.risk_manager.check_risk(current_drawdown, self.position, market_data):
+                if prediction_value >= self.threshold_buy and self.position != 'long':
+                    await self._execute_trade('buy')
+                    self.position = 'long'
+                elif prediction_value <= self.threshold_sell and self.position != 'short':
+                    await self._execute_trade('sell')
+                    self.position = 'short'
+                elif self.threshold_sell < prediction_value < self.threshold_buy:
+                    if self.position is not None:
+                        await self._execute_trade('close')
+                        self.position = None
+            else:
+                logging.warning("Risk management check failed. Not executing trade.")
+
+        except Exception as e:
+            logging.error(f"Error in make_decision: {e}")
+
+    def _prepare_input(self, market_data):
+        """Prepares and scales the input vector for the LNN model."""
+        input_vector = []
+        for timeframe in self.timeframes:
+            for indicator in self.indicators:
+                data = market_data.get(timeframe, {}).get(indicator)
+                if data is None or len(data) == 0:
+                    logging.warning(f"Missing data for {timeframe} {indicator}. Skipping.")
+                    return None
+
+                if isinstance(data[-1], dict):
+                    values = [v for v in data[-1].values() if isinstance(v, (int, float))]
+                    input_vector.extend(values)
+                else:
+                    input_vector.append(data[-1])
+
+        if not input_vector:
+            logging.warning("Input vector is empty. No data available for making a decision.")
+            return None
+
+        input_vector = np.array([input_vector], dtype=np.float32)
+        input_vector = self.scaler.transform(input_vector).astype(np.float32)
+        return input_vector.flatten()
+
+    async def _execute_trade(self, action, symbol="BTC_USDT"):
+        """Executes a trade action (buy, sell, close) via the MEXC API using aiohttp."""
+        try:
+            timestamp = int(time.time() * 1000)
+            params = {
+                "symbol": symbol,
+                "timestamp": timestamp
+            }
+
+            # Determine trade parameters based on action
+            if action == 'buy':
+                side = 'OPEN_LONG'
+                quantity = self.trade_parameters.get("volume", 1)
+            elif action == 'sell':
+                side = 'OPEN_SHORT'
+                quantity = self.trade_parameters.get("volume", 1)
+            elif action == 'close':
+                if self.position == 'long':
+                    side = 'CLOSE_LONG'
+                elif self.position == 'short':
+                    side = 'CLOSE_SHORT'
+                else:
+                    logging.warning("No position to close.")
+                    return
+                quantity = self.trade_parameters.get("volume", 1)
+            else:
+                logging.warning(f"Invalid trade action: {action}")
+                return
+
+            # Set additional parameters
+            params.update({
+                "price": '',  # Empty for market orders
+                "vol": quantity,
+                "side": side,
+                "type": self.trade_parameters.get("order_type", 1),  # 1: Market order
+                "leverage": self.leverage,
+                "openType": self.trade_parameters.get("open_type", 1),  # 1: Isolated margin
+            })
+
+            # Generate signature
+            query_string = '&'.join([f"{key}={params[key]}" for key in sorted(params)])
+            signature = hmac.new(
+                self.api_secret.encode('utf-8'),
+                query_string.encode('utf-8'),
+                hashlib.sha256
+            ).hexdigest()
+            params['sign'] = signature
+
+            # Send request using aiohttp
+            url = self.base_url + 'order/submit'
+            async with self.session.post(url, params=params) as response:
+                response_data = await response.json()
+                if response.status == 200 and response_data.get("success", False):
+                    logging.info(f"Successfully executed {action} order: {response_data}")
+                    # Update portfolio value based on trade execution
+                    self.update_portfolio(action, response_data)
+                else:
+                    logging.error(f"Failed to execute {action} order: {response_data}")
+
+        except Exception as e:
+            logging.error(f"Error executing trade: {e}")
+
+    def calculate_current_drawdown(self):
+        """Calculates the current drawdown based on portfolio value."""
+        self.peak_portfolio_value = max(self.peak_portfolio_value, self.portfolio_value)
+        drawdown = (self.peak_portfolio_value - self.portfolio_value) / self.peak_portfolio_value
+        logging.info(f"Current Drawdown: {drawdown:.4f}")
+        return drawdown
+
+    def update_portfolio(self, action: str, response_data: Dict):
+        """
+        Updates the portfolio value based on the executed trade.
+        This is a placeholder function. You need to implement actual portfolio management logic.
+        """
+        # Example: Update portfolio based on the price and quantity
+        try:
+            price = float(response_data.get('data', {}).get('price', self.portfolio_value))
+            quantity = float(response_data.get('data', {}).get('vol', 0))
+            if action == 'buy':
+                # Example logic: Increase portfolio value
+                self.portfolio_value += price * quantity
+            elif action == 'sell':
+                # Example logic: Decrease portfolio value
+                self.portfolio_value -= price * quantity
+            elif action == 'close':
+                # Example logic: Neutralize position
+                pass
+            logging.info(f"Portfolio updated after {action}: {self.portfolio_value}")
+        except Exception as e:
+            logging.error(f"Error updating portfolio: {e}")
+
+    async def close(self):
+        """Closes the aiohttp session."""
+        await self.session.close()
+
+// File: models\agents\rl_agent.py
+# models/agents/rl_agent.py
+
+import gym
+import numpy as np
+from stable_baselines3 import PPO
+
+class TradingEnvironment(gym.Env):
+    def __init__(self, market_data):
+        super(TradingEnvironment, self).__init__()
+        self.market_data = market_data
+        self.current_step = 0
+        self.action_space = gym.spaces.Discrete(3)  # Buy, Sell, Hold
+        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(OBSERVATION_SPACE_SIZE,), dtype=np.float32)
+
+    def reset(self):
+        self.current_step = 0
+        return self._next_observation()
+
+    def _next_observation(self):
+        # Return the next market observation
+        obs = self.market_data.iloc[self.current_step]
+        return obs.values
+
+    def step(self, action):
+        # Execute one time step within the environment
+        self.current_step += 1
+
+        reward = self._calculate_reward(action)
+        done = self.current_step >= len(self.market_data) - 1
+        obs = self._next_observation() if not done else np.zeros(self.observation_space.shape)
+
+        return obs, reward, done, {}
+
+    def _calculate_reward(self, action):
+        # Implement reward calculation
+        return reward
+
+def train_rl_agent():
+    # Load market data
+    market_data = pd.read_csv("data/distilled/distilled_data.csv")
+    env = TradingEnvironment(market_data)
+    model = PPO("MlpPolicy", env, verbose=1)
+    model.learn(total_timesteps=10000)
+    model.save("models/agents/ppo_agent")
+
+if __name__ == "__main__":
+    train_rl_agent()
+
+
+// File: models\agents\__init__.py
+
+
+// File: models\gmn\config.py
+import os
+from pydantic import BaseModel, Field, validator
+from typing import List
+
+class CryptoGMNConfig(BaseModel):
+    timeframes: List[str] = ["1m", "5m"]
+    indicators: List[str] = ["price", "volume", "rsi", "macd", "fibonacci"]
+    max_history: int = 1000
+    executor_workers: int = 5
+    cache_size: int = 100
+    db_path: str = "market_data.db"
+    performance_threshold: float = 0.1
+    
+    @validator('timeframes', 'indicators', pre=True)
+    def split_comma_separated(cls, v):
+        if isinstance(v, str):
+            return [item.strip() for item in v.split(",")]
+        return v
+
+def load_config():
+    env = os.getenv("ENVIRONMENT", "DEFAULT").upper()
+    config_file = f"config_{env.lower()}.ini" if env != "DEFAULT" else "config.ini"
+    
+    # Here you would typically load from the config file
+    # For simplicity, we're using default values
+    return CryptoGMNConfig()
+
+// File: models\gmn\crypto_gmn.py
+import asyncio
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, List, Optional, Union, Callable
+import numpy as np
+import logging
+from functools import lru_cache
+import aiosqlite
+import aiohttp
+from readerwriterlock import rwlock
+import time
+
+from config import CryptoGMNConfig
+from logger import logger
+from indicators import IndicatorFactory
+from data_model import DataModel
+from performance_monitor import PerformanceMonitor
+
+class CryptoGMN:
+    def __init__(self, config: CryptoGMNConfig):
+        self.config = config
+        self.timeframes = config.timeframes
+        self.indicators = config.indicators
+        self.max_history_length = config.max_history
+        self.market_data: Dict[str, Dict[str, deque]] = {
+            timeframe: {indicator: deque(maxlen=self.max_history_length) for indicator in self.indicators}
+            for timeframe in self.timeframes
+        }
+        self.locks: Dict[str, rwlock.RWLockFair] = {timeframe: rwlock.RWLockFair() for timeframe in self.timeframes}
+        self.executor: Optional[ThreadPoolExecutor] = None
+        self.indicator_factory = IndicatorFactory()
+        self.performance_monitor = PerformanceMonitor()
+        self.cache_size = config.cache_size
+        self.db_path = config.db_path
+        self.queue = asyncio.Queue()
+
+    async def __aenter__(self):
+        async with asyncio.Lock():
+            if self.executor is None:
+                self.executor = ThreadPoolExecutor(max_workers=self.config.executor_workers)
+                logger.info(f"ThreadPoolExecutor initialized with {self.config.executor_workers} workers.")
+        await self.load_persisted_data()
+        asyncio.create_task(self.start_periodic_tasks())
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.shutdown()
+
+    async def update_graph(self, new_data_items: List[Dict[str, Any]]) -> None:
+        start_time = time.time()
+        await asyncio.gather(*(self._update_single_data(data) for data in new_data_items))
+        end_time = time.time()
+        self.performance_monitor.record(start_time, end_time)
+        if self.performance_monitor.average_processing_time > self.config.performance_threshold:
+            logger.warning(f"Average processing time ({self.performance_monitor.average_processing_time:.4f}s) exceeds threshold.")
+
+    async def _update_single_data(self, new_data: Dict[str, Any]) -> None:
+        try:
+            validated_data = DataModel(**new_data)
+            price = validated_data.c
+            volume = validated_data.v
+        except ValueError as e:
+            logger.error(f"Data validation error: {e}. Data: {new_data}")
+            return
+
+        await asyncio.gather(*(self._update_timeframe(tf, price, volume) for tf in self.timeframes))
+
+    async def _update_timeframe(self, timeframe: str, price: float, volume: float) -> None:
+        async with self.locks[timeframe].gen_wlock():
+            data = self.market_data[timeframe]
+            data['price'].append(price)
+            data['volume'].append(volume)
+
+            prices_array = np.array(data['price'], dtype=np.float64)
+
+            if len(prices_array) >= 14:
+                await self._calculate_indicators(timeframe, prices_array)
+
+    async def _calculate_indicators(self, timeframe: str, prices_array: np.ndarray):
+        tasks = []
+        for indicator in self.indicators:
+            if indicator in ['price', 'volume']:
+                continue
+            indicator_func = getattr(self.indicator_factory, f"create_{indicator}", None)
+            if indicator_func:
+                tasks.append(self._calculate_and_append(timeframe, indicator, indicator_func(), prices_array))
+        if tasks:
+            await asyncio.gather(*tasks)
+
+    async def _calculate_and_append(self, timeframe: str, indicator: str,
+                                    indicator_func: Callable[[np.ndarray], Optional[float]],
+                                    prices: np.ndarray) -> None:
+        loop = asyncio.get_running_loop()
+        try:
+            result = await loop.run_in_executor(self.executor, indicator_func, prices)
+            if result is not None:
+                self.market_data[timeframe][indicator].append(float(result))
+        except Exception as e:
+            logger.error(f"Error calculating {indicator} for {timeframe}: {e}")
+
+    @lru_cache(maxsize=100)
+    def get_cached_indicator(self, timeframe: str, indicator: str, window: int = 100):
+        data = self.get_data(timeframe, indicator)
+        if data:
+            return tuple(data[-window:])
+        return None
+
+    def get_data(self, timeframe: str, indicator: str) -> Optional[List[Union[float, Dict[str, Union[float, bool]]]]]:
+        try:
+            with self.locks[timeframe].gen_rlock():
+                return list(self.market_data[timeframe][indicator])
+        except KeyError:
+            logger.warning(f"No data found for timeframe '{timeframe}' and indicator '{indicator}'.")
+            return None
+
+    def get_all_data(self) -> Dict[str, Dict[str, List[Union[float, Dict[str, Union[float, bool]]]]]]:
+        return {
+            timeframe: {
+                indicator: list(data)
+                for indicator, data in indicators.items()
+            }
+            for timeframe, indicators in self.market_data.items()
+        }
+
+    def add_indicator(self, timeframe: str, indicator: str, calculation_func: Callable[[np.ndarray], Optional[Union[float, Dict[str, Union[float, bool]]]]]) -> None:
+        if timeframe not in self.market_data:
+            logger.error(f"Timeframe '{timeframe}' not found.")
+            return
+        if indicator in self.market_data[timeframe]:
+            logger.warning(f"Indicator '{indicator}' already exists for timeframe '{timeframe}'.")
+            return
+
+        self.market_data[timeframe][indicator] = deque(maxlen=self.max_history_length)
+        self.indicators.append(indicator)
+        logger.info(f"Indicator '{indicator}' added to timeframe '{timeframe}'.")
+
+    def remove_indicator(self, timeframe: str, indicator: str) -> None:
+        if timeframe not in self.market_data:
+            logger.error(f"Timeframe '{timeframe}' not found.")
+            return
+        if indicator not in self.market_data[timeframe]:
+            logger.warning(f"Indicator '{indicator}' does not exist for timeframe '{timeframe}'.")
+            return
+
+        del self.market_data[timeframe][indicator]
+        self.indicators.remove(indicator)
+        logger.info(f"Indicator '{indicator}' removed from timeframe '{timeframe}'.")
+
+    async def persist_data(self):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute('''CREATE TABLE IF NOT EXISTS market_data
+                                (timestamp INTEGER, timeframe TEXT, indicator TEXT, value REAL)''')
+            for timeframe, indicators in self.market_data.items():
+                for indicator, data in indicators.items():
+                    await db.executemany('INSERT INTO market_data (timestamp, timeframe, indicator, value) VALUES (?, ?, ?, ?)',
+                                         [(int(time.time()), timeframe, indicator, value) for value in data])
+            await db.commit()
+        logger.info("Market data persisted to the database.")
+
+    async def load_persisted_data(self):
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute('SELECT timestamp, timeframe, indicator, value FROM market_data ORDER BY timestamp ASC') as cursor:
+                async for row in cursor:
+                    timestamp, timeframe, indicator, value = row
+                    if timeframe in self.market_data and indicator in self.market_data[timeframe]:
+                        self.market_data[timeframe][indicator].append(float(value))
+        logger.info("Persisted market data loaded from the database.")
+
+    async def fetch_real_time_data(self, exchange: str, symbol: str):
+        if exchange.lower() == 'binance':
+            url = f'https://api.binance.com/api/v3/ticker/price?symbol={symbol}'
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        price = float(data['price'])
+                        new_data = {'c': price, 'v': 0.0}
+                        await self._update_single_data(new_data)
+                        logger.info(f"Fetched real-time data from Binance for {symbol}: Price={price}")
+                    else:
+                        logger.error(f"Failed to fetch data from Binance: {response.status}")
+
+    async def enqueue_data(self, new_data_items: List[Dict[str, Any]]) -> None:
+        for data in new_data_items:
+            await self.queue.put(data)
+
+    async def batch_processor(self, batch_size: int = 10, timeout: float = 1.0):
+        while True:
+            batch = []
+            try:
+                async with asyncio.timeout(timeout):
+                    while len(batch) < batch_size:
+                        data = await self.queue.get()
+                        batch.append(data)
+                        self.queue.task_done()
+            except asyncio.TimeoutError:
+                pass
+
+            if batch:
+                try:
+                    await self.update_graph(batch)
+                except Exception as e:
+                    logger.error(f"Error processing batch: {e}")
+
+    async def start_periodic_tasks(self):
+        asyncio.create_task(self._periodic_cleanup())
+        asyncio.create_task(self._periodic_persist())
+
+    async def _periodic_cleanup(self):
+        while True:
+            # Implement cleanup logic if needed
+            await asyncio.sleep(3600)  # Run every hour
+
+    async def _periodic_persist(self):
+        while True:
+            await self.persist_data()
+            await asyncio.sleep(300)  # Persist every 5 minutes
+
+    async def shutdown(self) -> None:
+        if self.executor:
+            self.executor.shutdown(wait=True)
+            self.executor = None
+            logger.info("ThreadPoolExecutor has been shut down gracefully.")
+        await self.persist_data()
+        logger.info("CryptoGMN has been shut down gracefully.")
+
+// File: models\gmn\data_model.py
+from pydantic import BaseModel, validator
+from typing import Optional
+
+class DataModel(BaseModel):
+    c: float  # Close price
+    v: Optional[float] = 0.0  # Volume
+
+    @validator('c', 'v', pre=True)
+    def validate_numeric(cls, v):
+        if isinstance(v, (int, float)):
+            return float(v)
+        try:
+            return float(v)
+        except (ValueError, TypeError):
+            raise ValueError(f"Value '{v}' is not a valid float.")
+
+// File: models\gmn\gmn.py
+import asyncio
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, List, Optional, Union, Callable, cast
+import numpy as np
+import talib  # type: ignore  # Suppress type errors for TA-Lib
+import logging
+from configparser import ConfigParser
+from pydantic import BaseModel, ValidationError, validator
+
+logger = logging.getLogger(__name__)
+
+# Load configuration from external file (config.ini)
+config = ConfigParser()
+config.read("config.ini")  # Ensure a config.ini file exists in the same directory
+
+# Default configuration values
+DEFAULT_TIMEFRAMES = config.get("DEFAULT", "timeframes", fallback="1m,5m").split(",")  # Example: ['1m', '5m']
+DEFAULT_INDICATORS = config.get("DEFAULT", "indicators", fallback="price,volume,rsi,macd,fibonacci").split(",")  # Example: ['price', 'volume', 'rsi', 'macd', 'fibonacci']
+MAX_HISTORY = config.getint("DEFAULT", "max_history", fallback=1000)
+EXECUTOR_WORKERS = config.getint("DEFAULT", "executor_workers", fallback=5)
+
+
+class CryptoGMNError(Exception):
+    """Base exception for CryptoGMN."""
+    pass
+
+
+class IndicatorCalculationError(CryptoGMNError):
+    """Exception raised when an indicator calculation fails."""
+    pass
+
+
+class DataModel(BaseModel):
+    """Pydantic model for validating incoming data."""
+    c: float  # Close price
+    v: Optional[float] = 0.0  # Volume
+
+    @validator('c', 'v', pre=True)
+    def validate_numeric(cls, v):
+        if isinstance(v, (int, float)):
+            return float(v)
+        try:
+            return float(v)
+        except (ValueError, TypeError):
+            raise ValueError(f"Value '{v}' is not a valid float.")
+
+
+class CryptoGMN:
+    """Manages cryptocurrency market data and technical indicators."""
+
+    def __init__(self, timeframes: List[str] = DEFAULT_TIMEFRAMES,  # Default values
+                 indicators: List[str] = DEFAULT_INDICATORS,
+                 max_history_length: int = MAX_HISTORY,
+                 executor_workers: int = EXECUTOR_WORKERS) -> None:
+        """
+        Initializes the CryptoGMN instance.
+
+        :param timeframes: List of timeframes (e.g., ['1m', '5m', '1h'])
+        :param indicators: List of indicators (e.g., ['price', 'volume', 'rsi', 'macd', 'fibonacci'])
+        :param max_history_length: Maximum number of data points to store per indicator
+        :param executor_workers: Number of worker threads for indicator calculations
+        """
+        self.timeframes = timeframes
+        self.indicators = indicators
+        self.max_history_length = max_history_length
+        self.market_data: Dict[str, Dict[str, deque]] = {
+            timeframe: {indicator: deque(maxlen=max_history_length) for indicator in indicators}
+            for timeframe in timeframes
+        }
+        self.locks: Dict[str, asyncio.Lock] = {timeframe: asyncio.Lock() for timeframe in timeframes}
+        self.executor: ThreadPoolExecutor  # Explicitly type hint
+        # Asynchronous context manager for Executor
+        self._executor_lock = asyncio.Lock()
+        self._executor: Optional[ThreadPoolExecutor] = None
+
+    async def __aenter__(self):
+        async with self._executor_lock:
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(max_workers=self.executor_workers)  # Use the config value here
+            self.executor = cast(ThreadPoolExecutor, self._executor)  # Cast to make mypy happy.
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.shutdown()
+
+    async def update_graph(self, new_data_items: List[Dict[str, Any]]) -> None:
+        """Updates market data with new items concurrently."""
+        await asyncio.gather(*(self._update_single_data(data) for data in new_data_items))  # More concise
+
+    async def _update_single_data(self, new_data: Dict[str, Any]) -> None:
+        """Updates data for a single new item across all timeframes."""
+        try:
+            validated_data = DataModel(**new_data)
+            price = validated_data.c
+            volume = validated_data.v
+        except ValidationError as e:
+            logger.error(f"Data validation error: {e}. Data: {new_data}")
+            return
+
+        await asyncio.gather(*(self._update_timeframe(tf, price, volume) for tf in self.timeframes))
+
+    async def _update_timeframe(self, timeframe: str, price: float, volume: float) -> None:
+        """Updates data for a specific timeframe, including batching for high-frequency data."""
+        async with self.locks[timeframe]:
+            data = self.market_data[timeframe]
+            data['price'].append(price)
+            data['volume'].append(volume)
+
+            prices_array = np.array(data['price'], dtype=np.float64)
+
+            if len(prices_array) >= 14:
+                await self._calculate_indicators(timeframe, prices_array)
+
+    async def _calculate_indicators(self, timeframe: str, prices_array: np.ndarray):
+        """Calculates all indicators for a timeframe concurrently."""
+        tasks = []
+        if 'rsi' in self.indicators:
+            tasks.append(self._calculate_and_append(timeframe, 'rsi', talib.RSI, prices_array, {'timeperiod': 14}))
+        if 'macd' in self.indicators:
+            tasks.append(self._calculate_and_append(
+                timeframe, 'macd',
+                lambda prices: self._macd_wrapper(prices),  # Lambda for MACD extraction
+                prices_array
+            ))
+        if 'fibonacci' in self.indicators:
+            tasks.append(self._calculate_and_append_fibonacci(timeframe, prices_array))
+        # Add other indicators similarly if needed
+        if tasks:
+            await asyncio.gather(*tasks)
+
+    async def _calculate_and_append(self, timeframe: str, indicator: str,
+                                    indicator_func: Callable, prices: np.ndarray,
+                                    kwargs: Dict[str, Any] = {}) -> None:
+        """
+        Calculates an indicator and appends the result to the market data.
+
+        :param timeframe: The timeframe for which to calculate the indicator
+        :param indicator: The name of the indicator
+        :param indicator_func: The TA-Lib function to calculate the indicator
+        :param prices: NumPy array of prices
+        :param kwargs: Additional keyword arguments for the indicator function
+        """
+        loop = asyncio.get_running_loop()
+        try:
+            result = await loop.run_in_executor(
+                self.executor, indicator_func, prices, **kwargs  # Simplify executor call
+            )
+        except Exception as e:
+            logger.error(f"Error running indicator '{indicator}' for timeframe '{timeframe}': {e}")
+            return
+
+        if result is not None:
+            try:
+                latest = result[-1]
+                if isinstance(latest, np.ndarray):
+                    latest = latest.item()  # Convert numpy scalar to Python float
+                if np.isnan(latest):
+                    logger.warning(f"{indicator.upper()} returned NaN or empty result for timeframe {timeframe}")
+                    return
+                self.market_data[timeframe][indicator].append(float(latest))
+            except IndexError:
+                logger.warning(f"{indicator.upper()} returned NaN or empty result for timeframe {timeframe}")
+
+    async def _calculate_and_append_fibonacci(self, timeframe: str, prices: np.ndarray, lookback: int = 14) -> None:
+        """Calculates and appends Fibonacci levels."""
+        loop = asyncio.get_running_loop()
+        try:
+            fibonacci_levels = await loop.run_in_executor(
+                self.executor, self._calculate_fibonacci, prices, lookback
+            )
+        except Exception as e:
+            logger.error(f"Error calculating Fibonacci for timeframe '{timeframe}': {e}")
+            return
+
+        if fibonacci_levels:
+            self.market_data[timeframe]['fibonacci'].append(fibonacci_levels)
+
+    def _macd_wrapper(self, prices: np.ndarray, fastperiod: int = 12, slowperiod: int = 26, signalperiod: int = 9) -> Optional[float]:
+        """Wrapper for talib.MACD to return only the MACD line."""
+        try:
+            macd, _, _ = talib.MACD(prices, fastperiod=fastperiod, slowperiod=slowperiod, signalperiod=signalperiod)
+            if macd is None or len(macd) == 0:
+                logger.warning(f"MACD calculation returned no data for timeframe.")
+                return None
+            latest_macd = macd[-1]
+            if np.isnan(latest_macd):
+                logger.warning(f"MACD returned NaN for timeframe.")
+                return None
+            return float(latest_macd)
+        except Exception as e:
+            logger.error(f"Error in _macd_wrapper: {e}")
+            return None
+
+    def _calculate_fibonacci(self, prices: np.ndarray, lookback: int) -> Optional[Dict[str, Union[float, bool]]]:
+        """Calculates Fibonacci retracement levels and indicates the closest level."""
+        try:
+            if len(prices) < lookback:
+                logger.warning("Not enough data to calculate Fibonacci retracement.")
+                return None
+            recent_prices = prices[-lookback:]
+            high = np.max(recent_prices)
+            low = np.min(recent_prices)
+            close = recent_prices[-1]
+            diff = high - low
+            if diff == 0:
+                logger.warning("High and low prices are the same; cannot calculate Fibonacci levels.")
+                return None  # Avoid division by zero
+
+            levels = {
+                "23.6%": high - 0.236 * diff,
+                "38.2%": high - 0.382 * diff,
+                "50%": high - 0.5 * diff,
+                "61.8%": high - 0.618 * diff,
+                "78.6%": high - 0.786 * diff,
+                "100%": low,
+            }
+            closest_level_key = min(
+                levels.keys(), key=lambda k: abs(levels[k] - close)
+            )
+            for k in levels:
+                levels[k] = {"value": levels[k], "is_closest": k == closest_level_key}  # Indicate closest
+
+            return levels
+        except Exception as e:
+            logger.error(f"Error calculating Fibonacci retracement: {e}")
+            return None
+
+    def get_data(self, timeframe: str, indicator: str) -> Optional[List[Union[float, Dict[str, Union[float, bool]]]]]:
+        """Retrieves the latest data for a specific timeframe and indicator."""
+        try:
+            return list(self.market_data[timeframe][indicator])
+        except KeyError:
+            logger.warning(
+                f"No data found for timeframe '{timeframe}' and indicator '{indicator}'."
+            )
+            return None
+
+    def get_all_data(self) -> Dict[str, Dict[str, List[Union[float, Dict[str, Union[float, bool]]]]]]:
+        """Retrieves all market data across all timeframes and indicators."""
+        return {
+            timeframe: {
+                indicator: list(data)
+                for indicator, data in indicators.items()
+            }
+            for timeframe, indicators in self.market_data.items()
+        }
+
+    async def shutdown(self) -> None:
+        """Shuts down the executor gracefully."""
+        if self._executor:
+            self._executor.shutdown(wait=True)
+            self._executor = None  # Important for proper cleanup
+        logger.info("CryptoGMN has been shut down gracefully.")
+
+
+// File: models\gmn\logger.py
+import logging
+
+class CryptoGMNLogger:
+    def __init__(self, name: str, level: int = logging.INFO):
+        self.logger = logging.getLogger(name)
+        self.logger.setLevel(level)
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        
+        file_handler = logging.FileHandler('cryptogmn.log')
+        file_handler.setFormatter(formatter)
+        self.logger.addHandler(file_handler)
+        
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        self.logger.addHandler(console_handler)
+
+logger = CryptoGMNLogger("CryptoGMN").logger
+
+// File: models\gmn\main.py
+import asyncio
+import logging
+import os
+from crypto_gmn import CryptoGMN
+from config import load_config
+
+async def main():
+    # Optionally set the environment variable before running
+    # os.environ["ENVIRONMENT"] = "PRODUCTION"
+
+    config = load_config()
+    
+    async with CryptoGMN(config) as gmn:
+        # Example batch of new data points
+        new_data = [
+            {'c': 150.0, 'v': 1000},
+            {'c': 155.0, 'v': 1200},
+            {'c': 160.0, 'v': 1500},
+            {'c': 158.0, 'v': 1100},
+            {'c': 162.0, 'v': 1300},
+        ]
+
+        # Update the graph with new data
+        await gmn.update_graph(new_data)
+
+        # Retrieve specific indicator data
+        rsi_data = gmn.get_data('1m', 'rsi')
+        macd_data = gmn.get_data('1m', 'macd')
+        fibonacci_data = gmn.get_data('1m', 'fibonacci')
+
+        print(f"RSI Data for 1m: {rsi_data}")
+        print(f"MACD Data for 1m: {macd_data}")
+        print(f"Fibonacci Data for 1m: {fibonacci_data}")
+
+        # Retrieve all market data
+        all_data = gmn.get_all_data()
+        print(f"All Market Data: {all_data}")
+
+        # Dynamically add a new indicator (e.g., EMA)
+        ema_func = gmn.indicator_factory.create_ema(timeperiod=50)
+        gmn.add_indicator('1m', 'ema', ema_func)
+
+        # Update with new data to trigger EMA calculation
+        new_data = [
+            {'c': 165.0, 'v': 1400},
+            {'c': 170.0, 'v': 1600},
+        ]
+        await gmn.update_graph(new_data)
+
+        ema_data = gmn.get_data('1m', 'ema')
+        print(f"EMA Data for 1m: {ema_data}")
+
+        # Fetch real-time data from Binance
+        await gmn.fetch_real_time_data(exchange='binance', symbol='BTCUSDT')
+
+        # Access cached indicator data
+        cached_rsi = gmn.get_cached_indicator('1m', 'rsi', window=10)
+        print(f"Cached RSI Data for 1m (last 10): {cached_rsi}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+// File: models\gmn\performance_monitor.py
+from collections import deque
+
+class PerformanceMonitor:
+    def __init__(self, window_size: int = 100):
+        self.processing_times = deque(maxlen=window_size)
+
+    def record(self, start_time: float, end_time: float):
+        self.processing_times.append(end_time - start_time)
+
+    @property
+    def average_processing_time(self):
+        return sum(self.processing_times) / len(self.processing_times) if self.processing_times else 0
+
+// File: models\gmn\utils.py
+import functools
+from logger import logger
+
+def retry(exceptions, tries=3, delay=1.0):
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            for attempt in range(tries):
+                try:
+                    return await func(*args, **kwargs)
+                except exceptions as e:
+                    logger.warning(f"Attempt {attempt + 1} failed with error: {e}")
+                    if attempt < tries - 1:
+                        await asyncio.sleep(delay)
+                    else:
+                        logger.error(f"All {tries} attempts failed for function {func.__name__}")
+                        raise
+        return wrapper
+    return decorator
+
+// File: models\gmn\__init__.py
+
+
+// File: models\lnn\lnn_model.py
+# File: models/lnn/lnn_model.py
+
+import torch
+import torch.nn as nn
+
+class LiquidNeuralNetwork(nn.Module):
+    def __init__(self, input_size: int, hidden_size: int, output_size: int, num_layers: int = 2, dropout: float = 0.2):
+        super(LiquidNeuralNetwork, self).__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=num_layers, batch_first=True, dropout=dropout)
+        self.fc = nn.Linear(hidden_size, output_size)
+        self.dropout = nn.Dropout(dropout)
+        self.relu = nn.ReLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the LNN.
+        Args:
+            x: Input tensor of shape (batch_size, seq_len, input_size)
+        Returns:
+            Output tensor of shape (batch_size, output_size)
+        """
+        out, _ = self.lstm(x)  # out: (batch_size, seq_len, hidden_size)
+        out = self.dropout(out[:, -1, :])  # Take the output from the last time step
+        out = self.relu(out)
+        out = self.fc(out)
+        return out
+
+
+// File: models\lnn\train_lnn.py
+# File: models/lnn/train_lnn.py
+
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from models.lnn.lnn_model import LiquidNeuralNetwork
+from models.utils.config import Config
+from sklearn.preprocessing import MinMaxScaler
+import logging
+
+
+def train_lnn():
+    """Trains the LNN model and saves it."""
+    config = Config("configs/config.yaml")
+    
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+
+    try:
+        # Load and prepare your data
+        # Replace 'your_training_data.csv' with your actual data source
+        data = pd.read_csv("data/your_training_data.csv")  # Ensure this file exists and is correctly formatted
+        X = data.iloc[:, :-1].values
+        y = data.iloc[:, -1].values
+
+        # Scale the input features
+        scaler = MinMaxScaler()
+        X_scaled = scaler.fit_transform(X)
+
+        # Convert to tensors
+        X_tensor = torch.tensor(X_scaled, dtype=torch.float32).unsqueeze(1)  # Shape: (batch_size, seq_len, input_size)
+        y_tensor = torch.tensor(y, dtype=torch.float32)  # Shape: (batch_size,)
+
+        # Create DataLoader
+        dataset = torch.utils.data.TensorDataset(X_tensor, y_tensor)
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=32, shuffle=True)
+
+        # Initialize the model, loss function, and optimizer
+        input_size = X_scaled.shape[1]
+        model = LiquidNeuralNetwork(input_size, config.lnn_hidden_size, 1)
+        criterion = nn.BCEWithLogitsLoss()  # Suitable for binary classification
+        optimizer = optim.Adam(model.parameters(), lr=config.lnn_learning_rate)
+
+        # Training loop
+        epochs = config.lnn_training_epochs
+        for epoch in range(epochs):
+            model.train()
+            epoch_loss = 0.0
+            for batch_X, batch_y in dataloader:
+                optimizer.zero_grad()
+                outputs = model(batch_X.half()).squeeze()  # Forward pass
+                loss = criterion(outputs, batch_y)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+            avg_loss = epoch_loss / len(dataloader)
+            logging.info(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}")
+
+        # Save the trained model
+        torch.save(model.state_dict(), config.lnn_model_path)
+        logging.info(f"LNN model trained and saved to {config.lnn_model_path}")
+
+    except FileNotFoundError:
+        logging.error("Training data file not found. Please provide a valid CSV file.")
+    except Exception as e:
+        logging.error(f"Error during LNN training: {e}")
+
+
+if __name__ == "__main__":
+    train_lnn()
+
+
+// File: models\lnn\__init__.py
+
+
+// File: models\utils\config.py
+# File: models/utils/config.py
+
+import yaml
+from typing import List, Dict, Any
+
+
+class Config:
+    def __init__(self, config_path: str):
+        try:
+            with open(config_path, "r") as f:
+                self.config: Dict[str, Any] = yaml.safe_load(f)
+
+                # Trading Parameters
+                self.symbol: str = self.config.get("symbol", "BTC_USDT")
+                self.interval: str = self.config.get("interval", "Min1")
+                self.timeframes: List[str] = self.config.get("timeframes", ["1m", "5m", "15m", "1h", "4h"])
+                self.indicators: List[str] = self.config.get("indicators", ["price", "volume", "rsi", "macd", "fibonacci"])
+
+                # GMN Parameters
+                self.max_history_length: int = self.config.get("max_history_length", 1000)
+
+                # LNN Parameters
+                self.lnn_model_path: str = self.config.get("lnn_model_path", "models/lnn/lnn_model.pth")
+                self.lnn_hidden_size: int = self.config.get("lnn_hidden_size", 64)
+                self.lnn_training_epochs: int = self.config.get("lnn_training_epochs", 10)
+                self.training_history_length: int = self.config.get("training_history_length", 500)
+                self.lnn_learning_rate: float = self.config.get("lnn_learning_rate", 0.001)
+
+                # Agent Parameters
+                self.threshold_buy: float = self.config.get("threshold_buy", 0.7)
+                self.threshold_sell: float = self.config.get("threshold_sell", 0.3)
+
+                # Risk Management
+                self.risk_parameters: Dict[str, Any] = self.config.get("risk_parameters", {})
+
+                # Trade Execution
+                self.trade_parameters: Dict[str, Any] = self.config.get("trade_parameters", {})
+
+                # System
+                self.agent_loop_delay: int = self.config.get("agent_loop_delay", 1)
+                self.reconnect_delay: int = self.config.get("reconnect_delay", 5)
+                self.log_level = self.config.get("log_level", "INFO")
+
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Config file not found: {config_path}")
+        except yaml.YAMLError as e:
+            raise ValueError(f"Error parsing YAML config file: {e}")
+
+
+// File: models\utils\risk_management.py
+# File: models/utils/risk_management.py
+
+import logging
+from typing import Dict, Any
+
+
+class RiskManager:
+    def __init__(self, risk_parameters: Dict[str, Any]):
+        self.max_drawdown = risk_parameters.get("max_drawdown", 0.1)
+        self.max_position_size = risk_parameters.get("max_position_size", 0.05)  # Example: 5% of portfolio
+        # ... (initialize other risk parameters as needed)
+
+    def check_risk(self, current_drawdown: float, current_position: str, market_data: Dict) -> bool:
+        """
+        Checks if the current trade action is within risk parameters.
+        Args:
+            current_drawdown (float): Current drawdown ratio.
+            current_position (str): Current position ('long', 'short', or None).
+            market_data (Dict): Latest market data for additional risk checks.
+        Returns:
+            bool: True if within risk parameters, False otherwise.
+        """
+        if current_drawdown > self.max_drawdown:
+            logging.warning(
+                f"Risk check failed: Drawdown ({current_drawdown:.2f}) exceeds maximum allowed ({self.max_drawdown:.2f})."
+            )
+            return False
+
+        # Example: Prevent increasing position size beyond maximum allowed
+        # Implement additional risk checks based on current_position and market_data
+        # For instance, limit the number of concurrent positions, check volatility, etc.
+
+        return True
+
+
+// File: models\utils\__init__.py
+
+
+// File: tests\test_websocket_manager.py
+# tests/test_websocket_manager.py 
+import asyncio
+import json
+import pytest
+from unittest.mock import AsyncMock, patch
+import time
+
+from data.ingestion.websocket_manager import WebSocketManager 
+
+class MockWebSocket:
+    def __init__(self, messages=None):
+        self.messages = messages if messages else []
+        self.sent_messages = []
+        self.closed = False
+
+    async def recv(self):
+        if self.messages:
+            return json.dumps(self.messages.pop(0))
+        else:
+            await asyncio.sleep(0.1)
+            return None
+
+    async def send(self, message):
+        self.sent_messages.append(message)
+
+    async def close(self):
+        self.closed = True
+
+    async def ping(self):
+        pass
+
+    async def pong(self):
+        pass
+
+@pytest.mark.asyncio
+async def test_connect_and_subscribe():
+    """Tests connecting to a mock WebSocket and subscribing to a channel."""
+    mock_ws = MockWebSocket()
+    with patch('websockets.connect', new_callable=AsyncMock) as mock_connect:
+        mock_connect.return_value = mock_ws
+        manager = WebSocketManager("wss://test-ws.com", "test_api_key", "test_api_secret", 10)
+        
+        async with manager: 
+            assert manager.websocket is not None
+            assert manager.websocket.closed is False
+
+            await manager.subscribe_to_spot("BTCUSDT")
+
+            expected_message = json.dumps({
+                "method": "SUBSCRIPTION",
+                "params": ["spot@public.deals.v3.api@BTCUSDT"]
+            })
+            assert expected_message in mock_ws.sent_messages
+
+
+@pytest.mark.asyncio
+async def test_send_and_receive_messages_with_rate_limit():
+    """Tests sending and receiving messages with rate limiting."""
+    test_messages = [
+        {"test": "message1"},
+        {"test": "message2"},
+        {"test": "message3"},
+    ]
+    mock_ws = MockWebSocket(messages=test_messages.copy())  
+
+    with patch('websockets.connect', new_callable=AsyncMock) as mock_connect:
+        mock_connect.return_value = mock_ws
+        handler = WebSocketManager("wss://test-ws.com", "test_api_key", "test_api_secret", 2)  
+
+        async with handler:
+            assert handler.websocket is not None
+
+            start_time = time.time()
+
+            for message in test_messages:
+                await handler.send_message(json.dumps(message))
+
+            assert len(mock_ws.sent_messages) == len(test_messages)
+
+            received_messages = []
+            for _ in range(len(test_messages)):  
+                received_messages.append(json.loads(await handler.receive_message()))
+
+            assert received_messages == test_messages
+
+            end_time = time.time()
+            elapsed_time = end_time - start_time
+
+            assert elapsed_time >= (len(test_messages) / handler.rate_limit) 
+
+// File: tests\__init__.py
+
+
