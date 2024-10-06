@@ -432,7 +432,7 @@ class MexcWebsocketConnector:
         Args:
             data_queue (asyncio.Queue): Queue to put received data for processing.
             symbols (List[str]): List of trading symbols (e.g., ['BTCUSDT', 'ETHUSDT']).
-            timeframes (List[str]): List of kline timeframes (e.g., ['1m', '15m']).
+            timeframes (List[str]): List of kline timeframes in the correct format (e.g., ['Min1', 'Min5']).
             error_handler (ErrorHandler): Instance to handle errors.
         """
         self.ws_url = os.getenv("MEXC_WS_URL", "wss://wbs.mexc.com/ws")
@@ -454,11 +454,8 @@ class MexcWebsocketConnector:
             try:
                 async with websockets.connect(self.ws_url) as ws:
                     await self._subscribe(ws)
-                    # Start keep-alive and data reception concurrently
-                    await asyncio.gather(
-                        self._receive_data(ws),
-                        self._keep_alive(ws)
-                    )
+                    # Start receiving data
+                    await self._receive_data(ws)
             except Exception as e:
                 self.error_handler.handle_error(f"WebSocket connection error: {e}", exc_info=True)
                 print(f"WebSocket connection error: {e}. Reconnecting in {self.reconnect_delay} seconds...")
@@ -474,7 +471,7 @@ class MexcWebsocketConnector:
         subscription_params = []
         for symbol in self.symbols:
             for timeframe in self.timeframes:
-                stream_name = f"spot@public.kline.v3.api@{symbol}@kline_{timeframe}"
+                stream_name = f"spot@public.kline.v3.api@{symbol}@{timeframe}"
                 subscription_params.append(stream_name)
                 # If subscription_params reach max_subscriptions, send subscription
                 if len(subscription_params) == self.max_subscriptions:
@@ -512,33 +509,25 @@ class MexcWebsocketConnector:
         async for message in ws:
             try:
                 data = json.loads(message)
-                stream = data.get('stream')
-                if not stream:
-                    continue  # Ignore non-stream messages
+                
+                # Handle PING from server
+                if data.get('method') == 'PING':
+                    pong_message = {"method": "PONG"}
+                    await ws.send(json.dumps(pong_message))
+                    print("Received PING, sent PONG.")
+                    continue
+                
+                channel = data.get('c')  # 'c' field contains the channel name
+                if not channel:
+                    continue  # Ignore non-channel messages
 
-                # Check if the message is a kline update
-                if "kline" in stream:
+                if "kline" in channel:
                     await self.data_queue.put(data)
             except json.JSONDecodeError:
                 self.error_handler.handle_error(f"Failed to decode message: {message}", symbol=None, timeframe=None)
             except Exception as e:
                 self.error_handler.handle_error(f"Error processing message: {e}", exc_info=True, symbol=None, timeframe=None)
 
-    async def _keep_alive(self, ws):
-        """
-        Sends PING messages periodically to keep the WebSocket connection alive.
-
-        Args:
-            ws (websockets.WebSocketClientProtocol): Active WebSocket connection.
-        """
-        try:
-            while True:
-                await asyncio.sleep(60)  # Send PING every 60 seconds
-                ping_message = {"method": "PING"}
-                await ws.send(json.dumps(ping_message))
-                print("Sent PING to WebSocket.")
-        except Exception as e:
-            self.error_handler.handle_error(f"Error sending PING: {e}", exc_info=True, symbol=None, timeframe=None)
 
 
 // File: data\__init__.py
@@ -714,122 +703,6 @@ class DataStorage:
         """
         # Implement MongoDB storage logic here
         pass
-
-
-// File: data\storage\data_storage_postgresql.py
-import asyncio
-import pandas as pd
-from typing import Dict, Any, List
-import asyncpg
-from error_handler import ErrorHandler
-
-class DataStoragePostgreSQL:
-    """
-    Handles storage of processed data to a PostgreSQL database.
-    """
-
-    def __init__(self, db_config: Dict[str, Any], error_handler: ErrorHandler):
-        """
-        Initializes the PostgreSQL storage.
-
-        Args:
-            db_config (Dict[str, Any]): Database configuration parameters.
-            error_handler (ErrorHandler): Instance to handle errors.
-        """
-        self.db_config = db_config
-        self.error_handler = error_handler
-        self.conn = None
-
-    async def connect(self):
-        """
-        Establishes a connection to the PostgreSQL database.
-        """
-        try:
-            self.conn = await asyncpg.connect(**self.db_config)
-            print("Connected to PostgreSQL database.")
-        except Exception as e:
-            self.error_handler.handle_error(f"PostgreSQL connection error: {e}", exc_info=True)
-
-    async def store_data(self, unified_feed: Dict[str, Any]):
-        """
-        Stores unified feed data to the PostgreSQL database.
-
-        Args:
-            unified_feed (Dict[str, Any]): Processed data ready for storage.
-        """
-        try:
-            symbol = unified_feed.get('symbol', 'UNKNOWN')
-            timeframe = unified_feed.get('timeframe', 'UNKNOWN')
-            data = unified_feed.get('data', [])
-            indicators = unified_feed.get('indicators', {})
-
-            for record in data:
-                open_price = record.get('open')
-                high = record.get('high')
-                low = record.get('low')
-                close = record.get('close')
-                volume = record.get('volume')
-                close_time = record.get('close_time')
-
-                # Insert kline data
-                await self.conn.execute('''
-                    INSERT INTO klines(symbol, timeframe, open, high, low, close, volume, close_time)
-                    VALUES($1, $2, $3, $4, $5, $6, $7, to_timestamp($8 / 1000.0))
-                    ON CONFLICT (symbol, timeframe, close_time) DO NOTHING
-                ''', symbol, timeframe, open_price, high, low, close, volume, close_time)
-
-            # Insert indicators as needed
-            # Example: Insert RSI
-            if 'rsi' in indicators:
-                rsi_values = indicators['rsi']
-                for record, rsi in zip(data, rsi_values):
-                    close_time = record.get('close_time')
-                    await self.conn.execute('''
-                        INSERT INTO indicators(symbol, timeframe, close_time, rsi)
-                        VALUES($1, $2, to_timestamp($3 / 1000.0), $4)
-                        ON CONFLICT (symbol, timeframe, close_time) DO NOTHING
-                    ''', symbol, timeframe, close_time, rsi)
-
-            print(f"Data stored in PostgreSQL for {symbol} {timeframe}.")
-        except Exception as e:
-            self.error_handler.handle_error(f"Error storing data to PostgreSQL: {e}", exc_info=True, symbol=unified_feed.get('symbol'), timeframe=unified_feed.get('timeframe'))
-
-    async def load_dataframe(self, symbol: str, timeframe: str) -> pd.DataFrame:
-        """
-        Loads existing DataFrame from PostgreSQL.
-
-        Args:
-            symbol (str): Trading symbol.
-            timeframe (str): Kline timeframe.
-
-        Returns:
-            pd.DataFrame: Loaded DataFrame or empty DataFrame if no data exists.
-        """
-        try:
-            rows = await self.conn.fetch('''
-                SELECT open, high, low, close, volume, EXTRACT(EPOCH FROM close_time) * 1000 AS close_time
-                FROM klines
-                WHERE symbol = $1 AND timeframe = $2
-                ORDER BY close_time ASC
-            ''', symbol, timeframe)
-
-            if not rows:
-                return pd.DataFrame()
-
-            df = pd.DataFrame(rows, columns=['open', 'high', 'low', 'close', 'volume', 'close_time'])
-            df['close_time'] = df['close_time'].astype(int)
-            return df
-        except Exception as e:
-            self.error_handler.handle_error(f"Error loading data from PostgreSQL: {e}", exc_info=True, symbol=symbol, timeframe=timeframe)
-            return pd.DataFrame()
-
-    async def close(self):
-        """
-        Closes the PostgreSQL database connection.
-        """
-        if self.conn:
-            await self.conn.close()
-            print("PostgreSQL connection closed.")
 
 
 // File: data\storage\__init__.py

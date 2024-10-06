@@ -1,18 +1,28 @@
-import os
+# File: data/data_processor.py
 import asyncio
-import aiohttp
 from typing import Dict, Any, List
 import pandas as pd
 from .indicator_calculations import IndicatorCalculator
 from .storage.data_storage import DataStorage
 from error_handler import ErrorHandler
+import logging
+import aiohttp
+import os
 
 class DataProcessor:
     """
     Processes raw kline data, applies technical indicators, and stores the processed data.
     """
 
-    def __init__(self, data_queue: asyncio.Queue, storage: DataStorage, indicator_calculator: IndicatorCalculator, error_handler: ErrorHandler, symbols: List[str], timeframes: List[str]):
+    def __init__(
+        self,
+        data_queue: asyncio.Queue,
+        storage: DataStorage,
+        indicator_calculator: IndicatorCalculator,
+        error_handler: ErrorHandler,
+        symbols: List[str],
+        timeframes: List[str]
+    ):
         """
         Initializes the DataProcessor.
 
@@ -30,6 +40,7 @@ class DataProcessor:
         self.error_handler = error_handler
         self.symbols = symbols
         self.timeframes = timeframes
+        self.logger = logging.getLogger("DataProcessor")
 
     async def run(self):
         """
@@ -40,8 +51,16 @@ class DataProcessor:
                 data = await self.data_queue.get()
                 await self.process_data(data)
                 self.data_queue.task_done()
+            except asyncio.CancelledError:
+                self.logger.info("DataProcessor task cancelled.")
+                break
             except Exception as e:
-                self.error_handler.handle_error(f"Error in DataProcessor run loop: {e}", exc_info=True, symbol=None, timeframe=None)
+                self.error_handler.handle_error(
+                    f"Error in DataProcessor run loop: {e}",
+                    exc_info=True,
+                    symbol=None,
+                    timeframe=None
+                )
 
     async def process_data(self, data: Dict[str, Any]):
         """
@@ -83,16 +102,19 @@ class DataProcessor:
             await self.storage.store_data(unified_feed)
             # Optionally, send to GMN
             await self.send_to_gmn(unified_feed)
-            # Live Test Output: Print the unified_feed
-            print("\n--- Unified Feed ---")
-            print(unified_feed)
-            print("---------------------\n")
+            # Live Test Output: Log the unified_feed
+            self.logger.info(f"Processed data for {symbol} {timeframe}: {unified_feed}")
         except Exception as e:
-            self.error_handler.handle_error(f"Error processing data: {e}", exc_info=True, symbol=None, timeframe=None)
+            self.error_handler.handle_error(
+                f"Error processing data: {e}",
+                exc_info=True,
+                symbol=None,
+                timeframe=None
+            )
 
     def _extract_symbol_timeframe(self, data: Dict[str, Any]) -> tuple[str, str]:
         """
-        Extracts the symbol and timeframe from the stream name.
+        Extracts the symbol and timeframe from the channel name.
 
         Args:
             data (Dict[str, Any]): Raw kline data.
@@ -100,12 +122,12 @@ class DataProcessor:
         Returns:
             tuple[str, str]: Symbol and timeframe.
         """
-        stream = data.get('stream', '')
-        parts = stream.split('@')
-        if len(parts) < 5:
-            raise ValueError(f"Invalid stream format: {stream}")
-        symbol = parts[3]
-        timeframe = parts[4].replace('kline_', '')
+        channel = data.get('c', '')
+        parts = channel.split('@')
+        if len(parts) < 4:
+            raise ValueError(f"Invalid channel format: {channel}")
+        symbol = parts[2]
+        timeframe = parts[3]  # e.g., 'Min30'
         return symbol, timeframe
 
     def _extract_kline_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -118,7 +140,7 @@ class DataProcessor:
         Returns:
             Dict[str, Any]: Extracted kline information.
         """
-        k = data.get('data', {}).get('k', {})
+        k = data.get('d', {}).get('k', {})
         if not k:
             raise ValueError("Missing kline data in the message")
         return {
@@ -143,6 +165,20 @@ class DataProcessor:
             try:
                 async with session.post(gmn_endpoint, json=unified_feed) as response:
                     if response.status != 200:
-                        self.error_handler.handle_error(f"GMN API error: {response.status}", symbol=unified_feed.get('symbol'), timeframe=unified_feed.get('timeframe'))
+                        response_text = await response.text()
+                        self.error_handler.handle_error(
+                            f"GMN API error: {response.status}, Response: {response_text}",
+                            symbol=unified_feed.get('symbol'),
+                            timeframe=unified_feed.get('timeframe')
+                        )
+                    else:
+                        self.logger.info(
+                            f"Data successfully sent to GMN for {unified_feed.get('symbol')} {unified_feed.get('timeframe')}"
+                        )
             except Exception as e:
-                self.error_handler.handle_error(f"Error sending data to GMN: {e}", exc_info=True, symbol=unified_feed.get('symbol'), timeframe=unified_feed.get('timeframe'))
+                self.error_handler.handle_error(
+                    f"Error sending data to GMN: {e}",
+                    exc_info=True,
+                    symbol=unified_feed.get('symbol'),
+                    timeframe=unified_feed.get('timeframe')
+                )

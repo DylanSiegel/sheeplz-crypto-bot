@@ -1,8 +1,10 @@
+# File: data/indicator_calculations.py
 import pandas as pd
 from finta import TA
 from typing import Dict, Any, List
 import concurrent.futures
 from error_handler import ErrorHandler
+import logging
 
 class IndicatorCalculator:
     """
@@ -17,6 +19,7 @@ class IndicatorCalculator:
             error_handler (ErrorHandler): Instance to handle errors during calculations.
         """
         self.error_handler = error_handler
+        self.logger = logging.getLogger("IndicatorCalculator")
 
     def calculate_indicators(self, symbol: str, data: Dict[str, pd.DataFrame]) -> Dict[str, Dict[str, Any]]:
         """
@@ -78,6 +81,7 @@ class IndicatorCalculator:
             indicators['rsi'] = self.calculate_rsi(df)
             indicators['macd'] = self.calculate_macd(df)
             indicators['fibonacci'] = self.calculate_fibonacci(df)
+            self.logger.debug(f"Indicators calculated for {symbol} {timeframe}: {indicators}")
         except Exception as e:
             self.error_handler.handle_error(
                 f"Error calculating indicators for {symbol} {timeframe}: {e}",

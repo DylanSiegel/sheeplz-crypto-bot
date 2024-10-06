@@ -5,6 +5,7 @@ import os
 from typing import Dict, Any, List
 from dotenv import load_dotenv
 from error_handler import ErrorHandler
+import logging
 
 load_dotenv(os.path.join(os.path.dirname(__file__), '../../configs/.env'))
 
@@ -26,6 +27,8 @@ class DataStorage:
         os.makedirs(self.storage_path, exist_ok=True)
         self.db_config = db_config  # For future expansion to database storage
         self.error_handler = error_handler
+        self.logger = logging.getLogger("DataStorage")
+        self.file_locks = {}  # To prevent concurrent writes to the same file
 
     async def store_data(self, unified_feed: Dict[str, Any]):
         """
@@ -50,7 +53,7 @@ class DataStorage:
         indicators = unified_feed.get('indicators', {})
 
         if not data:
-            print(f"No data to store for {symbol} {timeframe}")
+            self.logger.warning(f"No data to store for {symbol} {timeframe}")
             return
 
         # For file-based storage (CSV)
@@ -62,7 +65,7 @@ class DataStorage:
     def _store_to_csv(self, symbol: str, timeframe: str, data: List[Dict[str, Any]], indicators: Dict[str, Any]):
         """
         Stores data to a CSV file.
-        
+
         Args:
             symbol (str): Trading symbol.
             timeframe (str): Kline timeframe.
@@ -81,30 +84,56 @@ class DataStorage:
                             df[f"{key}_{sub_key}"] = sub_value
                 else:
                     # For scalar or mismatched lengths, skip or handle accordingly
-                    pass
+                    self.logger.debug(f"Skipping indicator {key} due to mismatched data length.")
 
             filename = f"{symbol}_{timeframe}.csv"
             filepath = os.path.join(self.storage_path, filename)
-            if os.path.exists(filepath):
-                existing_df = pd.read_csv(filepath)
-                df = pd.concat([existing_df, df], ignore_index=True)
-                df.drop_duplicates(subset=['close_time'], keep='last', inplace=True)
-            df.to_csv(filepath, index=False)
-            print(f"Data stored in {filepath}")
+
+            # Acquire a lock for the file to prevent concurrent writes
+            lock = self.file_locks.get(filepath)
+            if not lock:
+                lock = asyncio.Lock()
+                self.file_locks[filepath] = lock
+
+            async def write_csv():
+                if os.path.exists(filepath):
+                    existing_df = pd.read_csv(filepath)
+                    df_combined = pd.concat([existing_df, df], ignore_index=True)
+                    df_combined.drop_duplicates(subset=['close_time'], keep='last', inplace=True)
+                    df_combined.sort_values(by='close_time', inplace=True)
+                    df_combined.to_csv(filepath, index=False)
+                else:
+                    df.to_csv(filepath, index=False)
+                self.logger.info(f"Data stored in {filepath}")
+
+            # Schedule the write operation in the event loop
+            asyncio.get_event_loop().create_task(self._write_with_lock(lock, write_csv))
+
         except Exception as e:
             if self.error_handler:
                 self.error_handler.handle_error(f"Error storing data to {filepath}: {e}", exc_info=True, symbol=symbol, timeframe=timeframe)
             else:
-                print(f"Error storing data to {filepath}: {e}")
+                self.logger.error(f"Error storing data to {filepath}: {e}")
+
+    async def _write_with_lock(self, lock: asyncio.Lock, write_coroutine):
+        """
+        Ensures that writing to a file is thread-safe using asyncio locks.
+
+        Args:
+            lock (asyncio.Lock): The lock associated with the file.
+            write_coroutine (callable): The coroutine to execute for writing.
+        """
+        async with lock:
+            await write_coroutine()
 
     async def load_dataframe(self, symbol: str, timeframe: str) -> pd.DataFrame:
         """
         Loads existing DataFrame from storage.
-        
+
         Args:
             symbol (str): Trading symbol.
             timeframe (str): Kline timeframe.
-        
+
         Returns:
             pd.DataFrame: Loaded DataFrame or empty DataFrame if file doesn't exist.
         """
@@ -114,11 +143,11 @@ class DataStorage:
     def _load_dataframe_sync(self, symbol: str, timeframe: str) -> pd.DataFrame:
         """
         Synchronously loads DataFrame from storage.
-        
+
         Args:
             symbol (str): Trading symbol.
             timeframe (str): Kline timeframe.
-        
+
         Returns:
             pd.DataFrame: Loaded DataFrame or empty DataFrame if file doesn't exist.
         """
@@ -127,19 +156,22 @@ class DataStorage:
         if os.path.exists(filepath):
             try:
                 df = pd.read_csv(filepath)
+                self.logger.debug(f"Loaded existing data from {filepath}")
                 return df
             except Exception as e:
                 if self.error_handler:
                     self.error_handler.handle_error(f"Error loading data from {filepath}: {e}", exc_info=True, symbol=symbol, timeframe=timeframe)
+                self.logger.error(f"Error loading data from {filepath}: {e}")
                 return pd.DataFrame()
         else:
+            self.logger.info(f"No existing data found for {symbol} {timeframe}. Starting fresh.")
             return pd.DataFrame()
 
     # Placeholder methods for database storage implementations
     def _store_to_postgresql(self, symbol: str, timeframe: str, data: List[Dict[str, Any]], indicators: Dict[str, Any]):
         """
         Stores data to a PostgreSQL database.
-        
+
         Args:
             symbol (str): Trading symbol.
             timeframe (str): Kline timeframe.
@@ -152,7 +184,7 @@ class DataStorage:
     def _store_to_mongodb(self, symbol: str, timeframe: str, data: List[Dict[str, Any]], indicators: Dict[str, Any]):
         """
         Stores data to a MongoDB database.
-        
+
         Args:
             symbol (str): Trading symbol.
             timeframe (str): Kline timeframe.
