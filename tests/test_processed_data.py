@@ -1,64 +1,118 @@
-# File: tests/test_processed_data.py
-
-import asyncio
 import pytest
+from unittest.mock import AsyncMock, MagicMock
 from data.data_processor import DataProcessor
-from models.gmn.crypto_gmn import CryptoGMN
-from data.config import Config as DataIngestionConfig
+from data.config import Config
+from data.indicator_calculations import IndicatorCalculator
+from data.error_handler import ErrorHandler
 
-@pytest.fixture(scope="module")
-def config():
-    """Load data ingestion configuration."""
-    return DataIngestionConfig()
-
-@pytest.fixture(scope="module")
-def gmn(config):
-    """Create a CryptoGMN instance."""
-    return CryptoGMN(config.timeframes, config.max_history_length, 5)
-
-@pytest.fixture(scope="module")
-def data_processor(gmn):
-    """Create a DataProcessor instance."""
-    return DataProcessor(gmn)
 
 @pytest.mark.asyncio
-async def test_processed_data_sample(data_processor):
+async def test_processed_data():
     """
-    Test to check the processed data sample and ensure it's ready for GMN calculations.
+    Tests that DataProcessor correctly processes kline data, applies indicators,
+    and creates a unified feed.
     """
+    # Create mock gmn with store_data as AsyncMock
+    mock_gmn = MagicMock()
+    mock_gmn.store_data = AsyncMock()
 
-    # Example raw data batch that would be processed in the data flow
-    raw_data_batch = [
-        {'channel': 'push.kline', 'data': {'price': 50000, 'volume': 1.5}},
-        {'channel': 'push.kline', 'data': {'price': 50100, 'volume': 1.6}},
-        {'channel': 'push.kline', 'data': {'price': 50200, 'volume': 1.7}},
-        {'channel': 'push.kline', 'data': {'price': 50300, 'volume': 1.8}},
-        {'channel': 'push.kline', 'data': {'price': 50400, 'volume': 2.0}},
-        # Add more data for multiple timeframes/indicators as necessary
+    # Create IndicatorCalculator with mock error_handler
+    mock_error_handler = MagicMock(spec=ErrorHandler)
+    indicator_calculator = IndicatorCalculator(mock_error_handler)
+
+    # Initialize Config
+    config = Config()
+
+    # Initialize DataProcessor
+    processor = DataProcessor(mock_gmn, indicator_calculator, mock_error_handler, config)
+
+    # Sample kline data for multiple timeframes
+    sample_kline_data = [
+        {
+            'method': 'some_method',
+            'c': 'spot@public.kline.v3.api@1m',
+            'd': {
+                'k': {
+                    'T': 1638316800000,
+                    'a': 100.0,
+                    'c': 30000.0,
+                    'h': 30050.0,
+                    'i': '1m',
+                    'l': 29950.0,
+                    'o': 29975.0,
+                    't': 1638316740000,
+                    'v': 50.0
+                }
+            }
+        },
+        {
+            'method': 'some_method',
+            'c': 'spot@public.kline.v3.api@5m',
+            'd': {
+                'k': {
+                    'T': 1638317100000,
+                    'a': 150.0,
+                    'c': 30050.0,
+                    'h': 30100.0,
+                    'i': '5m',
+                    'l': 30000.0,
+                    'o': 30025.0,
+                    't': 1638317040000,
+                    'v': 75.0
+                }
+            }
+        },
+        {
+            'method': 'PONG',  # Heartbeat message
+            'c': 'some_other_channel',
+            'd': {}
+        }
     ]
 
-    # Process the raw data through the data processor
-    await data_processor.process_data(raw_data_batch)
+    # Process the kline data
+    await processor.process_data(sample_kline_data)
 
-    # Fetch the processed data from the GMN
-    processed_data = data_processor.gmn.get_all_data()
+    # Check if store_data was called once
+    assert mock_gmn.store_data.called, "store_data was not called"
 
-    # Check if the processed data contains required indicators and is in expected format
-    assert '1m' in processed_data, "Processed data missing '1m' timeframe"
-    assert 'price' in processed_data['1m'], "Processed data missing 'price' indicator in '1m' timeframe"
-    assert 'volume' in processed_data['1m'], "Processed data missing 'volume' indicator in '1m' timeframe"
-    
-    # Print the processed data for debugging and analysis
-    print("Processed Data Sample for GMN Calculations:")
-    print(processed_data)
+    # Get the unified_feed argument
+    unified_feed = mock_gmn.store_data.call_args[0][0]
 
-    # Validate structure of processed data for GMN calculations
-    assert isinstance(processed_data['1m']['price'], list), "Price data is not in the correct format (list)"
-    assert isinstance(processed_data['1m']['volume'], list), "Volume data is not in the correct format (list)"
-    assert len(processed_data['1m']['price']) > 0, "Price data list is empty"
-    assert len(processed_data['1m']['volume']) > 0, "Volume data list is empty"
+    # Validate the unified_feed structure
+    assert '1m' in unified_feed
+    assert '5m' in unified_feed
 
-    # You can add further checks to ensure that all other indicators are processed properly
+    for timeframe in ['1m', '5m']:
+        assert 'price' in unified_feed[timeframe]
+        assert 'volume' in unified_feed[timeframe]
+        assert 'open' in unified_feed[timeframe]
+        assert 'high' in unified_feed[timeframe]
+        assert 'low' in unified_feed[timeframe]
+        assert 'close_time' in unified_feed[timeframe]
+        assert 'open_time' in unified_feed[timeframe]
+        assert 'quantity' in unified_feed[timeframe]
+        assert 'indicators' in unified_feed[timeframe]
+        assert 'rsi' in unified_feed[timeframe]['indicators']
+        assert 'macd' in unified_feed[timeframe]['indicators']
+        assert 'fibonacci' in unified_feed[timeframe]['indicators']
 
-if __name__ == "__main__":
-    pytest.main(["-v", "tests/test_processed_data.py"])
+    # Further checks can be done on the contents of 'price', 'volume', and indicators
+    assert unified_feed['1m']['price'] == [30000.0]
+    assert unified_feed['1m']['volume'] == [50.0]
+    assert unified_feed['1m']['open'] == [29975.0]
+    assert unified_feed['1m']['high'] == [30050.0]
+    assert unified_feed['1m']['low'] == [29950.0]
+    assert unified_feed['1m']['quantity'] == [100.0]
+    assert isinstance(unified_feed['1m']['indicators']['rsi'], list)
+    assert isinstance(unified_feed['1m']['indicators']['macd'], dict)
+    assert isinstance(unified_feed['1m']['indicators']['fibonacci'], list)
+
+    assert unified_feed['5m']['price'] == [30050.0]
+    assert unified_feed['5m']['volume'] == [75.0]
+    assert unified_feed['5m']['open'] == [30025.0]
+    assert unified_feed['5m']['high'] == [30100.0]
+    assert unified_feed['5m']['low'] == [30000.0]
+    assert unified_feed['5m']['quantity'] == [150.0]
+    assert isinstance(unified_feed['5m']['indicators']['rsi'], list)
+    assert isinstance(unified_feed['5m']['indicators']['macd'], dict)
+    assert isinstance(unified_feed['5m']['indicators']['fibonacci'], list)
