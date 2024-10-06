@@ -1,8 +1,7 @@
 import pandas as pd
-import pandas_ta as ta
+from finta import TA
 from error_handler import ErrorHandler
 from typing import Dict, Any, List
-
 
 class IndicatorCalculator:
     def __init__(self, error_handler: ErrorHandler):
@@ -29,10 +28,9 @@ class IndicatorCalculator:
         for timeframe, df in data.items():
             try:
                 indicators[timeframe] = {}
-                indicators[timeframe]['rsi'] = self.calculate_rsi(df['close'])  # Use 'close' column
-                indicators[timeframe]['macd'] = self.calculate_macd(df['close'])  # Use 'close' column
-                indicators[timeframe]['fibonacci'] = self.calculate_fibonacci(df['close'])  # Use 'close' column
-                # ... add other indicators as needed
+                indicators[timeframe]['rsi'] = self.calculate_rsi(df)
+                indicators[timeframe]['macd'] = self.calculate_macd(df)
+                indicators[timeframe]['fibonacci'] = self.calculate_fibonacci(df)
             except Exception as e:
                 self.error_handler.handle_error(
                     f"Error calculating indicators for {symbol} {timeframe}: {e}",
@@ -40,71 +38,59 @@ class IndicatorCalculator:
                 )
         return indicators
 
-    def calculate_rsi(self, price_series: pd.Series) -> List[float]:
+    def calculate_rsi(self, df: pd.DataFrame) -> List[float]:
         """
         Calculates the RSI (Relative Strength Index).
 
         Args:
-            price_series (pd.Series): Series of closing prices.
+            df (pd.DataFrame): DataFrame containing OHLC data.
 
         Returns:
             List[float]: RSI values.
         """
         try:
-            rsi_values = ta.rsi(price_series, length=14)
-            return rsi_values.fillna(0).tolist()
+            rsi_values = TA.RSI(df).fillna(0).tolist()
+            return rsi_values
         except Exception as e:
             self.error_handler.handle_error(f"Error calculating RSI: {e}", exc_info=True)
             return []
 
-    def calculate_macd(self, price_series: pd.Series) -> Dict[str, List[float]]:
+    def calculate_macd(self, df: pd.DataFrame) -> Dict[str, List[float]]:
         """
         Calculates the MACD (Moving Average Convergence Divergence).
 
         Args:
-            price_series (pd.Series): Series of closing prices.
+            df (pd.DataFrame): DataFrame containing OHLC data.
 
         Returns:
             Dict[str, List[float]]: MACD values, signal line, and histogram.
         """
         try:
-            macd = ta.macd(price_series, fast=12, slow=26, signal=9)
+            macd_values = TA.MACD(df).fillna(0)
             return {
-                'macd': macd['MACD_12_26_9'].fillna(0).tolist(),
-                'macd_signal': macd['MACDs_12_26_9'].fillna(0).tolist(),
-                'macd_hist': macd['MACDh_12_26_9'].fillna(0).tolist()
+                'macd': macd_values['MACD'].tolist(),
+                'macd_signal': macd_values['SIGNAL'].tolist(),
+                'macd_hist': macd_values['HISTOGRAM'].tolist()
             }
-        except KeyError as e:
-            self.error_handler.handle_error(f"Error calculating MACD: Missing key - {e}", exc_info=True)
-            return {'macd': [], 'macd_signal': [], 'macd_hist': []}
         except Exception as e:
             self.error_handler.handle_error(f"Error calculating MACD: {e}", exc_info=True)
             return {'macd': [], 'macd_signal': [], 'macd_hist': []}
 
-    def calculate_fibonacci(self, price_series: pd.Series) -> List[float]:
+    def calculate_fibonacci(self, df: pd.DataFrame) -> List[float]:
         """
-        Calculates Fibonacci Retracement levels.
+        Calculates Fibonacci Retracement levels manually.
 
         Args:
-            price_series (pd.Series): Series of closing prices.
+            df (pd.DataFrame): DataFrame containing OHLC data.
 
         Returns:
-            List[float]: Fibonacci Retracement values.
+            List[float]: Fibonacci retracement levels.
         """
         try:
-            fib_values = []
-            for i in range(len(price_series)):
-                if i < 14:
-                    fib_values.append(float('nan'))
-                else:
-                    recent_prices = price_series.iloc[i - 14:i]
-                    high = recent_prices.max()
-                    low = recent_prices.min()
-                    close = recent_prices.iloc[-1]
-                    diff = high - low
-                    fib = (close - low) / diff if diff != 0 else float('nan')
-                    fib_values.append(fib)
-            return fib_values
+            high = df['high'].max()
+            low = df['low'].min()
+            fib_levels = [high - ((high - low) * ratio) for ratio in [0.236, 0.382, 0.5, 0.618, 0.786]]
+            return fib_levels
         except Exception as e:
             self.error_handler.handle_error(f"Error calculating Fibonacci Retracement: {e}", exc_info=True)
             return []
