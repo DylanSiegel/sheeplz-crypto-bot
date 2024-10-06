@@ -1,10 +1,10 @@
+# File: main.py
 import asyncio
 from data.mexc_websocket_connector import MexcWebsocketConnector
 from data.data_processor import DataProcessor
 from data.indicator_calculations import IndicatorCalculator
 from data.storage.data_storage import DataStorage
-from data.storage.data_storage_postgresql import DataStoragePostgreSQL  # If using PostgreSQL
-from error_handler import ErrorHandler
+from error_handler import ErrorHandler  
 from dotenv import load_dotenv
 import os
 

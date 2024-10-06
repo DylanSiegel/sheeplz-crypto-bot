@@ -1,3 +1,4 @@
+# File: data/storage/data_storage.py
 import asyncio
 import pandas as pd
 import os
@@ -5,7 +6,7 @@ from typing import Dict, Any, List
 from dotenv import load_dotenv
 from error_handler import ErrorHandler
 
-load_dotenv(os.path.join(os.path.dirname(__file__), '../../config/.env'))
+load_dotenv(os.path.join(os.path.dirname(__file__), '../../configs/.env'))
 
 class DataStorage:
     """

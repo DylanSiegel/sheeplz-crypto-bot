@@ -83,6 +83,10 @@ class DataProcessor:
             await self.storage.store_data(unified_feed)
             # Optionally, send to GMN
             await self.send_to_gmn(unified_feed)
+            # Live Test Output: Print the unified_feed
+            print("\n--- Unified Feed ---")
+            print(unified_feed)
+            print("---------------------\n")
         except Exception as e:
             self.error_handler.handle_error(f"Error processing data: {e}", exc_info=True, symbol=None, timeframe=None)
 
