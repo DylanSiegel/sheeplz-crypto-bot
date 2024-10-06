@@ -1,9 +1,9 @@
-# data/processing/data_processor.py
 import logging
 from typing import Dict, Any, List
 
+
 class DataProcessor:
-    """Processes incoming data and updates the GMN."""
+    """Processes incoming data and updates the Graph Management Node (GMN)."""
 
     def __init__(self, gmn):
         self.gmn = gmn
@@ -15,7 +15,7 @@ class DataProcessor:
                 if 'data' in data and 'channel' in data:
                     channel = data['channel']
                     if channel.startswith('push.kline'):
-                        await self._process_kline_data(data)  # Handle kline data (potentially in batches)
+                        await self._process_kline_data(data)
                     elif channel.startswith("push.private."):
                         await self._process_private_data(data)
                 elif 'method' in data:
@@ -24,27 +24,27 @@ class DataProcessor:
                 logging.exception(f"Error processing data: {e}")
 
     async def _process_kline_data(self, data: Dict[str, Any]):
-        """Processes kline (candlestick) data, handling potential batches."""
+        """Processes kline (candlestick) data."""
         channel_parts = data['channel'].split('.')
         if len(channel_parts) >= 4:
             interval = channel_parts[3]
-            kline_data = data['data'] 
+            kline_data = data['data']
 
-            if kline_data is None:
-                logging.warning("Kline data is None. Skipping.")
+            if not kline_data:
+                logging.warning("Kline data is None or empty. Skipping.")
                 return
 
             if isinstance(kline_data, list):  # Batch of klines
                 for kline in kline_data:
-                    kline['interval'] = interval  # Add interval to each kline in the batch
-                await self.gmn.update_graph(kline_data)  # Pass the entire batch to GMN
-
+                    kline['interval'] = interval
+                await self.gmn.update_graph(kline_data)
             elif isinstance(kline_data, dict):  # Single kline
                 kline_data['interval'] = interval
-                await self.gmn.update_graph([kline_data])  # Pass as a list of one element 
+                await self.gmn.update_graph([kline_data])
             else:
-                logging.error(f"Unexpected kline data type: {type(kline_data)}. Data: {kline_data}")
-
+                logging.error(
+                    f"Unexpected kline data type: {type(kline_data)}. Data: {kline_data}"
+                )
         else:
             logging.warning(f"Unexpected channel format: {data['channel']}")
 
@@ -55,21 +55,19 @@ class DataProcessor:
             logging.info(f"Account Update: {data['data']}")
         elif channel == 'push.order':
             logging.info(f"Order Update: {data['data']}")
-        # Add more handlers for other private channels as needed
-        else:  # More specific logging for unhandled channels
-            logging.warning(f"Received data from unhandled private channel: {channel}. Data: {data.get('data')}")  # Include data if present
-
+        else:
+            logging.warning(
+                f"Unhandled private channel: {channel}. Data: {data.get('data')}"
+            )
 
     def _process_method_data(self, data: Dict[str, Any]):
         """Processes method-based data."""
-        method = data.get('method')  # Use get method to avoid potential KeyError
+        method = data.get('method')
         if method == 'pong':
             logging.debug("Received pong from server.")
-        # Add handlers for other methods like 'subscribe.kline', 'unsub.kline' etc.
-        elif method and method.startswith('sub'): #Handle subscriptions:
+        elif method and method.startswith('sub'):
             logging.info(f"Subscribed to channel: {method}")
-        elif method and method.startswith('unsub'): #Handle unsubscriptions
+        elif method and method.startswith('unsub'):
             logging.info(f"Unsubscribed from channel: {method}")
-
-        else:  # Log unhandled methods for debugging
+        else:
             logging.debug(f"Unhandled method message: {method}")

@@ -1,12 +1,9 @@
-# data/config.py
 from typing import List, Dict, Any, Union, Optional
-from pydantic import BaseModel, validator, PositiveInt, Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import BaseSettings, validator, PositiveInt, Field
+
 
 class Config(BaseSettings):
-    """Configuration for DataIngestion and indicators."""
-
-    model_config = SettingsConfigDict(env_file='.env', env_file_encoding='utf-8')
+    """Configuration settings for data ingestion and processing."""
 
     symbol: str = "BTC_USDT"
     timeframes: List[str] = ["1m", "5m"]
@@ -20,6 +17,10 @@ class Config(BaseSettings):
     max_reconnect_attempts: int = 10
     max_retry_attempts: int = 3
 
+    class Config:
+        env_file = '.env'
+        env_file_encoding = 'utf-8'
+
     @validator('timeframes', pre=True)
     def validate_timeframes(cls, v):
         if isinstance(v, str):
@@ -27,9 +28,11 @@ class Config(BaseSettings):
         elif isinstance(v, list):
             return v
         else:
-            raise ValueError("timeframes must be a comma-separated string or a list")
+            raise ValueError("Timeframes must be a comma-separated string or a list.")
 
-    def get_indicator_param(self, indicator_name: str, param_name: str, default_value: Optional[Any] = None) -> Any:
+    def get_indicator_param(
+        self, indicator_name: str, param_name: str, default_value: Optional[Any] = None
+    ) -> Any:
         return self.indicators.get(f"{indicator_name}_{param_name}", default_value)
 
     def get_rsi_timeperiod(self) -> int:
