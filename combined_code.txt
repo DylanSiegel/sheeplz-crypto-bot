@@ -178,18 +178,11 @@ class ErrorHandler:
 # File: main.py
 import asyncio
 import logging
+import os
+from dotenv import load_dotenv
 from data.mexc_websocket_connector import MexcWebsocketConnector
 from data.data_processor import DataProcessor
 from error_handler import ErrorHandler
-from dotenv import load_dotenv
-import os
-from agent import PPOAgent
-from environment import TradingEnvironment
-import torch
-
-# Constants
-INPUT_SIZE = 10  # Should match INPUT_SIZE in data_processor.py
-ACTION_SIZE = 1  # Scalar action
 
 def load_configuration():
     load_dotenv(os.path.join(os.path.dirname(__file__), 'configs/.env'))
@@ -198,36 +191,15 @@ def load_configuration():
     return symbols, timeframes
 
 def validate_configuration(symbols, timeframes):
-    if not symbols:
+    if not symbols or symbols == ['']:
         raise ValueError("SYMBOLS must be defined in the .env file.")
-    if not timeframes:
+    if not timeframes or timeframes == ['']:
         raise ValueError("TIMEFRAMES must be defined in the .env file.")
-
-async def train_agent(agent, env, num_episodes=1000):
-    for episode in range(num_episodes):
-        state = await env.reset()
-        done = False
-        trajectories = {'states': [], 'actions': [], 'rewards': [], 'log_probs': [], 'values': []}
-        while not done:
-            action, log_prob = agent.select_action(state)
-            next_state, reward, done, info = await env.step(action)
-            _, _, value = agent.model(torch.FloatTensor(state).to(agent.device))
-            trajectories['states'].append(state)
-            trajectories['actions'].append(action)
-            trajectories['log_probs'].append(log_prob)
-            trajectories['values'].append(value.item())
-            trajectories['rewards'].append(reward)
-            state = next_state
-        # Compute returns and update agent
-        next_value = 0 if done else agent.model(torch.FloatTensor(state).to(agent.device))[-1].item()
-        returns = agent.compute_returns(trajectories['rewards'], [1]*len(trajectories['rewards']), trajectories['values'], next_value)
-        trajectories['returns'] = returns
-        agent.update(trajectories)
 
 async def main():
     # Configure logging
     logging.basicConfig(
-        level=logging.INFO,  # Change to DEBUG for more verbosity
+        level=logging.INFO,  # Change to logging.DEBUG for more verbosity
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[
             logging.FileHandler("app.log"),
@@ -246,33 +218,21 @@ async def main():
 
     # Initialize components
     data_queue = asyncio.Queue()
-    lnn_output_queue = asyncio.Queue()
     error_handler = ErrorHandler()
 
-    processor = DataProcessor(data_queue, lnn_output_queue, error_handler, symbols, timeframes)
+    processor = DataProcessor(data_queue, error_handler, symbols, timeframes)
     connector = MexcWebsocketConnector(data_queue, symbols, timeframes, error_handler)
-
-    # Initialize agent and environment
-    state_size = 3  # lnn_output, position, equity
-    action_size = ACTION_SIZE
-    agent = PPOAgent(state_size, action_size)
-    env = TradingEnvironment(lnn_output_queue)
 
     # Create tasks
     connector_task = asyncio.create_task(connector.connect())
-    processor_task = asyncio.create_task(processor.run())
-    training_task = asyncio.create_task(train_agent(agent, env))
+    processor_task = asyncio.create_task(processor.run_lnn())  # Run the LNN processing loop
 
-    tasks = [connector_task, processor_task, training_task]
+    tasks = [connector_task, processor_task]
 
     try:
         await asyncio.gather(*tasks)
     except KeyboardInterrupt:
         logger.info("Pipeline terminated by user.")
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        logger.info("Data pipeline terminated gracefully.")
     except Exception as e:
         error_handler.handle_error(f"Unexpected error in main: {e}", exc_info=True)
     finally:
@@ -297,11 +257,11 @@ import numpy as np
 from sklearn.preprocessing import StandardScaler
 
 # Constants for LNN
-INPUT_SIZE = 10  # Adjust based on actual feature size
-HIDDEN_SIZE = 128
-OUTPUT_SIZE = 1  # Single output for the indicator
+INPUT_SIZE = 30  # Adjust based on your selected features
+HIDDEN_SIZE = 256  # Should match the hidden_size in the model
+OUTPUT_SIZE = 1
 
-# Precomputed scaling parameters (placeholder values)
+# Precomputed scaling parameters (replace with actual means and stds)
 feature_means = np.array([0.0] * INPUT_SIZE)
 feature_stds = np.array([1.0] * INPUT_SIZE)
 
@@ -309,31 +269,36 @@ class DataProcessor:
     def __init__(
         self,
         data_queue: asyncio.Queue,
-        lnn_output_queue: asyncio.Queue,
         error_handler: ErrorHandler,
         symbols: List[str],
         timeframes: List[str]
     ):
         self.data_queue = data_queue
-        self.lnn_output_queue = lnn_output_queue
         self.error_handler = error_handler
         self.symbols = symbols
         self.timeframes = timeframes
         self.logger = logging.getLogger("DataProcessor")
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.lnn = LiquidNeuralNetwork(input_size=INPUT_SIZE, hidden_size=HIDDEN_SIZE, output_size=OUTPUT_SIZE).to(self.device)
-        self.batch_size = 16
-        self.input_buffer = []
+        self.lnn = LiquidNeuralNetwork(
+            input_size=INPUT_SIZE,
+            hidden_size=HIDDEN_SIZE,
+            output_size=OUTPUT_SIZE
+        ).to(self.device)
         self.scaler = StandardScaler()
         # Initialize scaler with precomputed parameters
         self.scaler.mean_ = feature_means
         self.scaler.scale_ = feature_stds
         self.scaler.n_features_in_ = INPUT_SIZE
 
+        # Batch processing parameters
+        self.batch_size = 64  # Adjust based on your GPU capacity
+        self.input_buffer = []
+
     def preprocess_data(self, data: Dict[str, Any]) -> torch.Tensor:
+        """Preprocess data based on message type and extract features."""
         channel = data.get('c')
         if not channel:
-            self.logger.warning(f"Received data without channel information: {data}")
+            self.logger.warning(f"Data missing channel: {data}")
             return None
 
         try:
@@ -341,19 +306,24 @@ class DataProcessor:
                 return self._preprocess_kline_data(data)
             elif channel.startswith("spot@public.deals.v3.api"):
                 return self._preprocess_deals_data(data)
-            elif channel.startswith("spot@public.increase.depth.v3.api"):
-                return self._preprocess_depth_data(data)
             elif channel.startswith("spot@public.bookTicker.v3.api"):
                 return self._preprocess_bookTicker_data(data)
+            elif channel.startswith("spot@public.increase.depth.v3.api"):
+                return self._preprocess_depth_data(data)
             else:
                 self.logger.warning(f"Unknown channel: {channel}")
                 return None
 
         except Exception as e:
-            self.error_handler.handle_error(f"Error preprocessing data: {e}", exc_info=True, channel=channel)
+            self.error_handler.handle_error(
+                f"Preprocessing Error: {e}",
+                exc_info=True,
+                channel=channel
+            )
             return None
 
     def _preprocess_kline_data(self, data: Dict[str, Any]) -> torch.Tensor:
+        """Preprocess kline data."""
         kline_data = data.get('d', {}).get('k')
         if kline_data:
             try:
@@ -370,46 +340,77 @@ class DataProcessor:
                 ]
                 features = features[:INPUT_SIZE] + [0] * (INPUT_SIZE - len(features))
                 features = np.array(features)
-                features = (features - self.scaler.mean_) / (self.scaler.scale_ + 1e-8)
-                return torch.tensor(features, dtype=torch.float32, device=self.device)
+                features_scaled = (features - self.scaler.mean_) / (self.scaler.scale_ + 1e-8)
+                return torch.tensor(features_scaled, dtype=torch.float32)
 
             except (KeyError, TypeError) as e:
-                self.error_handler.handle_error(f"Error extracting kline features: {e}", exc_info=True, data=data)
-                return None
+                self.error_handler.handle_error(
+                    f"Kline Feature Error: {e}",
+                    exc_info=True,
+                    data=data
+                )
         return None
 
     def _preprocess_deals_data(self, data: Dict[str, Any]) -> torch.Tensor:
+        """Preprocess deals data."""
         deals_data = data.get('d', {}).get('deals')
         if deals_data and isinstance(deals_data, list):
             try:
                 first_deal = deals_data[0]
                 trade_side = int(first_deal['S'])
-                # According to documentation, 'S' = 1 for BUY, 'S' = 2 for SELL
                 is_buy = 1 if trade_side == 1 else 0
                 features = [
                     float(first_deal['p']),   # Price
-                    float(first_deal['v']),   # Quantity/Volume
-                    int(first_deal['t']),     # Deal Time
-                    is_buy,                   # Trade Side: 1 for BUY, 0 for SELL
+                    float(first_deal['v']),   # Quantity
+                    int(first_deal['t']),     # Trade time
+                    is_buy,                   # Trade side
                     # Add more features as needed...
                 ]
                 features = features[:INPUT_SIZE] + [0] * (INPUT_SIZE - len(features))
                 features = np.array(features)
-                features = (features - self.scaler.mean_) / (self.scaler.scale_ + 1e-8)
-                return torch.tensor(features, dtype=torch.float32, device=self.device)
+                features_scaled = (features - self.scaler.mean_) / (self.scaler.scale_ + 1e-8)
+                return torch.tensor(features_scaled, dtype=torch.float32)
 
             except (KeyError, TypeError, IndexError) as e:
-                self.error_handler.handle_error(f"Error extracting deals features: {e}", exc_info=True, data=data)
-                return None
+                self.error_handler.handle_error(
+                    f"Deals Feature Error: {e}",
+                    exc_info=True,
+                    data=data
+                )
+        return None
+
+    def _preprocess_bookTicker_data(self, data: Dict[str, Any]) -> torch.Tensor:
+        """Preprocess book ticker data."""
+        book_ticker_data = data.get('d')
+        if book_ticker_data:
+            try:
+                features = [
+                    float(book_ticker_data['a']),  # Best ask price
+                    float(book_ticker_data['A']),  # Best ask quantity
+                    float(book_ticker_data['b']),  # Best bid price
+                    float(book_ticker_data['B']),  # Best bid quantity
+                    # Add more features as needed...
+                ]
+                features = features[:INPUT_SIZE] + [0] * (INPUT_SIZE - len(features))
+                features = np.array(features)
+                features_scaled = (features - self.scaler.mean_) / (self.scaler.scale_ + 1e-8)
+                return torch.tensor(features_scaled, dtype=torch.float32)
+
+            except (KeyError, TypeError) as e:
+                self.error_handler.handle_error(
+                    f"BookTicker Feature Error: {e}",
+                    exc_info=True,
+                    data=data
+                )
         return None
 
     def _preprocess_depth_data(self, data: Dict[str, Any]) -> torch.Tensor:
+        """Preprocess depth data."""
         depth_data = data.get('d')
         if depth_data:
             try:
                 asks = depth_data.get('asks', [])
                 bids = depth_data.get('bids', [])
-
                 num_levels = min(5, len(asks), len(bids))
                 features = []
                 for i in range(num_levels):
@@ -417,83 +418,46 @@ class DataProcessor:
                         float(asks[i]['p']), float(asks[i]['v']),
                         float(bids[i]['p']), float(bids[i]['v'])
                     ])
-
                 features = features[:INPUT_SIZE] + [0] * (INPUT_SIZE - len(features))
                 features = np.array(features)
-                features = (features - self.scaler.mean_) / (self.scaler.scale_ + 1e-8)
-                return torch.tensor(features, dtype=torch.float32, device=self.device)
+                features_scaled = (features - self.scaler.mean_) / (self.scaler.scale_ + 1e-8)
+                return torch.tensor(features_scaled, dtype=torch.float32)
 
             except (KeyError, TypeError, IndexError) as e:
-                self.error_handler.handle_error(f"Error extracting depth features: {e}", exc_info=True, data=data)
-                return None
+                self.error_handler.handle_error(
+                    f"Depth Feature Error: {e}",
+                    exc_info=True,
+                    data=data
+                )
         return None
 
-    def _preprocess_bookTicker_data(self, data: Dict[str, Any]) -> torch.Tensor:
-        bookTicker_data = data.get('d')
-        if bookTicker_data:
-            try:
-                features = [
-                    float(bookTicker_data['a']),  # Best ask price
-                    float(bookTicker_data['A']),  # Best ask quantity
-                    float(bookTicker_data['b']),  # Best bid price
-                    float(bookTicker_data['B']),  # Best bid quantity
-                    # Add more features as needed...
-                ]
-                features = features[:INPUT_SIZE] + [0] * (INPUT_SIZE - len(features))
-                features = np.array(features)
-                features = (features - self.scaler.mean_) / (self.scaler.scale_ + 1e-8)
-                return torch.tensor(features, dtype=torch.float32, device=self.device)
-
-            except (KeyError, TypeError) as e:
-                self.error_handler.handle_error(f"Error extracting bookTicker features: {e}", exc_info=True, data=data)
-                return None
-        return None
-
-    async def process_data(self, data: Dict[str, Any]):
-        try:
-            input_tensor = self.preprocess_data(data)
-            if input_tensor is None:
-                return
-
-            self.input_buffer.append(input_tensor)
-
-            if len(self.input_buffer) >= self.batch_size:
-                batch_tensor = torch.stack(self.input_buffer).to(self.device)
-                with torch.no_grad():
-                    intelligence_outputs = self.lnn(batch_tensor)
-                for intelligence_output in intelligence_outputs:
-                    await self.handle_lnn_output(intelligence_output)
-                self.input_buffer = []
-
-        except Exception as e:
-            self.error_handler.handle_error(
-                f"Error processing data through LNN: {e}",
-                exc_info=True
-            )
-
-    async def handle_lnn_output(self, intelligence_output: torch.Tensor):
-        try:
-            indicator_value = intelligence_output.item()
-            await self.lnn_output_queue.put(indicator_value)
-            self.logger.debug(f"LNN indicator enqueued for agents: {indicator_value}")
-        except Exception as e:
-            self.error_handler.handle_error(
-                f"Error handling LNN output: {e}",
-                exc_info=True
-            )
-
-    async def run(self):
+    async def run_lnn(self):
+        """Continuously process data through the LNN."""
         while True:
             try:
                 data = await self.data_queue.get()
-                await self.process_data(data)
+
+                input_tensor = self.preprocess_data(data)
+                if input_tensor is not None:
+                    self.input_buffer.append(input_tensor)
+
+                if len(self.input_buffer) >= self.batch_size:
+                    batch_tensor = torch.stack(self.input_buffer).to(self.device)
+                    with torch.no_grad():
+                        indicator_outputs = self.lnn(batch_tensor)
+                        for indicator_output in indicator_outputs:
+                            indicator_value = indicator_output.item()
+                            self.logger.info(f"New Indicator: {indicator_value}")
+                    self.input_buffer = []
+
                 self.data_queue.task_done()
+
             except asyncio.CancelledError:
-                self.logger.info("DataProcessor task cancelled.")
+                self.logger.info("Data Processor task canceled.")
                 break
             except Exception as e:
                 self.error_handler.handle_error(
-                    f"Error in DataProcessor run loop: {e}",
+                    f"LNN Processing Error: {e}",
                     exc_info=True
                 )
 
@@ -629,39 +593,50 @@ __all__ = ['MexcWebsocketConnector', 'DataProcessor']
 # File: models/lnn_model.py
 import torch
 import torch.nn as nn
-from torchdiffeq import odeint
+from torchdiffeq import odeint_adjoint as odeint  # Using adjoint method for memory efficiency
 
 class ODEFunc(nn.Module):
     def __init__(self, hidden_size):
         super(ODEFunc, self).__init__()
-        self.linear = nn.Linear(hidden_size, hidden_size)
-        self.nonlinearity = nn.LeakyReLU()
+        self.fc1 = nn.Linear(hidden_size, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, hidden_size)
+        self.nonlinearity = nn.ELU()
 
     def forward(self, t, x):
-        return self.nonlinearity(self.linear(x))
+        out = self.nonlinearity(self.fc1(x))
+        out = self.nonlinearity(self.fc2(out))
+        return out
 
 class LiquidNeuralNetwork(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
         super(LiquidNeuralNetwork, self).__init__()
         self.input_layer = nn.Sequential(
             nn.Linear(input_size, hidden_size),
-            nn.ReLU(),
+            nn.ELU(),
             nn.Linear(hidden_size, hidden_size),
-            nn.ReLU()
+            nn.ELU()
         )
         self.ode_func = ODEFunc(hidden_size)
-        self.output_layer = nn.Linear(hidden_size, output_size)
+        self.output_layer = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.ELU(),
+            nn.Linear(hidden_size, output_size),
+            nn.Tanh()  # Output between -1 and 1
+        )
+        # Residual connection
+        self.res_connection = nn.Linear(input_size, hidden_size)
 
     def forward(self, x):
         t = torch.tensor([0.0, 1.0], dtype=torch.float32).to(x.device)
+        residual = self.res_connection(x)
         x = self.input_layer(x)
-        # Adjusted solver options to prevent underflow error
+        x = x + residual  # Adding residual connection
         ode_sol = odeint(
             self.ode_func,
             x,
             t,
-            method='rk4',  # Using a fixed-step solver
-            options={'step_size': 0.1}  # Specify a suitable step size
+            method='rk4',
+            options={'step_size': 0.1}
         )
         x = ode_sol[-1]
         x = self.output_layer(x)

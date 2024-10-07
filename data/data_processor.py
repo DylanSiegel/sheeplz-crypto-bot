@@ -5,206 +5,243 @@ from error_handler import ErrorHandler
 import logging
 from models.lnn_model import LiquidNeuralNetwork
 import torch
+import torch.nn as nn
+import torch.optim as optim
 import numpy as np
-from sklearn.preprocessing import StandardScaler
 
 # Constants for LNN
-INPUT_SIZE = 10  # Adjust based on actual feature size
-HIDDEN_SIZE = 128
-OUTPUT_SIZE = 1  # Single output for the indicator
-
-# Precomputed scaling parameters (placeholder values)
-feature_means = np.array([0.0] * INPUT_SIZE)
-feature_stds = np.array([1.0] * INPUT_SIZE)
+INPUT_SIZE = 100  # Adjust based on your selected features
+HIDDEN_SIZE = 256  # Should match the hidden_size in the model
+OUTPUT_SIZE = 1
 
 class DataProcessor:
     def __init__(
         self,
         data_queue: asyncio.Queue,
-        lnn_output_queue: asyncio.Queue,
         error_handler: ErrorHandler,
         symbols: List[str],
         timeframes: List[str]
     ):
         self.data_queue = data_queue
-        self.lnn_output_queue = lnn_output_queue
         self.error_handler = error_handler
         self.symbols = symbols
         self.timeframes = timeframes
         self.logger = logging.getLogger("DataProcessor")
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.lnn = LiquidNeuralNetwork(input_size=INPUT_SIZE, hidden_size=HIDDEN_SIZE, output_size=OUTPUT_SIZE).to(self.device)
-        self.batch_size = 16
+        self.lnn = LiquidNeuralNetwork(
+            input_size=INPUT_SIZE,
+            hidden_size=HIDDEN_SIZE,
+            output_size=OUTPUT_SIZE,
+            num_ode_layers=5
+        ).to(self.device)
+        # Precomputed scaling parameters (replace with actual means and stds)
+        self.feature_means = torch.zeros(INPUT_SIZE).to(self.device)
+        self.feature_stds = torch.ones(INPUT_SIZE).to(self.device)
+
+        # Batch processing parameters
+        self.batch_size = 64  # Adjust based on your GPU capacity
         self.input_buffer = []
-        self.scaler = StandardScaler()
-        # Initialize scaler with precomputed parameters
-        self.scaler.mean_ = feature_means
-        self.scaler.scale_ = feature_stds
-        self.scaler.n_features_in_ = INPUT_SIZE
+        self.target_buffer = []
+
+        # Initialize optimizer and loss function for online training
+        self.optimizer = optim.Adam(self.lnn.parameters(), lr=1e-4)
+        self.loss_function = nn.MSELoss()
 
     def preprocess_data(self, data: Dict[str, Any]) -> torch.Tensor:
-        channel = data.get('c')
-        if not channel:
-            self.logger.warning(f"Received data without channel information: {data}")
+        """Preprocess data and perform feature engineering."""
+        raw_features = self.extract_raw_features(data)
+        if raw_features is None:
             return None
 
+        # Perform complex feature engineering
         try:
-            if channel.startswith("spot@public.kline.v3.api"):
-                return self._preprocess_kline_data(data)
-            elif channel.startswith("spot@public.deals.v3.api"):
-                return self._preprocess_deals_data(data)
-            elif channel.startswith("spot@public.increase.depth.v3.api"):
-                return self._preprocess_depth_data(data)
-            elif channel.startswith("spot@public.bookTicker.v3.api"):
-                return self._preprocess_bookTicker_data(data)
+            features = self._engineer_features(raw_features)
+        except Exception as e:
+            self.error_handler.handle_error(
+                f"Feature Engineering Error: {e}",
+                exc_info=True,
+                data=data
+            )
+            return None
+
+        # Ensure features match INPUT_SIZE
+        if len(features) < INPUT_SIZE:
+            padding = torch.zeros(INPUT_SIZE - len(features)).to(self.device)
+            features = torch.cat([features, padding])
+        elif len(features) > INPUT_SIZE:
+            features = features[:INPUT_SIZE]
+
+        # Scale features
+        features_scaled = (features - self.feature_means) / (self.feature_stds + 1e-8)
+        return features_scaled
+
+    def extract_raw_features(self, data: Dict[str, Any]) -> torch.Tensor:
+        """Extract raw features from data."""
+        try:
+            kline_data = data.get('d', {}).get('k')
+            if kline_data:
+                features = [
+                    float(kline_data['o']),  # Open price
+                    float(kline_data['c']),  # Close price
+                    float(kline_data['h']),  # High price
+                    float(kline_data['l']),  # Low price
+                    float(kline_data['v']),  # Volume
+                    # Add more raw features as needed
+                ]
+                return torch.tensor(features, dtype=torch.float32).to(self.device)
             else:
-                self.logger.warning(f"Unknown channel: {channel}")
                 return None
-
         except Exception as e:
-            self.error_handler.handle_error(f"Error preprocessing data: {e}", exc_info=True, channel=channel)
+            self.error_handler.handle_error(
+                f"Feature Extraction Error: {e}",
+                exc_info=True,
+                data=data
+            )
             return None
 
-    def _preprocess_kline_data(self, data: Dict[str, Any]) -> torch.Tensor:
-        kline_data = data.get('d', {}).get('k')
-        if kline_data:
-            try:
-                features = [
-                    float(kline_data['o']),  # Opening price
-                    float(kline_data['c']),  # Closing price
-                    float(kline_data['h']),  # Highest price
-                    float(kline_data['l']),  # Lowest price
-                    float(kline_data['v']),  # Quantity
-                    float(kline_data['a']),  # Volume
-                    int(kline_data['t']),    # Start time
-                    int(kline_data['T']),    # End time
-                    # Add more features as needed...
-                ]
-                features = features[:INPUT_SIZE] + [0] * (INPUT_SIZE - len(features))
-                features = np.array(features)
-                features = (features - self.scaler.mean_) / (self.scaler.scale_ + 1e-8)
-                return torch.tensor(features, dtype=torch.float32, device=self.device)
+    def _engineer_features(self, raw_features: torch.Tensor) -> torch.Tensor:
+        """Perform complex feature engineering."""
+        # Ensure raw_features is a 1D tensor on the correct device
+        raw_features = raw_features.to(self.device)
+        if raw_features.dim() == 0:
+            raw_features = raw_features.unsqueeze(0)
+        elif raw_features.dim() > 1:
+            raw_features = raw_features.view(-1)
 
-            except (KeyError, TypeError) as e:
-                self.error_handler.handle_error(f"Error extracting kline features: {e}", exc_info=True, data=data)
-                return None
-        return None
+        features = [raw_features]
 
-    def _preprocess_deals_data(self, data: Dict[str, Any]) -> torch.Tensor:
-        deals_data = data.get('d', {}).get('deals')
-        if deals_data and isinstance(deals_data, list):
-            try:
-                first_deal = deals_data[0]
-                trade_side = int(first_deal['S'])
-                # According to documentation, 'S' = 1 for BUY, 'S' = 2 for SELL
-                is_buy = 1 if trade_side == 1 else 0
-                features = [
-                    float(first_deal['p']),   # Price
-                    float(first_deal['v']),   # Quantity/Volume
-                    int(first_deal['t']),     # Deal Time
-                    is_buy,                   # Trade Side: 1 for BUY, 0 for SELL
-                    # Add more features as needed...
-                ]
-                features = features[:INPUT_SIZE] + [0] * (INPUT_SIZE - len(features))
-                features = np.array(features)
-                features = (features - self.scaler.mean_) / (self.scaler.scale_ + 1e-8)
-                return torch.tensor(features, dtype=torch.float32, device=self.device)
+        # Rolling statistics
+        if raw_features.numel() >= 5:
+            rolling_mean = torch.mean(raw_features[-5:])
+            rolling_std = torch.std(raw_features[-5:])
+        else:
+            rolling_mean = torch.mean(raw_features)
+            rolling_std = torch.std(raw_features)
 
-            except (KeyError, TypeError, IndexError) as e:
-                self.error_handler.handle_error(f"Error extracting deals features: {e}", exc_info=True, data=data)
-                return None
-        return None
+        rolling_mean = rolling_mean.unsqueeze(0)
+        rolling_std = rolling_std.unsqueeze(0)
+        features.extend([rolling_mean, rolling_std])
 
-    def _preprocess_depth_data(self, data: Dict[str, Any]) -> torch.Tensor:
-        depth_data = data.get('d')
-        if depth_data:
-            try:
-                asks = depth_data.get('asks', [])
-                bids = depth_data.get('bids', [])
+        # Technical indicators
+        rsi = self._calculate_rsi(raw_features)
+        macd = self._calculate_macd(raw_features)
+        features.extend([rsi, macd])
 
-                num_levels = min(5, len(asks), len(bids))
-                features = []
-                for i in range(num_levels):
-                    features.extend([
-                        float(asks[i]['p']), float(asks[i]['v']),
-                        float(bids[i]['p']), float(bids[i]['v'])
-                    ])
+        # Combine all features
+        features = torch.cat(features)
+        return features
 
-                features = features[:INPUT_SIZE] + [0] * (INPUT_SIZE - len(features))
-                features = np.array(features)
-                features = (features - self.scaler.mean_) / (self.scaler.scale_ + 1e-8)
-                return torch.tensor(features, dtype=torch.float32, device=self.device)
+    def _calculate_rsi(self, data: torch.Tensor, period: int = 14) -> torch.Tensor:
+        """Calculate the Relative Strength Index (RSI)."""
+        if data.numel() < period + 1:
+            return torch.tensor([50.0], device=self.device)  # Default value when insufficient data
 
-            except (KeyError, TypeError, IndexError) as e:
-                self.error_handler.handle_error(f"Error extracting depth features: {e}", exc_info=True, data=data)
-                return None
-        return None
+        # Compute price differences
+        delta = data[1:] - data[:-1]
+        delta = delta.to(self.device)
 
-    def _preprocess_bookTicker_data(self, data: Dict[str, Any]) -> torch.Tensor:
-        bookTicker_data = data.get('d')
-        if bookTicker_data:
-            try:
-                features = [
-                    float(bookTicker_data['a']),  # Best ask price
-                    float(bookTicker_data['A']),  # Best ask quantity
-                    float(bookTicker_data['b']),  # Best bid price
-                    float(bookTicker_data['B']),  # Best bid quantity
-                    # Add more features as needed...
-                ]
-                features = features[:INPUT_SIZE] + [0] * (INPUT_SIZE - len(features))
-                features = np.array(features)
-                features = (features - self.scaler.mean_) / (self.scaler.scale_ + 1e-8)
-                return torch.tensor(features, dtype=torch.float32, device=self.device)
+        # Separate gains and losses
+        gains = torch.where(delta > 0, delta, torch.tensor(0.0, device=self.device))
+        losses = torch.where(delta < 0, -delta, torch.tensor(0.0, device=self.device))
 
-            except (KeyError, TypeError) as e:
-                self.error_handler.handle_error(f"Error extracting bookTicker features: {e}", exc_info=True, data=data)
-                return None
-        return None
+        # Calculate average gains and losses
+        avg_gain = torch.mean(gains[-period:])
+        avg_loss = torch.mean(losses[-period:])
 
-    async def process_data(self, data: Dict[str, Any]):
+        if avg_loss == 0:
+            rs = torch.tensor(float('inf'), device=self.device)
+        else:
+            rs = avg_gain / avg_loss
+
+        rsi = 100 - (100 / (1 + rs))
+        return rsi.unsqueeze(0)
+
+    def _calculate_macd(self, data: torch.Tensor, fast_period: int = 12, slow_period: int = 26, signal_period: int = 9) -> torch.Tensor:
+        """Calculate the Moving Average Convergence Divergence (MACD)."""
+        if data.numel() < slow_period:
+            return torch.tensor([0.0], device=self.device)  # Default value when insufficient data
+
+        # Calculate exponential moving averages (EMAs)
+        ema_fast = self._calculate_ema(data, fast_period)
+        ema_slow = self._calculate_ema(data, slow_period)
+        macd_line = ema_fast - ema_slow
+
+        if macd_line.numel() < signal_period:
+            return torch.tensor([0.0], device=self.device)
+
+        signal_line = self._calculate_ema(macd_line, signal_period)
+        macd_histogram = macd_line[-1] - signal_line[-1]
+
+        return macd_histogram.unsqueeze(0)
+
+    def _calculate_ema(self, data: torch.Tensor, period: int) -> torch.Tensor:
+        """Calculate Exponential Moving Average (EMA)."""
+        alpha = 2 / (period + 1)
+        ema = [data[0]]
+        for price in data[1:]:
+            ema_value = alpha * price + (1 - alpha) * ema[-1]
+            ema.append(ema_value)
+        return torch.stack(ema).to(self.device)
+
+    def generate_target(self, data: Dict[str, Any]) -> torch.Tensor:
+        """Generate target value for training."""
+        # For demonstration, we'll use the future close price as the target
         try:
-            input_tensor = self.preprocess_data(data)
-            if input_tensor is None:
-                return
-
-            self.input_buffer.append(input_tensor)
-
-            if len(self.input_buffer) >= self.batch_size:
-                batch_tensor = torch.stack(self.input_buffer).to(self.device)
-                with torch.no_grad():
-                    intelligence_outputs = self.lnn(batch_tensor)
-                for intelligence_output in intelligence_outputs:
-                    await self.handle_lnn_output(intelligence_output)
-                self.input_buffer = []
-
+            future_kline_data = data.get('d', {}).get('k')  # Replace with actual future data
+            if future_kline_data:
+                future_close_price = float(future_kline_data['c'])
+                return torch.tensor([future_close_price], dtype=torch.float32).to(self.device)
+            else:
+                return None
         except Exception as e:
             self.error_handler.handle_error(
-                f"Error processing data through LNN: {e}",
-                exc_info=True
+                f"Target Generation Error: {e}",
+                exc_info=True,
+                data=data
             )
+            return None
 
-    async def handle_lnn_output(self, intelligence_output: torch.Tensor):
-        try:
-            indicator_value = intelligence_output.item()
-            await self.lnn_output_queue.put(indicator_value)
-            self.logger.debug(f"LNN indicator enqueued for agents: {indicator_value}")
-        except Exception as e:
-            self.error_handler.handle_error(
-                f"Error handling LNN output: {e}",
-                exc_info=True
-            )
-
-    async def run(self):
+    async def run_lnn(self):
+        """Continuously process data through the LNN and perform online training."""
         while True:
             try:
                 data = await self.data_queue.get()
-                await self.process_data(data)
+                input_tensor = self.preprocess_data(data)
+                target_tensor = self.generate_target(data)
+                if input_tensor is not None and target_tensor is not None:
+                    self.input_buffer.append(input_tensor)
+                    self.target_buffer.append(target_tensor)
+
+                if len(self.input_buffer) >= self.batch_size:
+                    batch_inputs = torch.stack(self.input_buffer).to(self.device)
+                    batch_targets = torch.stack(self.target_buffer).to(self.device).squeeze()
+
+                    # Training mode
+                    self.lnn.train()
+                    self.optimizer.zero_grad()
+                    outputs = self.lnn(batch_inputs).squeeze()
+                    loss = self.loss_function(outputs, batch_targets)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.lnn.parameters(), max_norm=1.0)
+                    self.optimizer.step()
+
+                    # Logging
+                    self.logger.info(f"Training Loss: {loss.item()}")
+                    for output in outputs:
+                        indicator_value = output.item()
+                        self.logger.info(f"New Indicator: {indicator_value}")
+
+                    # Clear buffers
+                    self.input_buffer = []
+                    self.target_buffer = []
+
                 self.data_queue.task_done()
+
             except asyncio.CancelledError:
-                self.logger.info("DataProcessor task cancelled.")
+                self.logger.info("Data Processor task canceled.")
                 break
             except Exception as e:
                 self.error_handler.handle_error(
-                    f"Error in DataProcessor run loop: {e}",
+                    f"LNN Processing Error: {e}",
                     exc_info=True
                 )
