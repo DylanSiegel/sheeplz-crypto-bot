@@ -1,710 +1,677 @@
+// File: agent.py
+# File: agent.py
+import torch
+import torch.nn as nn
+from torch.optim import Adam
+from torch.distributions import Normal
+import numpy as np
+
+class ActorCritic(nn.Module):
+    def __init__(self, state_size, action_size, hidden_size=64):
+        super(ActorCritic, self).__init__()
+        # Common feature extraction
+        self.feature = nn.Sequential(
+            nn.Linear(state_size, hidden_size),
+            nn.ReLU(),
+        )
+        # Actor network
+        self.actor_mean = nn.Linear(hidden_size, action_size)
+        self.actor_log_std = nn.Parameter(torch.zeros(action_size))
+        # Critic network
+        self.critic = nn.Linear(hidden_size, 1)
+
+    def forward(self, state):
+        feature = self.feature(state)
+        mean = self.actor_mean(feature)
+        std = self.actor_log_std.exp()
+        value = self.critic(feature)
+        return mean, std, value
+
+class PPOAgent:
+    def __init__(self, state_size, action_size, lr=1e-4, gamma=0.99, eps_clip=0.2, c1=0.5, c2=0.01):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model = ActorCritic(state_size, action_size).to(self.device)
+        self.optimizer = Adam(self.model.parameters(), lr=lr)
+        self.gamma = gamma
+        self.eps_clip = eps_clip
+        self.c1 = c1  # Critic loss coefficient
+        self.c2 = c2  # Entropy coefficient
+
+    def select_action(self, state):
+        state = torch.FloatTensor(state).to(self.device)
+        with torch.no_grad():
+            mean, std, _ = self.model(state)
+        dist = Normal(mean, std)
+        action = dist.rsample()
+        tanh_action = torch.tanh(action)
+        log_prob = dist.log_prob(action) - torch.log(1 - tanh_action.pow(2) + 1e-7)
+        log_prob = log_prob.sum(dim=-1)
+        action_np = tanh_action.cpu().numpy()
+        return action_np, log_prob.item()
+
+    def compute_returns(self, rewards, masks, values, next_value):
+        R = next_value
+        returns = []
+        for step in reversed(range(len(rewards))):
+            R = rewards[step] + self.gamma * R * masks[step]
+            returns.insert(0, R)
+        return returns
+
+    def update(self, trajectories):
+        states = torch.FloatTensor(np.array(trajectories['states'])).to(self.device)
+        actions = torch.FloatTensor(np.array(trajectories['actions'])).to(self.device)
+        old_log_probs = torch.FloatTensor(np.array(trajectories['log_probs'])).to(self.device)
+        returns = torch.FloatTensor(np.array(trajectories['returns'])).to(self.device)
+        values = torch.FloatTensor(np.array(trajectories['values'])).to(self.device)
+        advantages = returns - values
+
+        # Normalize advantages
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # PPO update
+        for _ in range(4):  # Number of epochs
+            mean, std, current_values = self.model(states)
+            dist = Normal(mean, std)
+            new_log_probs = dist.log_prob(actions)
+            tanh_actions = torch.tanh(actions)
+            new_log_probs -= torch.log(1 - tanh_actions.pow(2) + 1e-7)
+            new_log_probs = new_log_probs.sum(dim=-1)
+            entropy = dist.entropy().sum(dim=-1).mean()
+
+            ratio = (new_log_probs - old_log_probs).exp()
+
+            # Surrogate function
+            surr1 = ratio * advantages
+            surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
+            actor_loss = -torch.min(surr1, surr2).mean()
+            critic_loss = self.c1 * (returns - current_values.squeeze()).pow(2).mean()
+            loss = actor_loss + critic_loss - self.c2 * entropy
+
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+
+// File: environment.py
+# File: environment.py
+import numpy as np
+import asyncio
+
+class TradingEnvironment:
+    def __init__(self, lnn_output_queue, initial_balance=10000, max_leverage=10):
+        self.lnn_output_queue = lnn_output_queue
+        self.initial_balance = initial_balance
+        self.max_leverage = max_leverage
+
+    async def reset(self):
+        self.balance = self.initial_balance
+        self.position = 0.0  # Current position size (positive for long, negative for short)
+        self.entry_price = 0.0
+        self.margin = 0.0
+        self.equity = self.initial_balance
+        self.margin_level = 100.0
+        self.history = []
+        lnn_output = await self._get_lnn_output()
+        self.current_state = self._get_state(lnn_output)
+        return self.current_state
+
+    async def step(self, action):
+        # action is expected to be a scalar in [-1, 1]
+        lnn_output = await self._get_lnn_output()
+        market_price = self._get_market_price(lnn_output)
+        # Process action
+        # action > 0: buy (long), action < 0: sell (short), action == 0: hold
+        position_change = action.item() * self.max_leverage  # Scale action to leverage
+        # Update position
+        self.position += position_change
+        self.entry_price = market_price  # Update entry price
+        # Compute reward
+        reward = self._compute_reward(market_price)
+        # Update equity
+        self.equity += reward
+        self.history.append((self.position, market_price, reward))
+        # Check if done (e.g., if balance below zero)
+        done = self.equity <= 0
+        info = {}
+        # Update state
+        self.current_state = self._get_state(lnn_output)
+        return self.current_state, reward, done, info
+
+    async def _get_lnn_output(self):
+        lnn_output = await self.lnn_output_queue.get()
+        self.lnn_output_queue.task_done()
+        return lnn_output  # Assuming lnn_output is a scalar indicator
+
+    def _get_market_price(self, lnn_output):
+        # For simplicity, use the LNN output as a proxy for market price
+        # In practice, you would get the market price from actual data
+        return lnn_output
+
+    def _compute_reward(self, market_price):
+        # Compute reward based on position and market price change
+        price_change = market_price - self.entry_price
+        reward = self.position * price_change
+        return reward
+
+    def _get_state(self, lnn_output):
+        # Construct the state representation
+        # State includes LNN output, current position, and equity
+        state = np.array([lnn_output, self.position, self.equity], dtype=np.float32)
+        return state
+
+
 // File: error_handler.py
 # File: error_handler.py
 import logging
-import traceback
 
 class ErrorHandler:
-    """
-    Centralized error handling and logging.
-    """
+    def __init__(self):
+        self.logger = logging.getLogger("ErrorHandler")
 
-    def __init__(self, log_file: str = "error.log"):
-        """
-        Initializes the ErrorHandler with a specified log file.
-
-        Args:
-            log_file (str, optional): Path to the log file. Defaults to "error.log".
-        """
-        self.logger = logging.getLogger("DataPipelineErrorHandler")
-        self.logger.setLevel(logging.ERROR)
-        fh = logging.FileHandler(log_file)
-        fh.setLevel(logging.ERROR)
-        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-        fh.setFormatter(formatter)
-        self.logger.addHandler(fh)
-
-    def handle_error(self, message: str, exc_info: bool = False, symbol: str = None, timeframe: str = None):
-        """
-        Logs an error message with optional contextual information.
-
-        Args:
-            message (str): Error message.
-            exc_info (bool, optional): If True, includes traceback. Defaults to False.
-            symbol (str, optional): Trading symbol related to the error. Defaults to None.
-            timeframe (str, optional): Timeframe related to the error. Defaults to None.
-        """
-        context = f" (Symbol: {symbol}, Timeframe: {timeframe})" if symbol and timeframe else ""
-        full_message = f"{message}{context}"
-        if exc_info:
-            self.logger.error(full_message, exc_info=True)
-        else:
-            self.logger.error(full_message)
+    def handle_error(self, message: str, exc_info: bool = False, **context):
+        context_info = ' | '.join([f"{key}={value}" for key, value in context.items()])
+        full_message = f"{message} | {context_info}" if context else message
+        self.logger.error(full_message, exc_info=exc_info)
 
 
 // File: main.py
 # File: main.py
 import asyncio
+import logging
 from data.mexc_websocket_connector import MexcWebsocketConnector
 from data.data_processor import DataProcessor
-from data.indicator_calculations import IndicatorCalculator
-from data.storage.data_storage import DataStorage
-from error_handler import ErrorHandler  
+from error_handler import ErrorHandler
 from dotenv import load_dotenv
 import os
+from agent import PPOAgent
+from environment import TradingEnvironment
+import torch
+
+# Constants
+INPUT_SIZE = 10  # Should match INPUT_SIZE in data_processor.py
+ACTION_SIZE = 1  # Scalar action
 
 def load_configuration():
-    """
-    Loads configuration from the .env file.
-
-    Returns:
-        Tuple[List[str], List[str], str]: Symbols, timeframes, storage path.
-    """
     load_dotenv(os.path.join(os.path.dirname(__file__), 'configs/.env'))
     symbols = os.getenv("SYMBOLS", "BTCUSDT").split(",")
-    timeframes = os.getenv("TIMEFRAMES", "1m,15m,30m,4h,1d,1w,1M").split(",")
-    storage_path = os.getenv("DATA_STORAGE_PATH", "./data_storage")
-    return symbols, timeframes, storage_path
+    timeframes = os.getenv("TIMEFRAMES", "Min1").split(",")
+    return symbols, timeframes
+
+def validate_configuration(symbols, timeframes):
+    if not symbols:
+        raise ValueError("SYMBOLS must be defined in the .env file.")
+    if not timeframes:
+        raise ValueError("TIMEFRAMES must be defined in the .env file.")
+
+async def train_agent(agent, env, num_episodes=1000):
+    for episode in range(num_episodes):
+        state = await env.reset()
+        done = False
+        trajectories = {'states': [], 'actions': [], 'rewards': [], 'log_probs': [], 'values': []}
+        while not done:
+            action, log_prob = agent.select_action(state)
+            next_state, reward, done, info = await env.step(action)
+            _, _, value = agent.model(torch.FloatTensor(state).to(agent.device))
+            trajectories['states'].append(state)
+            trajectories['actions'].append(action)
+            trajectories['log_probs'].append(log_prob)
+            trajectories['values'].append(value.item())
+            trajectories['rewards'].append(reward)
+            state = next_state
+        # Compute returns and update agent
+        next_value = 0 if done else agent.model(torch.FloatTensor(state).to(agent.device))[-1].item()
+        returns = agent.compute_returns(trajectories['rewards'], [1]*len(trajectories['rewards']), trajectories['values'], next_value)
+        trajectories['returns'] = returns
+        agent.update(trajectories)
 
 async def main():
-    """
-    Main entry point for the data pipeline.
-    """
-    symbols, timeframes, storage_path = load_configuration()
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,  # Change to DEBUG for more verbosity
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler("app.log"),
+            logging.StreamHandler()
+        ]
+    )
+    logger = logging.getLogger("Main")
+
+    symbols, timeframes = load_configuration()
+    try:
+        validate_configuration(symbols, timeframes)
+    except ValueError as ve:
+        logger.error(f"Configuration Error: {ve}")
+        return
+    logger.info(f"Loaded configuration: Symbols={symbols}, Timeframes={timeframes}")
 
     # Initialize components
     data_queue = asyncio.Queue()
+    lnn_output_queue = asyncio.Queue()
     error_handler = ErrorHandler()
-    
-    # Choose storage method:
-    # For CSV storage:
-    storage = DataStorage(storage_path=storage_path)
-    
-    # For PostgreSQL storage:
-    # storage = DataStoragePostgreSQL()
-    
-    indicator_calculator = IndicatorCalculator(error_handler=error_handler)
-    processor = DataProcessor(data_queue, storage, indicator_calculator, error_handler, symbols, timeframes)
+
+    processor = DataProcessor(data_queue, lnn_output_queue, error_handler, symbols, timeframes)
     connector = MexcWebsocketConnector(data_queue, symbols, timeframes, error_handler)
 
-    # Create tasks
-    tasks = [
-        asyncio.create_task(connector.connect()),
-        asyncio.create_task(processor.run())
-    ]
+    # Initialize agent and environment
+    state_size = 3  # lnn_output, position, equity
+    action_size = ACTION_SIZE
+    agent = PPOAgent(state_size, action_size)
+    env = TradingEnvironment(lnn_output_queue)
 
-    # Run tasks until complete
-    await asyncio.gather(*tasks)
+    # Create tasks
+    connector_task = asyncio.create_task(connector.connect())
+    processor_task = asyncio.create_task(processor.run())
+    training_task = asyncio.create_task(train_agent(agent, env))
+
+    tasks = [connector_task, processor_task, training_task]
+
+    try:
+        await asyncio.gather(*tasks)
+    except KeyboardInterrupt:
+        logger.info("Pipeline terminated by user.")
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        logger.info("Data pipeline terminated gracefully.")
+    except Exception as e:
+        error_handler.handle_error(f"Unexpected error in main: {e}", exc_info=True)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        logger.info("Shutdown complete.")
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("Pipeline terminated by user.")
+    asyncio.run(main())
 
 
 // File: data\data_processor.py
-import os
+# File: data/data_processor.py
 import asyncio
-import aiohttp
 from typing import Dict, Any, List
-import pandas as pd
-from .indicator_calculations import IndicatorCalculator
-from .storage.data_storage import DataStorage
 from error_handler import ErrorHandler
+import logging
+from models.lnn_model import LiquidNeuralNetwork
+import torch
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+
+# Constants for LNN
+INPUT_SIZE = 10  # Adjust based on actual feature size
+HIDDEN_SIZE = 128
+OUTPUT_SIZE = 1  # Single output for the indicator
+
+# Precomputed scaling parameters (placeholder values)
+feature_means = np.array([0.0] * INPUT_SIZE)
+feature_stds = np.array([1.0] * INPUT_SIZE)
 
 class DataProcessor:
-    """
-    Processes raw kline data, applies technical indicators, and stores the processed data.
-    """
-
-    def __init__(self, data_queue: asyncio.Queue, storage: DataStorage, indicator_calculator: IndicatorCalculator, error_handler: ErrorHandler, symbols: List[str], timeframes: List[str]):
-        """
-        Initializes the DataProcessor.
-
-        Args:
-            data_queue (asyncio.Queue): Queue to consume raw data from.
-            storage (DataStorage): Instance for storing processed data.
-            indicator_calculator (IndicatorCalculator): Instance for calculating technical indicators.
-            error_handler (ErrorHandler): Instance to handle errors.
-            symbols (List[str]): List of trading symbols.
-            timeframes (List[str]): List of kline timeframes.
-        """
+    def __init__(
+        self,
+        data_queue: asyncio.Queue,
+        lnn_output_queue: asyncio.Queue,
+        error_handler: ErrorHandler,
+        symbols: List[str],
+        timeframes: List[str]
+    ):
         self.data_queue = data_queue
-        self.storage = storage
-        self.indicator_calculator = indicator_calculator
+        self.lnn_output_queue = lnn_output_queue
         self.error_handler = error_handler
         self.symbols = symbols
         self.timeframes = timeframes
+        self.logger = logging.getLogger("DataProcessor")
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.lnn = LiquidNeuralNetwork(input_size=INPUT_SIZE, hidden_size=HIDDEN_SIZE, output_size=OUTPUT_SIZE).to(self.device)
+        self.batch_size = 16
+        self.input_buffer = []
+        self.scaler = StandardScaler()
+        # Initialize scaler with precomputed parameters
+        self.scaler.mean_ = feature_means
+        self.scaler.scale_ = feature_stds
+        self.scaler.n_features_in_ = INPUT_SIZE
+
+    def preprocess_data(self, data: Dict[str, Any]) -> torch.Tensor:
+        channel = data.get('c')
+        if not channel:
+            self.logger.warning(f"Received data without channel information: {data}")
+            return None
+
+        try:
+            if channel.startswith("spot@public.kline.v3.api"):
+                return self._preprocess_kline_data(data)
+            elif channel.startswith("spot@public.deals.v3.api"):
+                return self._preprocess_deals_data(data)
+            elif channel.startswith("spot@public.increase.depth.v3.api"):
+                return self._preprocess_depth_data(data)
+            elif channel.startswith("spot@public.bookTicker.v3.api"):
+                return self._preprocess_bookTicker_data(data)
+            else:
+                self.logger.warning(f"Unknown channel: {channel}")
+                return None
+
+        except Exception as e:
+            self.error_handler.handle_error(f"Error preprocessing data: {e}", exc_info=True, channel=channel)
+            return None
+
+    def _preprocess_kline_data(self, data: Dict[str, Any]) -> torch.Tensor:
+        kline_data = data.get('d', {}).get('k')
+        if kline_data:
+            try:
+                features = [
+                    float(kline_data['o']),  # Opening price
+                    float(kline_data['c']),  # Closing price
+                    float(kline_data['h']),  # Highest price
+                    float(kline_data['l']),  # Lowest price
+                    float(kline_data['v']),  # Quantity
+                    float(kline_data['a']),  # Volume
+                    int(kline_data['t']),    # Start time
+                    int(kline_data['T']),    # End time
+                    # Add more features as needed...
+                ]
+                features = features[:INPUT_SIZE] + [0] * (INPUT_SIZE - len(features))
+                features = np.array(features)
+                features = (features - self.scaler.mean_) / (self.scaler.scale_ + 1e-8)
+                return torch.tensor(features, dtype=torch.float32, device=self.device)
+
+            except (KeyError, TypeError) as e:
+                self.error_handler.handle_error(f"Error extracting kline features: {e}", exc_info=True, data=data)
+                return None
+        return None
+
+    def _preprocess_deals_data(self, data: Dict[str, Any]) -> torch.Tensor:
+        deals_data = data.get('d', {}).get('deals')
+        if deals_data and isinstance(deals_data, list):
+            try:
+                first_deal = deals_data[0]
+                trade_side = int(first_deal['S'])
+                # According to documentation, 'S' = 1 for BUY, 'S' = 2 for SELL
+                is_buy = 1 if trade_side == 1 else 0
+                features = [
+                    float(first_deal['p']),   # Price
+                    float(first_deal['v']),   # Quantity/Volume
+                    int(first_deal['t']),     # Deal Time
+                    is_buy,                   # Trade Side: 1 for BUY, 0 for SELL
+                    # Add more features as needed...
+                ]
+                features = features[:INPUT_SIZE] + [0] * (INPUT_SIZE - len(features))
+                features = np.array(features)
+                features = (features - self.scaler.mean_) / (self.scaler.scale_ + 1e-8)
+                return torch.tensor(features, dtype=torch.float32, device=self.device)
+
+            except (KeyError, TypeError, IndexError) as e:
+                self.error_handler.handle_error(f"Error extracting deals features: {e}", exc_info=True, data=data)
+                return None
+        return None
+
+    def _preprocess_depth_data(self, data: Dict[str, Any]) -> torch.Tensor:
+        depth_data = data.get('d')
+        if depth_data:
+            try:
+                asks = depth_data.get('asks', [])
+                bids = depth_data.get('bids', [])
+
+                num_levels = min(5, len(asks), len(bids))
+                features = []
+                for i in range(num_levels):
+                    features.extend([
+                        float(asks[i]['p']), float(asks[i]['v']),
+                        float(bids[i]['p']), float(bids[i]['v'])
+                    ])
+
+                features = features[:INPUT_SIZE] + [0] * (INPUT_SIZE - len(features))
+                features = np.array(features)
+                features = (features - self.scaler.mean_) / (self.scaler.scale_ + 1e-8)
+                return torch.tensor(features, dtype=torch.float32, device=self.device)
+
+            except (KeyError, TypeError, IndexError) as e:
+                self.error_handler.handle_error(f"Error extracting depth features: {e}", exc_info=True, data=data)
+                return None
+        return None
+
+    def _preprocess_bookTicker_data(self, data: Dict[str, Any]) -> torch.Tensor:
+        bookTicker_data = data.get('d')
+        if bookTicker_data:
+            try:
+                features = [
+                    float(bookTicker_data['a']),  # Best ask price
+                    float(bookTicker_data['A']),  # Best ask quantity
+                    float(bookTicker_data['b']),  # Best bid price
+                    float(bookTicker_data['B']),  # Best bid quantity
+                    # Add more features as needed...
+                ]
+                features = features[:INPUT_SIZE] + [0] * (INPUT_SIZE - len(features))
+                features = np.array(features)
+                features = (features - self.scaler.mean_) / (self.scaler.scale_ + 1e-8)
+                return torch.tensor(features, dtype=torch.float32, device=self.device)
+
+            except (KeyError, TypeError) as e:
+                self.error_handler.handle_error(f"Error extracting bookTicker features: {e}", exc_info=True, data=data)
+                return None
+        return None
+
+    async def process_data(self, data: Dict[str, Any]):
+        try:
+            input_tensor = self.preprocess_data(data)
+            if input_tensor is None:
+                return
+
+            self.input_buffer.append(input_tensor)
+
+            if len(self.input_buffer) >= self.batch_size:
+                batch_tensor = torch.stack(self.input_buffer).to(self.device)
+                with torch.no_grad():
+                    intelligence_outputs = self.lnn(batch_tensor)
+                for intelligence_output in intelligence_outputs:
+                    await self.handle_lnn_output(intelligence_output)
+                self.input_buffer = []
+
+        except Exception as e:
+            self.error_handler.handle_error(
+                f"Error processing data through LNN: {e}",
+                exc_info=True
+            )
+
+    async def handle_lnn_output(self, intelligence_output: torch.Tensor):
+        try:
+            indicator_value = intelligence_output.item()
+            await self.lnn_output_queue.put(indicator_value)
+            self.logger.debug(f"LNN indicator enqueued for agents: {indicator_value}")
+        except Exception as e:
+            self.error_handler.handle_error(
+                f"Error handling LNN output: {e}",
+                exc_info=True
+            )
 
     async def run(self):
-        """
-        Continuously consumes data from the queue and processes it.
-        """
         while True:
             try:
                 data = await self.data_queue.get()
                 await self.process_data(data)
                 self.data_queue.task_done()
+            except asyncio.CancelledError:
+                self.logger.info("DataProcessor task cancelled.")
+                break
             except Exception as e:
-                self.error_handler.handle_error(f"Error in DataProcessor run loop: {e}", exc_info=True, symbol=None, timeframe=None)
-
-    async def process_data(self, data: Dict[str, Any]):
-        """
-        Processes a single batch of kline data.
-
-        Args:
-            data (Dict[str, Any]): Raw kline data from the WebSocket.
-        """
-        try:
-            symbol, timeframe = self._extract_symbol_timeframe(data)
-            kline_data = self._extract_kline_data(data)
-            
-            # Load existing data
-            existing_df = await self.storage.load_dataframe(symbol, timeframe)
-            if existing_df is not None and not existing_df.empty:
-                df = pd.concat([existing_df, pd.DataFrame([kline_data])], ignore_index=True)
-            else:
-                df = pd.DataFrame([kline_data])
-
-            # Remove duplicates based on close_time
-            df.drop_duplicates(subset=['close_time'], keep='last', inplace=True)
-            # Sort by close_time
-            df.sort_values(by='close_time', inplace=True)
-            # Reset index
-            df.reset_index(drop=True, inplace=True)
-
-            # Calculate indicators
-            indicators = self.indicator_calculator.calculate_indicators(symbol, {timeframe: df})
-
-            # Consolidate data
-            unified_feed = {
-                'symbol': symbol,
-                'timeframe': timeframe,
-                'data': df.to_dict(orient='records'),
-                'indicators': indicators.get(timeframe, {})
-            }
-
-            # Store the unified feed
-            await self.storage.store_data(unified_feed)
-            # Optionally, send to GMN
-            await self.send_to_gmn(unified_feed)
-            # Live Test Output: Print the unified_feed
-            print("\n--- Unified Feed ---")
-            print(unified_feed)
-            print("---------------------\n")
-        except Exception as e:
-            self.error_handler.handle_error(f"Error processing data: {e}", exc_info=True, symbol=None, timeframe=None)
-
-    def _extract_symbol_timeframe(self, data: Dict[str, Any]) -> tuple[str, str]:
-        """
-        Extracts the symbol and timeframe from the stream name.
-
-        Args:
-            data (Dict[str, Any]): Raw kline data.
-
-        Returns:
-            tuple[str, str]: Symbol and timeframe.
-        """
-        stream = data.get('stream', '')
-        parts = stream.split('@')
-        if len(parts) < 5:
-            raise ValueError(f"Invalid stream format: {stream}")
-        symbol = parts[3]
-        timeframe = parts[4].replace('kline_', '')
-        return symbol, timeframe
-
-    def _extract_kline_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Extracts relevant kline data from the message.
-
-        Args:
-            data (Dict[str, Any]): Raw kline data.
-
-        Returns:
-            Dict[str, Any]: Extracted kline information.
-        """
-        k = data.get('data', {}).get('k', {})
-        if not k:
-            raise ValueError("Missing kline data in the message")
-        return {
-            'open': float(k['o']),
-            'high': float(k['h']),
-            'low': float(k['l']),
-            'close': float(k['c']),
-            'volume': float(k['v']),
-            'close_time': int(k['T'])
-        }
-
-    async def send_to_gmn(self, unified_feed: Dict[str, Any]):
-        """
-        Sends the unified feed to the GMN module.
-
-        Args:
-            unified_feed (Dict[str, Any]): Processed data with indicators.
-        """
-        gmn_endpoint = os.getenv("GMN_ENDPOINT", "http://localhost:8000/api/gmn")  # Replace with actual endpoint
-
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with session.post(gmn_endpoint, json=unified_feed) as response:
-                    if response.status != 200:
-                        self.error_handler.handle_error(f"GMN API error: {response.status}", symbol=unified_feed.get('symbol'), timeframe=unified_feed.get('timeframe'))
-            except Exception as e:
-                self.error_handler.handle_error(f"Error sending data to GMN: {e}", exc_info=True, symbol=unified_feed.get('symbol'), timeframe=unified_feed.get('timeframe'))
-
-
-// File: data\indicator_calculations.py
-import pandas as pd
-from finta import TA
-from typing import Dict, Any, List
-import concurrent.futures
-from error_handler import ErrorHandler
-
-class IndicatorCalculator:
-    """
-    Calculates technical indicators for kline data.
-    """
-
-    def __init__(self, error_handler: ErrorHandler):
-        """
-        Initializes the IndicatorCalculator with an error handler.
-
-        Args:
-            error_handler (ErrorHandler): Instance to handle errors during calculations.
-        """
-        self.error_handler = error_handler
-
-    def calculate_indicators(self, symbol: str, data: Dict[str, pd.DataFrame]) -> Dict[str, Dict[str, Any]]:
-        """
-        Calculates indicators for all provided timeframes.
-
-        Args:
-            symbol (str): The trading symbol (e.g., 'BTCUSDT').
-            data (Dict[str, pd.DataFrame]): Dictionary where keys are timeframes and values are DataFrames.
-
-        Returns:
-            Dict[str, Dict[str, Any]]: Dictionary of indicators keyed by timeframe.
-        """
-        indicators = {}
-        try:
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                futures = {
-                    executor.submit(self._calculate_for_timeframe, symbol, timeframe, df): timeframe
-                    for timeframe, df in data.items()
-                }
-                for future in concurrent.futures.as_completed(futures):
-                    timeframe = futures[future]
-                    try:
-                        indicators[timeframe] = future.result()
-                    except Exception as e:
-                        self.error_handler.handle_error(
-                            f"Error calculating indicators for {symbol} {timeframe}: {e}",
-                            exc_info=True,
-                            symbol=symbol,
-                            timeframe=timeframe
-                        )
-        except Exception as e:
-            self.error_handler.handle_error(
-                f"Error in calculate_indicators: {e}",
-                exc_info=True,
-                symbol=symbol,
-                timeframe=''
-            )
-        return indicators
-
-    def _calculate_for_timeframe(self, symbol: str, timeframe: str, df: pd.DataFrame) -> Dict[str, Any]:
-        """
-        Helper function to calculate indicators for a specific timeframe.
-
-        Args:
-            symbol (str): The trading symbol (e.g., 'BTCUSDT').
-            timeframe (str): The timeframe being processed.
-            df (pd.DataFrame): DataFrame containing OHLC data for the timeframe.
-
-        Returns:
-            Dict[str, Any]: Calculated indicators for the timeframe.
-        """
-        indicators = {}
-        try:
-            # Ensure dataframe has the required columns
-            required_columns = ['open', 'high', 'low', 'close', 'volume']
-            if not all(col in df.columns for col in required_columns):
-                raise ValueError(f"Missing required columns in {timeframe} data for {symbol}: {df.columns}")
-
-            indicators['rsi'] = self.calculate_rsi(df)
-            indicators['macd'] = self.calculate_macd(df)
-            indicators['fibonacci'] = self.calculate_fibonacci(df)
-        except Exception as e:
-            self.error_handler.handle_error(
-                f"Error calculating indicators for {symbol} {timeframe}: {e}",
-                exc_info=True,
-                symbol=symbol,
-                timeframe=timeframe
-            )
-        return indicators
-
-    def calculate_rsi(self, df: pd.DataFrame) -> List[float]:
-        """
-        Calculates the RSI (Relative Strength Index).
-
-        Args:
-            df (pd.DataFrame): DataFrame containing OHLC data.
-
-        Returns:
-            List[float]: RSI values.
-        """
-        try:
-            rsi_series = TA.RSI(df)
-            rsi_values = rsi_series.fillna(0).tolist()
-            return rsi_values
-        except Exception as e:
-            self.error_handler.handle_error(f"Error calculating RSI: {e}", exc_info=True, symbol=None, timeframe=None)
-            return []
-
-    def calculate_macd(self, df: pd.DataFrame) -> Dict[str, List[float]]:
-        """
-        Calculates the MACD (Moving Average Convergence Divergence).
-
-        Args:
-            df (pd.DataFrame): DataFrame containing OHLC data.
-
-        Returns:
-            Dict[str, List[float]]: MACD values, signal line, and histogram.
-        """
-        try:
-            macd_df = TA.MACD(df)
-            return {
-                'macd': macd_df['MACD'].fillna(0).tolist(),
-                'macd_signal': macd_df['SIGNAL'].fillna(0).tolist(),
-                'macd_hist': macd_df['HISTOGRAM'].fillna(0).tolist()
-            }
-        except Exception as e:
-            self.error_handler.handle_error(f"Error calculating MACD: {e}", exc_info=True, symbol=None, timeframe=None)
-            return {'macd': [], 'macd_signal': [], 'macd_hist': []}
-
-    def calculate_fibonacci(self, df: pd.DataFrame) -> Dict[str, float]:
-        """
-        Calculates Fibonacci Retracement levels manually.
-
-        Args:
-            df (pd.DataFrame): DataFrame containing OHLC data.
-
-        Returns:
-            Dict[str, float]: Fibonacci retracement levels.
-        """
-        try:
-            high = df['high'].max()
-            low = df['low'].min()
-            diff = high - low
-            fib_levels = {
-                "23.6%": high - 0.236 * diff,
-                "38.2%": high - 0.382 * diff,
-                "50.0%": high - 0.5 * diff,
-                "61.8%": high - 0.618 * diff,
-                "78.6%": high - 0.786 * diff
-            }
-            return fib_levels
-        except Exception as e:
-            self.error_handler.handle_error(f"Error calculating Fibonacci Retracement: {e}", exc_info=True, symbol=None, timeframe=None)
-            return {}
+                self.error_handler.handle_error(
+                    f"Error in DataProcessor run loop: {e}",
+                    exc_info=True
+                )
 
 
 // File: data\mexc_websocket_connector.py
-import os
-import json
+# File: data/mexc_websocket_connector.py
 import asyncio
 import websockets
-from dotenv import load_dotenv
+import json
 from typing import List
 from error_handler import ErrorHandler
-
-load_dotenv(os.path.join(os.path.dirname(__file__), '../config/.env'))
+import logging
+import time
 
 class MexcWebsocketConnector:
-    """
-    Connects to the MEXC WebSocket API, subscribes to kline streams, and feeds data into a queue.
-    """
-
-    def __init__(self, data_queue: asyncio.Queue, symbols: List[str], timeframes: List[str], error_handler: ErrorHandler):
-        """
-        Initializes the MexcWebsocketConnector.
-
-        Args:
-            data_queue (asyncio.Queue): Queue to put received data for processing.
-            symbols (List[str]): List of trading symbols (e.g., ['BTCUSDT', 'ETHUSDT']).
-            timeframes (List[str]): List of kline timeframes in the correct format (e.g., ['Min1', 'Min5']).
-            error_handler (ErrorHandler): Instance to handle errors.
-        """
-        self.ws_url = os.getenv("MEXC_WS_URL", "wss://wbs.mexc.com/ws")
-        self.api_key = os.getenv("MEXC_API_KEY")
-        self.api_secret = os.getenv("MEXC_API_SECRET")
-        self.reconnect_delay = 5.0  # Seconds
+    def __init__(
+        self,
+        data_queue: asyncio.Queue,
+        symbols: List[str],
+        timeframes: List[str],
+        error_handler: ErrorHandler
+    ):
         self.data_queue = data_queue
         self.symbols = symbols
         self.timeframes = timeframes
-        self.max_subscriptions = 30  # As per API limit
         self.error_handler = error_handler
+        self.logger = logging.getLogger("MexcWebsocketConnector")
+        self.uri = "wss://wbs.mexc.com/ws"
+        self.ping_interval = 60
 
     async def connect(self):
-        """
-        Establishes WebSocket connection and manages subscription and data reception.
-        Reconnects automatically on connection loss.
-        """
         while True:
             try:
-                async with websockets.connect(self.ws_url) as ws:
-                    await self._subscribe(ws)
-                    # Start receiving data
-                    await self._receive_data(ws)
+                async with websockets.connect(self.uri, ping_interval=None) as websocket:
+                    await self.subscribe_channels(websocket)
+                    ping_task = asyncio.create_task(self.send_ping(websocket))
+                    async for message in websocket:
+                        try:
+                            data = json.loads(message)
+                            if data.get("msg") == "PONG":
+                                self.logger.debug("Received PONG from server.")
+                                continue
+                            await self.data_queue.put(data)
+                            self.logger.debug(f"Received data: {data}")
+                        except json.JSONDecodeError as e:
+                            self.error_handler.handle_error(
+                                f"JSON decode error: {e}",
+                                exc_info=True
+                            )
+            except websockets.exceptions.ConnectionClosedError as e:
+                self.error_handler.handle_error(
+                    f"WebSocket connection closed unexpectedly: {e}",
+                    exc_info=True
+                )
+                self.logger.warning("WebSocket connection closed. Reconnecting in 5 seconds...")
+                await asyncio.sleep(5)
             except Exception as e:
-                self.error_handler.handle_error(f"WebSocket connection error: {e}", exc_info=True)
-                print(f"WebSocket connection error: {e}. Reconnecting in {self.reconnect_delay} seconds...")
-                await asyncio.sleep(self.reconnect_delay)
+                self.error_handler.handle_error(
+                    f"Unexpected error in WebSocket connection: {e}",
+                    exc_info=True
+                )
+                self.logger.error("Unexpected error. Reconnecting in 5 seconds...")
+                await asyncio.sleep(5)
 
-    async def _subscribe(self, ws):
-        """
-        Subscribes to the specified kline streams.
+    async def subscribe_channels(self, websocket):
+        subscribe_params = self._generate_subscribe_params()
+        max_subscriptions = 30
+        for i in range(0, len(subscribe_params), max_subscriptions):
+            batch = subscribe_params[i:i + max_subscriptions]
+            subscribe_message = {
+                "method": "SUBSCRIPTION",
+                "params": batch,
+                "id": int(time.time())
+            }
+            await websocket.send(json.dumps(subscribe_message))
+            self.logger.info(f"Subscribed to {len(batch)} channels.")
 
-        Args:
-            ws (websockets.WebSocketClientProtocol): Active WebSocket connection.
-        """
-        subscription_params = []
-        for symbol in self.symbols:
-            for timeframe in self.timeframes:
-                stream_name = f"spot@public.kline.v3.api@{symbol}@{timeframe}"
-                subscription_params.append(stream_name)
-                # If subscription_params reach max_subscriptions, send subscription
-                if len(subscription_params) == self.max_subscriptions:
-                    await self._send_subscription(ws, subscription_params)
-                    subscription_params = []
-        # Subscribe to any remaining streams
-        if subscription_params:
-            await self._send_subscription(ws, subscription_params)
-
-    async def _send_subscription(self, ws, params: List[str], method: str = "SUBSCRIPTION", request_id: int = 1):
-        """
-        Sends subscription or unsubscription requests to the WebSocket.
-
-        Args:
-            ws (websockets.WebSocketClientProtocol): Active WebSocket connection.
-            params (List[str]): List of stream names to subscribe/unsubscribe.
-            method (str): "SUBSCRIPTION" or "UNSUBSCRIPTION".
-            request_id (int): Identifier for the request.
-        """
-        subscription_message = {
-            "method": method,
-            "params": params,
-            "id": request_id
-        }
-        await ws.send(json.dumps(subscription_message))
-        print(f"{method.capitalize()} to streams: {params}")
-
-    async def _receive_data(self, ws):
-        """
-        Receives data from the WebSocket and puts relevant kline data into the queue.
-
-        Args:
-            ws (websockets.WebSocketClientProtocol): Active WebSocket connection.
-        """
-        async for message in ws:
             try:
-                data = json.loads(message)
-                
-                # Handle PING from server
-                if data.get('method') == 'PING':
-                    pong_message = {"method": "PONG"}
-                    await ws.send(json.dumps(pong_message))
-                    print("Received PING, sent PONG.")
-                    continue
-                
-                channel = data.get('c')  # 'c' field contains the channel name
-                if not channel:
-                    continue  # Ignore non-channel messages
+                response = await asyncio.wait_for(websocket.recv(), timeout=10)
+                response_data = json.loads(response)
+                if response_data.get("code") == 0:
+                    self.logger.info(f"Subscription successful: {response_data.get('msg')}")
+                else:
+                    self.error_handler.handle_error(
+                        f"Subscription failed: {response_data}",
+                        exc_info=False
+                    )
+            except asyncio.TimeoutError:
+                self.error_handler.handle_error(
+                    "Subscription acknowledgment timed out.",
+                    exc_info=False
+                )
 
-                if "kline" in channel:
-                    await self.data_queue.put(data)
-            except json.JSONDecodeError:
-                self.error_handler.handle_error(f"Failed to decode message: {message}", symbol=None, timeframe=None)
-            except Exception as e:
-                self.error_handler.handle_error(f"Error processing message: {e}", exc_info=True, symbol=None, timeframe=None)
+    def _generate_subscribe_params(self) -> List[str]:
+        channels = []
+        for symbol in self.symbols:
+            symbol = symbol.upper()
+            channels.append(f"spot@public.increase.depth.v3.api@{symbol}")
+            channels.append(f"spot@public.deals.v3.api@{symbol}")
+            channels.append(f"spot@public.bookTicker.v3.api@{symbol}")
+            for timeframe in self.timeframes:
+                channels.append(f"spot@public.kline.v3.api@{symbol}@{timeframe}")
+        return channels
 
+    async def send_ping(self, websocket):
+        try:
+            while True:
+                ping_message = {
+                    "method": "PING"
+                }
+                await websocket.send(json.dumps(ping_message))
+                self.logger.debug("Sent PING to server.")
+                await asyncio.sleep(self.ping_interval)
+        except asyncio.CancelledError:
+            self.logger.info("Ping task cancelled.")
+        except Exception as e:
+            self.error_handler.handle_error(
+                f"Error in PING/PONG mechanism: {e}",
+                exc_info=True
+            )
+            raise e
 
 
 // File: data\__init__.py
 # File: data/__init__.py
 from .mexc_websocket_connector import MexcWebsocketConnector
 from .data_processor import DataProcessor
-from .storage.data_storage import DataStorage
 
-__all__ = ['MexcWebsocketConnector', 'DataProcessor', 'DataStorage']
-
-
-// File: data\storage\data_storage.py
-# File: data/storage/data_storage.py
-import asyncio
-import pandas as pd
-import os
-from typing import Dict, Any, List
-from dotenv import load_dotenv
-from error_handler import ErrorHandler
-
-load_dotenv(os.path.join(os.path.dirname(__file__), '../../configs/.env'))
-
-class DataStorage:
-    """
-    Handles storage of processed data. Supports multiple storage backends.
-    """
-
-    def __init__(self, storage_path: str = None, db_config: Dict[str, Any] = None, error_handler: ErrorHandler = None):
-        """
-        Initializes the DataStorage.
-        
-        Args:
-            storage_path (str, optional): Path for file-based storage. Defaults to environment variable.
-            db_config (Dict[str, Any], optional): Configuration for database storage. Defaults to None.
-            error_handler (ErrorHandler, optional): Instance to handle errors. Defaults to None.
-        """
-        self.storage_path = storage_path or os.getenv("DATA_STORAGE_PATH", "./data_storage")
-        os.makedirs(self.storage_path, exist_ok=True)
-        self.db_config = db_config  # For future expansion to database storage
-        self.error_handler = error_handler
-
-    async def store_data(self, unified_feed: Dict[str, Any]):
-        """
-        Stores unified feed data asynchronously.
-        
-        Args:
-            unified_feed (Dict[str, Any]): Processed data ready for storage.
-        """
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._store_data_sync, unified_feed)
-
-    def _store_data_sync(self, unified_feed: Dict[str, Any]):
-        """
-        Synchronously stores data to the chosen storage backend.
-        
-        Args:
-            unified_feed (Dict[str, Any]): Processed data ready for storage.
-        """
-        symbol = unified_feed.get('symbol', 'UNKNOWN')
-        timeframe = unified_feed.get('timeframe', 'UNKNOWN')
-        data = unified_feed.get('data', [])
-        indicators = unified_feed.get('indicators', {})
-
-        if not data:
-            print(f"No data to store for {symbol} {timeframe}")
-            return
-
-        # For file-based storage (CSV)
-        self._store_to_csv(symbol, timeframe, data, indicators)
-
-        # For database storage, implement respective methods here
-        # Example: self._store_to_postgresql(symbol, timeframe, data, indicators)
-
-    def _store_to_csv(self, symbol: str, timeframe: str, data: List[Dict[str, Any]], indicators: Dict[str, Any]):
-        """
-        Stores data to a CSV file.
-        
-        Args:
-            symbol (str): Trading symbol.
-            timeframe (str): Kline timeframe.
-            data (List[Dict[str, Any]]): List of kline data records.
-            indicators (Dict[str, Any]): Calculated technical indicators.
-        """
-        try:
-            df = pd.DataFrame(data)
-            # Add indicators to DataFrame
-            for key, value in indicators.items():
-                if isinstance(value, list) and len(value) == len(df):
-                    df[key] = value
-                elif isinstance(value, dict):
-                    for sub_key, sub_value in value.items():
-                        if isinstance(sub_value, list) and len(sub_value) == len(df):
-                            df[f"{key}_{sub_key}"] = sub_value
-                else:
-                    # For scalar or mismatched lengths, skip or handle accordingly
-                    pass
-
-            filename = f"{symbol}_{timeframe}.csv"
-            filepath = os.path.join(self.storage_path, filename)
-            if os.path.exists(filepath):
-                existing_df = pd.read_csv(filepath)
-                df = pd.concat([existing_df, df], ignore_index=True)
-                df.drop_duplicates(subset=['close_time'], keep='last', inplace=True)
-            df.to_csv(filepath, index=False)
-            print(f"Data stored in {filepath}")
-        except Exception as e:
-            if self.error_handler:
-                self.error_handler.handle_error(f"Error storing data to {filepath}: {e}", exc_info=True, symbol=symbol, timeframe=timeframe)
-            else:
-                print(f"Error storing data to {filepath}: {e}")
-
-    async def load_dataframe(self, symbol: str, timeframe: str) -> pd.DataFrame:
-        """
-        Loads existing DataFrame from storage.
-        
-        Args:
-            symbol (str): Trading symbol.
-            timeframe (str): Kline timeframe.
-        
-        Returns:
-            pd.DataFrame: Loaded DataFrame or empty DataFrame if file doesn't exist.
-        """
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._load_dataframe_sync, symbol, timeframe)
-
-    def _load_dataframe_sync(self, symbol: str, timeframe: str) -> pd.DataFrame:
-        """
-        Synchronously loads DataFrame from storage.
-        
-        Args:
-            symbol (str): Trading symbol.
-            timeframe (str): Kline timeframe.
-        
-        Returns:
-            pd.DataFrame: Loaded DataFrame or empty DataFrame if file doesn't exist.
-        """
-        filename = f"{symbol}_{timeframe}.csv"
-        filepath = os.path.join(self.storage_path, filename)
-        if os.path.exists(filepath):
-            try:
-                df = pd.read_csv(filepath)
-                return df
-            except Exception as e:
-                if self.error_handler:
-                    self.error_handler.handle_error(f"Error loading data from {filepath}: {e}", exc_info=True, symbol=symbol, timeframe=timeframe)
-                return pd.DataFrame()
-        else:
-            return pd.DataFrame()
-
-    # Placeholder methods for database storage implementations
-    def _store_to_postgresql(self, symbol: str, timeframe: str, data: List[Dict[str, Any]], indicators: Dict[str, Any]):
-        """
-        Stores data to a PostgreSQL database.
-        
-        Args:
-            symbol (str): Trading symbol.
-            timeframe (str): Kline timeframe.
-            data (List[Dict[str, Any]]): List of kline data records.
-            indicators (Dict[str, Any]): Calculated technical indicators.
-        """
-        # Implement PostgreSQL storage logic here
-        pass
-
-    def _store_to_mongodb(self, symbol: str, timeframe: str, data: List[Dict[str, Any]], indicators: Dict[str, Any]):
-        """
-        Stores data to a MongoDB database.
-        
-        Args:
-            symbol (str): Trading symbol.
-            timeframe (str): Kline timeframe.
-            data (List[Dict[str, Any]]): List of kline data records.
-            indicators (Dict[str, Any]): Calculated technical indicators.
-        """
-        # Implement MongoDB storage logic here
-        pass
+__all__ = ['MexcWebsocketConnector', 'DataProcessor']
 
 
-// File: data\storage\__init__.py
+// File: models\lnn_model.py
+# File: models/lnn_model.py
+import torch
+import torch.nn as nn
+from torchdiffeq import odeint
+
+class ODEFunc(nn.Module):
+    def __init__(self, hidden_size):
+        super(ODEFunc, self).__init__()
+        self.linear = nn.Linear(hidden_size, hidden_size)
+        self.nonlinearity = nn.LeakyReLU()
+
+    def forward(self, t, x):
+        return self.nonlinearity(self.linear(x))
+
+class LiquidNeuralNetwork(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size):
+        super(LiquidNeuralNetwork, self).__init__()
+        self.input_layer = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU()
+        )
+        self.ode_func = ODEFunc(hidden_size)
+        self.output_layer = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        t = torch.tensor([0.0, 1.0], dtype=torch.float32).to(x.device)
+        x = self.input_layer(x)
+        # Adjusted solver options to prevent underflow error
+        ode_sol = odeint(
+            self.ode_func,
+            x,
+            t,
+            method='rk4',  # Using a fixed-step solver
+            options={'step_size': 0.1}  # Specify a suitable step size
+        )
+        x = ode_sol[-1]
+        x = self.output_layer(x)
+        return x
+
+
+// File: models\__init__.py
+# File: models/__init__.py
+from .lnn_model import LiquidNeuralNetwork
+
+__all__ = ['LiquidNeuralNetwork']
 
 

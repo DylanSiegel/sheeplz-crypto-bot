@@ -1,51 +1,200 @@
 # File: data/data_processor.py
 import asyncio
 from typing import Dict, Any, List
-import pandas as pd
-from .indicator_calculations import IndicatorCalculator
-from .storage.data_storage import DataStorage
 from error_handler import ErrorHandler
 import logging
-import aiohttp
-import os
+from models.lnn_model import LiquidNeuralNetwork
+import torch
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+
+# Constants for LNN
+INPUT_SIZE = 10  # Adjust based on actual feature size
+HIDDEN_SIZE = 128
+OUTPUT_SIZE = 1  # Single output for the indicator
+
+# Precomputed scaling parameters (placeholder values)
+feature_means = np.array([0.0] * INPUT_SIZE)
+feature_stds = np.array([1.0] * INPUT_SIZE)
 
 class DataProcessor:
-    """
-    Processes raw kline data, applies technical indicators, and stores the processed data.
-    """
-
     def __init__(
         self,
         data_queue: asyncio.Queue,
-        storage: DataStorage,
-        indicator_calculator: IndicatorCalculator,
+        lnn_output_queue: asyncio.Queue,
         error_handler: ErrorHandler,
         symbols: List[str],
         timeframes: List[str]
     ):
-        """
-        Initializes the DataProcessor.
-
-        Args:
-            data_queue (asyncio.Queue): Queue to consume raw data from.
-            storage (DataStorage): Instance for storing processed data.
-            indicator_calculator (IndicatorCalculator): Instance for calculating technical indicators.
-            error_handler (ErrorHandler): Instance to handle errors.
-            symbols (List[str]): List of trading symbols.
-            timeframes (List[str]): List of kline timeframes.
-        """
         self.data_queue = data_queue
-        self.storage = storage
-        self.indicator_calculator = indicator_calculator
+        self.lnn_output_queue = lnn_output_queue
         self.error_handler = error_handler
         self.symbols = symbols
         self.timeframes = timeframes
         self.logger = logging.getLogger("DataProcessor")
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.lnn = LiquidNeuralNetwork(input_size=INPUT_SIZE, hidden_size=HIDDEN_SIZE, output_size=OUTPUT_SIZE).to(self.device)
+        self.batch_size = 16
+        self.input_buffer = []
+        self.scaler = StandardScaler()
+        # Initialize scaler with precomputed parameters
+        self.scaler.mean_ = feature_means
+        self.scaler.scale_ = feature_stds
+        self.scaler.n_features_in_ = INPUT_SIZE
+
+    def preprocess_data(self, data: Dict[str, Any]) -> torch.Tensor:
+        channel = data.get('c')
+        if not channel:
+            self.logger.warning(f"Received data without channel information: {data}")
+            return None
+
+        try:
+            if channel.startswith("spot@public.kline.v3.api"):
+                return self._preprocess_kline_data(data)
+            elif channel.startswith("spot@public.deals.v3.api"):
+                return self._preprocess_deals_data(data)
+            elif channel.startswith("spot@public.increase.depth.v3.api"):
+                return self._preprocess_depth_data(data)
+            elif channel.startswith("spot@public.bookTicker.v3.api"):
+                return self._preprocess_bookTicker_data(data)
+            else:
+                self.logger.warning(f"Unknown channel: {channel}")
+                return None
+
+        except Exception as e:
+            self.error_handler.handle_error(f"Error preprocessing data: {e}", exc_info=True, channel=channel)
+            return None
+
+    def _preprocess_kline_data(self, data: Dict[str, Any]) -> torch.Tensor:
+        kline_data = data.get('d', {}).get('k')
+        if kline_data:
+            try:
+                features = [
+                    float(kline_data['o']),  # Opening price
+                    float(kline_data['c']),  # Closing price
+                    float(kline_data['h']),  # Highest price
+                    float(kline_data['l']),  # Lowest price
+                    float(kline_data['v']),  # Quantity
+                    float(kline_data['a']),  # Volume
+                    int(kline_data['t']),    # Start time
+                    int(kline_data['T']),    # End time
+                    # Add more features as needed...
+                ]
+                features = features[:INPUT_SIZE] + [0] * (INPUT_SIZE - len(features))
+                features = np.array(features)
+                features = (features - self.scaler.mean_) / (self.scaler.scale_ + 1e-8)
+                return torch.tensor(features, dtype=torch.float32, device=self.device)
+
+            except (KeyError, TypeError) as e:
+                self.error_handler.handle_error(f"Error extracting kline features: {e}", exc_info=True, data=data)
+                return None
+        return None
+
+    def _preprocess_deals_data(self, data: Dict[str, Any]) -> torch.Tensor:
+        deals_data = data.get('d', {}).get('deals')
+        if deals_data and isinstance(deals_data, list):
+            try:
+                first_deal = deals_data[0]
+                trade_side = int(first_deal['S'])
+                # According to documentation, 'S' = 1 for BUY, 'S' = 2 for SELL
+                is_buy = 1 if trade_side == 1 else 0
+                features = [
+                    float(first_deal['p']),   # Price
+                    float(first_deal['v']),   # Quantity/Volume
+                    int(first_deal['t']),     # Deal Time
+                    is_buy,                   # Trade Side: 1 for BUY, 0 for SELL
+                    # Add more features as needed...
+                ]
+                features = features[:INPUT_SIZE] + [0] * (INPUT_SIZE - len(features))
+                features = np.array(features)
+                features = (features - self.scaler.mean_) / (self.scaler.scale_ + 1e-8)
+                return torch.tensor(features, dtype=torch.float32, device=self.device)
+
+            except (KeyError, TypeError, IndexError) as e:
+                self.error_handler.handle_error(f"Error extracting deals features: {e}", exc_info=True, data=data)
+                return None
+        return None
+
+    def _preprocess_depth_data(self, data: Dict[str, Any]) -> torch.Tensor:
+        depth_data = data.get('d')
+        if depth_data:
+            try:
+                asks = depth_data.get('asks', [])
+                bids = depth_data.get('bids', [])
+
+                num_levels = min(5, len(asks), len(bids))
+                features = []
+                for i in range(num_levels):
+                    features.extend([
+                        float(asks[i]['p']), float(asks[i]['v']),
+                        float(bids[i]['p']), float(bids[i]['v'])
+                    ])
+
+                features = features[:INPUT_SIZE] + [0] * (INPUT_SIZE - len(features))
+                features = np.array(features)
+                features = (features - self.scaler.mean_) / (self.scaler.scale_ + 1e-8)
+                return torch.tensor(features, dtype=torch.float32, device=self.device)
+
+            except (KeyError, TypeError, IndexError) as e:
+                self.error_handler.handle_error(f"Error extracting depth features: {e}", exc_info=True, data=data)
+                return None
+        return None
+
+    def _preprocess_bookTicker_data(self, data: Dict[str, Any]) -> torch.Tensor:
+        bookTicker_data = data.get('d')
+        if bookTicker_data:
+            try:
+                features = [
+                    float(bookTicker_data['a']),  # Best ask price
+                    float(bookTicker_data['A']),  # Best ask quantity
+                    float(bookTicker_data['b']),  # Best bid price
+                    float(bookTicker_data['B']),  # Best bid quantity
+                    # Add more features as needed...
+                ]
+                features = features[:INPUT_SIZE] + [0] * (INPUT_SIZE - len(features))
+                features = np.array(features)
+                features = (features - self.scaler.mean_) / (self.scaler.scale_ + 1e-8)
+                return torch.tensor(features, dtype=torch.float32, device=self.device)
+
+            except (KeyError, TypeError) as e:
+                self.error_handler.handle_error(f"Error extracting bookTicker features: {e}", exc_info=True, data=data)
+                return None
+        return None
+
+    async def process_data(self, data: Dict[str, Any]):
+        try:
+            input_tensor = self.preprocess_data(data)
+            if input_tensor is None:
+                return
+
+            self.input_buffer.append(input_tensor)
+
+            if len(self.input_buffer) >= self.batch_size:
+                batch_tensor = torch.stack(self.input_buffer).to(self.device)
+                with torch.no_grad():
+                    intelligence_outputs = self.lnn(batch_tensor)
+                for intelligence_output in intelligence_outputs:
+                    await self.handle_lnn_output(intelligence_output)
+                self.input_buffer = []
+
+        except Exception as e:
+            self.error_handler.handle_error(
+                f"Error processing data through LNN: {e}",
+                exc_info=True
+            )
+
+    async def handle_lnn_output(self, intelligence_output: torch.Tensor):
+        try:
+            indicator_value = intelligence_output.item()
+            await self.lnn_output_queue.put(indicator_value)
+            self.logger.debug(f"LNN indicator enqueued for agents: {indicator_value}")
+        except Exception as e:
+            self.error_handler.handle_error(
+                f"Error handling LNN output: {e}",
+                exc_info=True
+            )
 
     async def run(self):
-        """
-        Continuously consumes data from the queue and processes it.
-        """
         while True:
             try:
                 data = await self.data_queue.get()
@@ -57,128 +206,5 @@ class DataProcessor:
             except Exception as e:
                 self.error_handler.handle_error(
                     f"Error in DataProcessor run loop: {e}",
-                    exc_info=True,
-                    symbol=None,
-                    timeframe=None
-                )
-
-    async def process_data(self, data: Dict[str, Any]):
-        """
-        Processes a single batch of kline data.
-
-        Args:
-            data (Dict[str, Any]): Raw kline data from the WebSocket.
-        """
-        try:
-            symbol, timeframe = self._extract_symbol_timeframe(data)
-            kline_data = self._extract_kline_data(data)
-            
-            # Load existing data
-            existing_df = await self.storage.load_dataframe(symbol, timeframe)
-            if existing_df is not None and not existing_df.empty:
-                df = pd.concat([existing_df, pd.DataFrame([kline_data])], ignore_index=True)
-            else:
-                df = pd.DataFrame([kline_data])
-
-            # Remove duplicates based on close_time
-            df.drop_duplicates(subset=['close_time'], keep='last', inplace=True)
-            # Sort by close_time
-            df.sort_values(by='close_time', inplace=True)
-            # Reset index
-            df.reset_index(drop=True, inplace=True)
-
-            # Calculate indicators
-            indicators = self.indicator_calculator.calculate_indicators(symbol, {timeframe: df})
-
-            # Consolidate data
-            unified_feed = {
-                'symbol': symbol,
-                'timeframe': timeframe,
-                'data': df.to_dict(orient='records'),
-                'indicators': indicators.get(timeframe, {})
-            }
-
-            # Store the unified feed
-            await self.storage.store_data(unified_feed)
-            # Optionally, send to GMN
-            await self.send_to_gmn(unified_feed)
-            # Live Test Output: Log the unified_feed
-            self.logger.info(f"Processed data for {symbol} {timeframe}: {unified_feed}")
-        except Exception as e:
-            self.error_handler.handle_error(
-                f"Error processing data: {e}",
-                exc_info=True,
-                symbol=None,
-                timeframe=None
-            )
-
-    def _extract_symbol_timeframe(self, data: Dict[str, Any]) -> tuple[str, str]:
-        """
-        Extracts the symbol and timeframe from the channel name.
-
-        Args:
-            data (Dict[str, Any]): Raw kline data.
-
-        Returns:
-            tuple[str, str]: Symbol and timeframe.
-        """
-        channel = data.get('c', '')
-        parts = channel.split('@')
-        if len(parts) < 4:
-            raise ValueError(f"Invalid channel format: {channel}")
-        symbol = parts[2]
-        timeframe = parts[3]  # e.g., 'Min30'
-        return symbol, timeframe
-
-    def _extract_kline_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Extracts relevant kline data from the message.
-
-        Args:
-            data (Dict[str, Any]): Raw kline data.
-
-        Returns:
-            Dict[str, Any]: Extracted kline information.
-        """
-        k = data.get('d', {}).get('k', {})
-        if not k:
-            raise ValueError("Missing kline data in the message")
-        return {
-            'open': float(k['o']),
-            'high': float(k['h']),
-            'low': float(k['l']),
-            'close': float(k['c']),
-            'volume': float(k['v']),
-            'close_time': int(k['T'])
-        }
-
-    async def send_to_gmn(self, unified_feed: Dict[str, Any]):
-        """
-        Sends the unified feed to the GMN module.
-
-        Args:
-            unified_feed (Dict[str, Any]): Processed data with indicators.
-        """
-        gmn_endpoint = os.getenv("GMN_ENDPOINT", "http://localhost:8000/api/gmn")  # Replace with actual endpoint
-
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with session.post(gmn_endpoint, json=unified_feed) as response:
-                    if response.status != 200:
-                        response_text = await response.text()
-                        self.error_handler.handle_error(
-                            f"GMN API error: {response.status}, Response: {response_text}",
-                            symbol=unified_feed.get('symbol'),
-                            timeframe=unified_feed.get('timeframe')
-                        )
-                    else:
-                        self.logger.info(
-                            f"Data successfully sent to GMN for {unified_feed.get('symbol')} {unified_feed.get('timeframe')}"
-                        )
-            except Exception as e:
-                self.error_handler.handle_error(
-                    f"Error sending data to GMN: {e}",
-                    exc_info=True,
-                    symbol=unified_feed.get('symbol'),
-                    timeframe=unified_feed.get('timeframe')
+                    exc_info=True
                 )
