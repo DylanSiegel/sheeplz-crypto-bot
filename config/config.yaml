@@ -1,0 +1,40 @@
+symbols:
+  - btcusdt
+  - ethusdt
+  - bnbusdt
+
+websocket:
+  base_url: "wss://fstream.binance.com"
+  ping_interval: 180
+  pong_timeout: 10
+  max_retries: 5
+  backoff_initial: 1
+  backoff_max: 60
+
+model:
+  input_size: 100
+  hidden_size: 256
+  output_size: 10
+  num_layers: 3
+  sequence_length: 200
+  learning_rate: 0.0005
+  accumulation_steps: 4
+  checkpoint_interval: 5000
+  regularization:
+    dropout: 0.2
+    l2: 1e-5
+
+logging:
+  level: "INFO"
+  format: "{time} {level} {message}"
+  rotation: "10 MB"
+  retention: "7 days"
+  compression: "zip"
+
+gpu:
+  device_id: 0
+
+security:
+  websocket_auth: false
+  api_key: ""
+  api_secret: ""
