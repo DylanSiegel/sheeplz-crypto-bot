@@ -1,6 +1,9 @@
 # feature_engineering.py
-from imports import *
-@lru_cache(maxsize=32)
+import cudf
+import ta
+from functools import lru_cache
+
+
 def calculate_indicators(df):
     close = df['Close']
     high = df['High']
@@ -29,6 +32,7 @@ def calculate_indicators(df):
         obv.rename('OBV')
     ], axis=1)
 
+
 def calculate_rolling_statistics(series, window=14):
     return cudf.DataFrame({
         'Rolling_Mean': series.rolling(window=window).mean(),
@@ -37,5 +41,3 @@ def calculate_rolling_statistics(series, window=14):
         'Rolling_Skew': series.rolling(window=window).skew(),
         'Rolling_Kurtosis': series.rolling(window=window).kurt()
     })
-
-# Add similar functions for other features like multi-timeframe, momentum, volatility, etc.

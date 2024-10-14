@@ -1,8 +1,10 @@
+// File: main.py
 # main.py
-from imports import *
+import os
+import glob
 from utils import optimize_dataframe, process_chunk
-from feature_engineering import calculate_indicators, engineer_features
 from tqdm import tqdm
+
 
 def main():
     N_JOBS = min(24, os.cpu_count())
@@ -22,6 +24,7 @@ def main():
             header=not os.path.exists(output_path),
             index=False,
         )
+
 
 if __name__ == "__main__":
     main()

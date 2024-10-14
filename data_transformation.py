@@ -1,5 +1,11 @@
 # data_transformation.py
-from imports import *
+import cudf
+import cupy as cp
+from cuml.decomposition import PCA as cuPCA
+from sklearn.preprocessing import StandardScaler
+from scipy.fft import fft
+
+
 def calculate_fft(series):
     fft_values = fft(series.values)
     return cudf.DataFrame({
@@ -8,6 +14,7 @@ def calculate_fft(series):
         'FFT_Magnitude': cp.abs(fft_values),
         'FFT_Phase': cp.angle(fft_values)
     })
+
 
 def perform_pca(df, n_components=5):
     num_cols = df.select_dtypes(include=[cp.float64, cp.float32]).columns
