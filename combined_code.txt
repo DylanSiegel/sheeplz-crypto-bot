@@ -1,138 +1,404 @@
 // File: data_transformation.py
 # data_transformation.py
+
 import cudf
 import cupy as cp
 from cuml.decomposition import PCA as cuPCA
-from sklearn.preprocessing import StandardScaler
+from cuml.preprocessing import StandardScaler, RobustScaler
 from scipy.fft import fft
+import logging
+from typing import Optional
 
+def calculate_fft(series: cudf.Series) -> cudf.DataFrame:
+    """
+    Calculates FFT features from a given series, handling potential NaN and infinite values.
+    
+    Args:
+        series (cudf.Series): Input data series.
+    
+    Returns:
+        cudf.DataFrame: DataFrame containing FFT real, imaginary, magnitude, and phase components.
+    """
+    try:
+        series = series.dropna()  # Remove NaN values before FFT
+        fft_values = fft(series.values_host)  # Transfer data to host for FFT computation
+        
+        return cudf.DataFrame({
+            'FFT_Real': cp.asnumpy(fft_values.real),      # Real part of FFT
+            'FFT_Imag': cp.asnumpy(fft_values.imag),      # Imaginary part of FFT
+            'FFT_Magnitude': cp.abs(fft_values),          # Magnitude of FFT
+            'FFT_Phase': cp.angle(fft_values)             # Phase of FFT
+        })
+    except Exception as e:
+        logging.error(f"Error in calculate_fft: {e}", exc_info=True)
+        raise
 
-def calculate_fft(series):
-    fft_values = fft(series.values)
-    return cudf.DataFrame({
-        'FFT_Real': fft_values.real,
-        'FFT_Imag': fft_values.imag,
-        'FFT_Magnitude': cp.abs(fft_values),
-        'FFT_Phase': cp.angle(fft_values)
-    })
+def perform_pca(df: cudf.DataFrame, n_components: int = 5, scaler_type: str = 'standard') -> Optional[cudf.DataFrame]:
+    """
+    Performs Principal Component Analysis (PCA) on numerical columns with optional scaling.
+    
+    Args:
+        df (cudf.DataFrame): Input DataFrame.
+        n_components (int, optional): Number of principal components to keep. Defaults to 5.
+        scaler_type (str, optional): Type of scaler to apply ('standard' or 'robust'). Defaults to 'standard'.
+    
+    Returns:
+        Optional[cudf.DataFrame]: DataFrame containing PCA components, or empty DataFrame if no numerical columns are found.
+    """
+    try:
+        num_cols = df.select_dtypes(include=['float64', 'float32']).columns
+        if not num_cols.size:
+            logging.warning("No numerical columns found for PCA.")
+            return cudf.DataFrame()
 
+        # Select scaler based on scaler_type
+        if scaler_type == 'robust':
+            scaler = RobustScaler()
+        else:
+            scaler = StandardScaler()
+        
+        scaled_data = scaler.fit_transform(df[num_cols])
+        
+        pca = cuPCA(n_components=n_components)
+        pca_result = pca.fit_transform(scaled_data)
+        
+        return cudf.DataFrame(pca_result, columns=[f'PCA_{i+1}' for i in range(n_components)])
+    except Exception as e:
+        logging.error(f"Error in perform_pca: {e}", exc_info=True)
+        raise
 
-def perform_pca(df, n_components=5):
-    num_cols = df.select_dtypes(include=[cp.float64, cp.float32]).columns
-    scaler = StandardScaler()
-    scaled_data = scaler.fit_transform(df[num_cols].to_pandas())
-    pca = cuPCA(n_components=n_components)
-    pca_result = pca.fit_transform(scaled_data)
-    return cudf.DataFrame({f'PCA_{i+1}': pca_result[:, i] for i in range(n_components)})
 
 // File: feature_engineering.py
 # feature_engineering.py
+
 import cudf
 import ta
-from functools import lru_cache
+from rolling_utils import calculate_rolling_statistics
+import logging
+import pandas as pd
+from typing import Dict
 
+# Create a dictionary to store indicator functions and their parameters
+indicator_functions: Dict[str, Dict] = {
+    "RSI": {"func": ta.momentum.RSIIndicator, "params": {"window": 14}},
+    "MACD": {"func": ta.trend.MACD, "params": {}},  # MACD has default parameters
+    "BollingerBands": {"func": ta.volatility.BollingerBands, "params": {}},
+    "ATR": {"func": ta.volatility.AverageTrueRange, "params": {"window": 14}},
+    "OBV": {"func": ta.volume.OnBalanceVolumeIndicator, "params": {}},
+    "StochasticOscillator": {"func": ta.momentum.StochasticOscillator, "params": {}},
+    "ADX": {"func": ta.trend.ADXIndicator, "params": {}},
+    "CCI": {"func": ta.trend.CCIIndicator, "params": {}},
+    "EMA": {"func": ta.trend.EMAIndicator, "params": {"window": 12}},
+    # Add other indicators and their parameters as needed
+}
 
-def calculate_indicators(df):
-    close = df['Close']
-    high = df['High']
-    low = df['Low']
-    volume = df['Volume']
+def calculate_indicators(df: cudf.DataFrame) -> cudf.DataFrame:
+    """
+    Calculates technical indicators and their rolling statistics.
     
-    # Indicators
-    rsi = ta.momentum.RSIIndicator(close, window=14).rsi()
-    macd_indicator = ta.trend.MACD(close)
-    macd = macd_indicator.macd()
-    macd_signal = macd_indicator.macd_signal()
-    bb = ta.volatility.BollingerBands(close)
-    bollinger_upper = bb.bollinger_hband()
-    bollinger_lower = bb.bollinger_lband()
-    atr = ta.volatility.AverageTrueRange(high, low, close, window=14).average_true_range()
-    obv = ta.volume.OnBalanceVolumeIndicator(close, volume).on_balance_volume()
+    Args:
+        df (cudf.DataFrame): Input DataFrame containing 'Close', 'High', 'Low', 'Volume' columns.
+    
+    Returns:
+        cudf.DataFrame: DataFrame with added technical indicators and their rolling statistics.
+    """
+    try:
+        df_pandas = df.to_pandas()
 
-    return cudf.concat([
-        df,
-        rsi.rename('RSI'),
-        macd.rename('MACD'),
-        macd_signal.rename('MACD_Signal'),
-        bollinger_upper.rename('Bollinger_Upper'),
-        bollinger_lower.rename('Bollinger_Lower'),
-        atr.rename('ATR'),
-        obv.rename('OBV')
-    ], axis=1)
+        close = df_pandas['Close']
+        high = df_pandas['High']
+        low = df_pandas['Low']
+        volume = df_pandas['Volume']
+
+        calculated_indicators = {}  # Store the calculated indicators
+        for name, indicator_data in indicator_functions.items():
+            indicator_func = indicator_data["func"]
+            params = indicator_data["params"]
+            # Apply the indicator function
+            indicator = indicator_func(high=high, low=low, close=close, volume=volume, **params)
+            
+            # Get the primary indicator value
+            try:
+                main_indicator_value = getattr(indicator, name.lower())  # Try to get the attribute by lowercase name
+            except AttributeError:
+                main_indicator_value = getattr(indicator, name)  # If lowercase fails, try original name
+            
+            calculated_indicators[name] = main_indicator_value
+
+        # Replace NaN values with forward fill to handle missing data
+        df_pandas.fillna(method='ffill', inplace=True)
+        # Optionally, other methods like 'bfill' or 'interpolate' can be used based on data characteristics
+
+        # Convert back to cuDF DataFrame
+        df = cudf.from_pandas(df_pandas)
+
+        # Add rolling statistics for each indicator
+        for name, indicator in calculated_indicators.items():
+            indicator_series = cudf.Series(indicator)  # Convert to cuDF Series
+            for window in [3, 7, 14, 21]:  # Defined rolling windows
+                rolling_stats = calculate_rolling_statistics(indicator_series, window)
+                rolling_stats = rolling_stats.add_prefix(f'{name}_rolling{window}_')
+                df = df.join(rolling_stats)
+
+        # Add the primary indicator values to the DataFrame
+        df = df.join(cudf.DataFrame(calculated_indicators))
+
+        return df
+
+    except Exception as e:
+        logging.error(f"Error in calculate_indicators: {e}", exc_info=True)
+        raise
 
 
-def calculate_rolling_statistics(series, window=14):
-    return cudf.DataFrame({
-        'Rolling_Mean': series.rolling(window=window).mean(),
-        'Rolling_Median': series.rolling(window=window).median(),
-        'Rolling_Variance': series.rolling(window=window).var(),
-        'Rolling_Skew': series.rolling(window=window).skew(),
-        'Rolling_Kurtosis': series.rolling(window=window).kurt()
-    })
+// File: logging_config.py
+# logging_config.py
 
-// File: main.py
+import logging
+
+def setup_logging(log_file: str = 'data_processing.log') -> None:
+    """
+    Configures the logging settings for the application.
+    
+    Args:
+        log_file (str): Path to the log file. Defaults to 'data_processing.log'.
+    """
+    logging.basicConfig(
+        filename=log_file,
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        filemode='a'  # Append mode to avoid overwriting existing logs
+    )
+
+
 // File: main.py
 # main.py
+
 import os
 import glob
 from utils import optimize_dataframe, process_chunk
 from tqdm import tqdm
+import dask
+from dask.distributed import Client, LocalCluster
+import logging
+import cudf
+from logging_config import setup_logging
+import time
 
+def validate_dataframe(df: cudf.DataFrame) -> bool:
+    """
+    Validates the processed DataFrame for the presence of required columns and non-null values.
+    
+    Args:
+        df (cudf.DataFrame): DataFrame to validate.
+    
+    Returns:
+        bool: True if validation passes, False otherwise.
+    """
+    required_columns = ['Close', 'High', 'Low', 'Volume', 'FFT_Magnitude', 'PCA_1']  # Example required columns
+    for col in required_columns:
+        if col not in df.columns:
+            logging.error(f"Missing required column: {col}")
+            return False
+        if df[col].isnull().any():
+            logging.warning(f"Column {col} contains null values.")
+    return True
 
 def main():
-    N_JOBS = min(24, os.cpu_count())
-    file_paths = glob.glob(r"C:\Users\dylan\Desktop\DATA-LAKE\data\raw\*.csv")
-    output_path = r"C:\Users\dylan\Desktop\DATA-LAKE\data\processed\btc_merged_advanced_features.csv"
-
-    chunk_size = 10
-    num_chunks = (len(file_paths) + chunk_size - 1) // chunk_size
-
-    for i in tqdm(range(num_chunks), desc="Processing Chunks"):
-        chunk = file_paths[i * chunk_size:(i + 1) * chunk_size]
-        processed_chunk = process_chunk(chunk, N_JOBS)
-        processed_chunk = optimize_dataframe(processed_chunk)
-        processed_chunk.to_csv(
-            output_path,
-            mode="a",
-            header=not os.path.exists(output_path),
-            index=False,
+    setup_logging()
+    start_time = time.time()  # Record start time
+    
+    try:
+        # Initialize Dask cluster with GPU support
+        cluster = LocalCluster(
+            n_workers=min(4, os.cpu_count()),  # Adjust based on GPU resources
+            threads_per_worker=1,
+            processes=True,
+            memory_limit='28GB'  # Adjust based on system
         )
-
+        client = Client(cluster)
+        
+        logging.info("Dask cluster initialized.")
+        
+        # Define data paths
+        RAW_DATA_PATH = r"C:\Users\dylan\Desktop\DATA-LAKE\data\raw\*.csv"
+        PROCESSED_DATA_PATH = r"C:\Users\dylan\Desktop\DATA-LAKE\data\processed\btc_merged_advanced_features.parquet"
+        
+        # Get list of file paths
+        file_paths = glob.glob(RAW_DATA_PATH)
+        output_path = PROCESSED_DATA_PATH
+        
+        chunk_size = 10
+        num_chunks = (len(file_paths) + chunk_size - 1) // chunk_size
+        batch_size = 50  # Number of chunks to process before writing
+        
+        batch_chunks = []
+        
+        for i in tqdm(range(num_chunks), desc="Processing Chunks"):
+            chunk = file_paths[i * chunk_size:(i + 1) * chunk_size]
+            try:
+                # Submit the processing task to Dask
+                future = client.submit(process_chunk, chunk)
+                processed_chunk = future.result()
+                
+                # Optimize the processed DataFrame
+                processed_chunk = optimize_dataframe(processed_chunk)
+                
+                # Validate the processed DataFrame
+                if validate_dataframe(processed_chunk):
+                    batch_chunks.append(processed_chunk)
+                else:
+                    logging.error(f"Validation failed for chunk {i}.")
+                
+                # Write batch to Parquet if batch_size is reached
+                if len(batch_chunks) >= batch_size:
+                    combined = cudf.concat(batch_chunks, ignore_index=True)
+                    combined.to_parquet(
+                        output_path,
+                        engine='pyarrow',
+                        compression='snappy',
+                        append=os.path.exists(output_path)
+                    )
+                    logging.info(f"Written batch {i//batch_size} to Parquet.")
+                    batch_chunks = []
+            except Exception as e:
+                logging.error(f"Error processing chunk {i}: {e}", exc_info=True)
+        
+        # Write any remaining chunks after loop
+        if batch_chunks:
+            combined = cudf.concat(batch_chunks, ignore_index=True)
+            combined.to_parquet(
+                output_path,
+                engine='pyarrow',
+                compression='snappy',
+                append=os.path.exists(output_path)
+            )
+            logging.info("Final batch written to Parquet.")
+    
+    except Exception as e:
+        logging.error(f"Error in main processing loop: {e}", exc_info=True)
+    finally:
+        # Ensure Dask client is closed
+        try:
+            client.close()
+            logging.info("Dask cluster closed.")
+        except:
+            logging.warning("Dask client was not initialized or already closed.")
+    
+    end_time = time.time()  # Record the end time
+    elapsed_time = end_time - start_time
+    logging.info(f"Total processing time: {elapsed_time:.2f} seconds")  # Log the execution time
 
 if __name__ == "__main__":
     main()
 
 
+// File: rolling_utils.py
+# rolling_utils.py
+
+import cudf
+import logging
+
+def calculate_rolling_statistics(series: cudf.Series, window: int) -> cudf.DataFrame:
+    """
+    Calculates rolling mean, standard deviation, minimum, and maximum for a given series and window.
+    
+    Args:
+        series (cudf.Series): The input data series.
+        window (int): The window size for rolling calculations.
+    
+    Returns:
+        cudf.DataFrame: A DataFrame containing rolling 'mean', 'std', 'min', and 'max'.
+    """
+    try:
+        rolling_mean = series.rolling(window).mean()
+        rolling_std = series.rolling(window).std()
+        rolling_min = series.rolling(window).min()
+        rolling_max = series.rolling(window).max()
+        
+        return cudf.DataFrame({
+            'mean': rolling_mean,
+            'std': rolling_std,
+            'min': rolling_min,
+            'max': rolling_max
+        })
+    except Exception as e:
+        logging.error(f"Error in calculate_rolling_statistics: {e}", exc_info=True)
+        raise
+
+
 // File: utils.py
 # utils.py
+
 import cudf
+import dask_cudf
 from concurrent.futures import ThreadPoolExecutor
-from feature_engineering import calculate_indicators, calculate_rolling_statistics
+from rolling_utils import calculate_rolling_statistics
+from feature_engineering import calculate_indicators
+import pandas as pd
+import logging
+import gc
 
-
-def optimize_dataframe(df):
-    for col in df.select_dtypes(include=['float64']).columns:
-        if df[col].memory_usage() > df[col].astype('float32').memory_usage():
-            df[col] = df[col].astype('float32')
-    for col in df.select_dtypes(include=['int64']).columns:
-        if df[col].memory_usage() > df[col].astype('int32').memory_usage():
-            df[col] = df[col].astype('int32')
-    return df
-
-
-def process_chunk(filepath_chunk, n_jobs):
-    with ThreadPoolExecutor(max_workers=n_jobs) as executor:
-        df_list_chunk = []
-        for future in executor.map(cudf.read_csv, filepath_chunk):
-            try:
-                df_list_chunk.append(future)
-            except Exception as e:
-                print(f"Error processing file: {e}")
+def optimize_dataframe(df: cudf.DataFrame) -> cudf.DataFrame:
+    """
+    Optimizes DataFrame memory usage by downcasting numerical columns and converting object types to categorical.
     
-    if df_list_chunk:
-        merged_df_chunk = cudf.concat(df_list_chunk, ignore_index=True).sort_values(by='Open time')
-        del df_list_chunk  # Free memory immediately after concatenation
-        return calculate_indicators(merged_df_chunk)
-    else:
-        raise ValueError("No valid data frames processed from chunk.")
+    Args:
+        df (cudf.DataFrame): Input DataFrame to optimize.
+    
+    Returns:
+        cudf.DataFrame: Optimized DataFrame with reduced memory footprint.
+    """
+    try:
+        for col in df.columns:
+            if df[col].dtype == 'float64':
+                df[col] = df[col].astype('float32')  # Downcast float64 to float32
+            elif df[col].dtype == 'int64':
+                df[col].astype('int32')  # Downcast int64 to int32
+            elif df[col].dtype == 'object':
+                df[col] = df[col].astype('category')  # Convert object types to categorical
+        gc.collect()  # Force garbage collection to free memory
+        return df
+    except Exception as e:
+        logging.error(f"Error in optimize_dataframe: {e}", exc_info=True)
+        raise
+
+def process_chunk(filepath_chunk: list) -> cudf.DataFrame:
+    """
+    Processes a list of filepaths by reading, merging, and calculating technical indicators.
+    
+    Args:
+        filepath_chunk (list): List of file paths to process.
+    
+    Returns:
+        cudf.DataFrame: Processed DataFrame with technical indicators.
+    
+    Raises:
+        ValueError: If no valid data frames are processed from the chunk.
+    """
+    try:
+        # Read CSV files using Dask-CuDF, handling missing values
+        ddf = dask_cudf.read_csv(
+            filepath_chunk, 
+            dtype={'Volume': 'float64', 'Trades': 'float64'}, 
+            assume_missing=True
+        )
+        # Compute the Dask DataFrame and sort by 'Open time'
+        merged_df_chunk = ddf.compute().sort_values(by='Open time')
+        
+        if merged_df_chunk.empty:
+            raise ValueError("No valid data frames processed from chunk.")
+        
+        # Calculate technical indicators
+        processed = calculate_indicators(merged_df_chunk)
+        
+        # Free memory by deleting intermediate objects
+        del ddf, merged_df_chunk
+        gc.collect()
+        
+        return processed
+    except Exception as e:
+        # Log the specific error and the filepaths that caused it
+        logging.error(f"Error processing files {filepath_chunk}: {e}", exc_info=True)
+        raise  # Reraise exception for visibility in the main loop
+
 
