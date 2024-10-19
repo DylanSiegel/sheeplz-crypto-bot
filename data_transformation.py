@@ -1,67 +1,167 @@
-# data_transformation.py
-
-import cudf
-import cupy as cp
-from cuml.decomposition import PCA as cuPCA
-from cuml.preprocessing import StandardScaler, RobustScaler
+# data_transformation.py (updated)
+import pandas as pd
+import numpy as np
+import torch
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler, RobustScaler, OneHotEncoder
 from scipy.fft import fft
 import logging
 from typing import Optional
+from logging_config import setup_logging  # Ensure logging is configured
 
-def calculate_fft(series: cudf.Series) -> cudf.DataFrame:
+setup_logging()
+
+def calculate_fft(series: pd.Series) -> pd.DataFrame:
     """
-    Calculates FFT features from a given series, handling potential NaN and infinite values.
+    Calculates FFT features, handling NaN/infinite values.
     
-    Args:
-        series (cudf.Series): Input data series.
-    
-    Returns:
-        cudf.DataFrame: DataFrame containing FFT real, imaginary, magnitude, and phase components.
+    :param series: Input pandas Series
+    :return: DataFrame with FFT features
     """
-    try:
-        series = series.dropna()  # Remove NaN values before FFT
-        fft_values = fft(series.values_host)  # Transfer data to host for FFT computation
-        
-        return cudf.DataFrame({
-            'FFT_Real': cp.asnumpy(fft_values.real),      # Real part of FFT
-            'FFT_Imag': cp.asnumpy(fft_values.imag),      # Imaginary part of FFT
-            'FFT_Magnitude': cp.abs(fft_values),          # Magnitude of FFT
-            'FFT_Phase': cp.angle(fft_values)             # Phase of FFT
+    series = series.dropna()
+    
+    # Use torch.fft on GPU if available
+    if torch.cuda.is_available():
+        fft_values = torch.fft.fft(torch.tensor(series.values, device='cuda:0'))
+        return pd.DataFrame({
+            'FFT_Real': fft_values.real.cpu().numpy(),
+            'FFT_Imag': fft_values.imag.cpu().numpy(),
+            'FFT_Magnitude': torch.abs(fft_values).cpu().numpy(),
+            'FFT_Phase': torch.angle(fft_values).cpu().numpy()
         })
-    except Exception as e:
-        logging.error(f"Error in calculate_fft: {e}", exc_info=True)
-        raise
+    else:
+        fft_values = fft(series.values)
+        return pd.DataFrame({
+            'FFT_Real': np.real(fft_values),
+            'FFT_Imag': np.imag(fft_values),
+            'FFT_Magnitude': np.abs(fft_values),
+            'FFT_Phase': np.angle(fft_values)
+        })
 
-def perform_pca(df: cudf.DataFrame, n_components: int = 5, scaler_type: str = 'standard') -> Optional[cudf.DataFrame]:
+def handle_missing_values(df: pd.DataFrame, strategy: str = 'mean') -> pd.DataFrame:
     """
-    Performs Principal Component Analysis (PCA) on numerical columns with optional scaling.
+    Handle missing values in the DataFrame.
     
-    Args:
-        df (cudf.DataFrame): Input DataFrame.
-        n_components (int, optional): Number of principal components to keep. Defaults to 5.
-        scaler_type (str, optional): Type of scaler to apply ('standard' or 'robust'). Defaults to 'standard'.
-    
-    Returns:
-        Optional[cudf.DataFrame]: DataFrame containing PCA components, or empty DataFrame if no numerical columns are found.
+    :param df: Input pandas DataFrame
+    :param strategy: Strategy to handle missing values (default: 'mean')
+    :return: DataFrame with handled missing values
     """
-    try:
-        num_cols = df.select_dtypes(include=['float64', 'float32']).columns
-        if not num_cols.size:
-            logging.warning("No numerical columns found for PCA.")
-            return cudf.DataFrame()
+    if strategy == 'mean':
+        return df.fillna(df.mean())
+    elif strategy == 'median':
+        return df.fillna(df.median())
+    elif strategy == 'most_frequent':
+        return df.fillna(df.mode().iloc[0])
+    elif strategy == 'drop':
+        return df.dropna()
+    else:
+        logging.error("Invalid strategy for handling missing values. Using default 'mean' strategy.")
+        return df.fillna(df.mean())
 
-        # Select scaler based on scaler_type
-        if scaler_type == 'robust':
-            scaler = RobustScaler()
-        else:
-            scaler = StandardScaler()
-        
-        scaled_data = scaler.fit_transform(df[num_cols])
-        
-        pca = cuPCA(n_components=n_components)
-        pca_result = pca.fit_transform(scaled_data)
-        
-        return cudf.DataFrame(pca_result, columns=[f'PCA_{i+1}' for i in range(n_components)])
-    except Exception as e:
-        logging.error(f"Error in perform_pca: {e}", exc_info=True)
-        raise
+def encode_categorical_variables(df: pd.DataFrame, columns: list) -> pd.DataFrame:
+    """
+    One-Hot encode categorical variables.
+    
+    :param df: Input pandas DataFrame
+    :param columns: List of categorical column names
+    :return: DataFrame with encoded categorical variables
+    """
+    encoder = OneHotEncoder(sparse=False)
+    encoded_data = pd.DataFrame(encoder.fit_transform(df[columns]))
+    encoded_data.columns = encoder.get_feature_names_out(columns)
+    return pd.concat([df.drop(columns, axis=1), encoded_data], axis=1)
+
+def scale_numerical_features(df: pd.DataFrame, columns: list, scaler_type: str = 'standard') -> pd.DataFrame:
+    """
+    Scale/Normalize numerical features.
+    
+    :param df: Input pandas DataFrame
+    :param columns: List of numerical column names
+    :param scaler_type: Type of scaler to use (default: 'standard')
+    :return: DataFrame with scaled numerical features
+    """
+    if scaler_type == 'standard':
+        scaler = StandardScaler()
+    elif scaler_type == 'robust':
+        scaler = RobustScaler()
+    else:
+        logging.error("Invalid scaler type. Using default 'standard' scaler.")
+        scaler = StandardScaler()
+    
+    df[columns] = scaler.fit_transform(df[columns])
+    return df
+
+def apply_fourier_transformation(series: pd.Series) -> pd.DataFrame:
+    """
+    Apply Fourier Transformation to a time series.
+    
+    :param series: Input pandas Series
+    :return: DataFrame with Fourier Transformation features
+    """
+    series = series.dropna()
+    
+    # Use torch.fft on GPU if available
+    if torch.cuda.is_available():
+        fft_values = torch.fft.fft(torch.tensor(series.values, device='cuda:0'))
+        return pd.DataFrame({
+            'FFT_Real': fft_values.real.cpu().numpy(),
+            'FFT_Imag': fft_values.imag.cpu().numpy(),
+            'FFT_Magnitude': torch.abs(fft_values).cpu().numpy(),
+            'FFT_Phase': torch.angle(fft_values).cpu().numpy()
+        })
+    else:
+        fft_values = fft(series.values)
+        return pd.DataFrame({
+            'FFT_Real': np.real(fft_values),
+            'FFT_Imag': np.imag(fft_values),
+            'FFT_Magnitude': np.abs(fft_values),
+            'FFT_Phase': np.angle(fft_values)
+        })
+
+def perform_pca(df: pd.DataFrame, n_components: int = 5, scaler_type: str = 'standard') -> pd.DataFrame:
+    """
+    Apply PCA Transformation to the DataFrame.
+    
+    :param df: Input pandas DataFrame
+    :param n_components: Number of PCA components (default: 5)
+    :param scaler_type: Type of scaler to use (default: 'standard')
+    :return: DataFrame with PCA features
+    """
+    num_cols = df.select_dtypes(include=['number']).columns
+    
+    if not len(num_cols):
+        return pd.DataFrame()
+    
+    df = scale_numerical_features(df, num_cols, scaler_type)
+    
+    pca = PCA(n_components=n_components)
+    pca_result = pca.fit_transform(df[num_cols])
+    return pd.DataFrame(pca_result, columns=[f'PCA_{i+1}' for i in range(n_components)])
+
+def main_data_transformation(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Main data transformation function.
+    
+    :param df: Input pandas DataFrame
+    :return: DataFrame with applied transformations
+    """
+    # Handle missing values
+    df = handle_missing_values(df)
+    
+    # Encode categorical variables
+    categorical_cols = ['column1', 'column2']  # Replace with your categorical column names
+    df = encode_categorical_variables(df, categorical_cols)
+    
+    # Scale numerical features
+    numerical_cols = ['column3', 'column4']  # Replace with your numerical column names
+    df = scale_numerical_features(df, numerical_cols)
+    
+    # Apply Fourier Transformation
+    fourier_features = apply_fourier_transformation(df['time_series_column'])  # Replace with your time series column
+    df = pd.concat([df, fourier_features], axis=1)
+    
+    # Apply PCA Transformation
+    pca_features = perform_pca(df, n_components=5)
+    df = pd.concat([df, pca_features], axis=1)
+    
+    return df

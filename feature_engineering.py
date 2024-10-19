@@ -1,146 +1,155 @@
-# feature_engineering.py
-import cudf
+# feature_engineering.py 
 import ta
-from rolling_utils import calculate_rolling_statistics
+from functools import lru_cache
 import logging
 import pandas as pd
-from typing import Dict
-from functools import lru_cache
+import torch
 import pywt
-from sklearn.manifold import TSNE  # t-SNE is not GPU-accelerated yet
-#from sklearn.preprocessing import MinMaxScaler  # Use scikit-learn for scaling if needed
-from cuml.preprocessing import MinMaxScaler # Use cuML's MinMaxScaler if available
-from cuml.cluster import KMeans as cuKMeans
-from sklearn.cluster import KMeans as skKMeans  # Fallback to scikit-learn's KMeans
+from sklearn.manifold import TSNE
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.cluster import KMeans
 import numpy as np
+from typing import Dict
+from logging_config import setup_logging  # Ensure logging is configured
 
-# Create a dictionary to store indicator functions and their parameters
-indicator_functions: Dict[str, Dict] = {
-    "RSI": {"func": ta.momentum.RSIIndicator, "params": {"window": 14}},
-    "MACD": {"func": ta.trend.MACD, "params": {}},  # MACD has default parameters
-    "BollingerBands": {"func": ta.volatility.BollingerBands, "params": {}},
-    "ATR": {"func": ta.volatility.AverageTrueRange, "params": {"window": 14}},
-    "OBV": {"func": ta.volume.OnBalanceVolumeIndicator, "params": {}},
-    "StochasticOscillator": {"func": ta.momentum.StochasticOscillator, "params": {}},
-    "ADX": {"func": ta.trend.ADXIndicator, "params": {}},
-    "CCI": {"func": ta.trend.CCIIndicator, "params": {}},
-    "EMA": {"func": ta.trend.EMAIndicator, "params": {"window": 12}},
-    # Add other indicators and their parameters as needed
+setup_logging()
+
+# Dictionary of Technical Indicators with their respective parameters
+indicator_functions = {
+    "rsi": {"func": ta.momentum.RSIIndicator, "params": {"window": 14}},
+    "macd": {"func": ta.trend.MACD, "params": {}},
+    "stochastic_oscillator": {"func": ta.momentum.StochasticOscillator, "params": {}},
+    "bollinger_bands": {"func": ta.volatility.BollingerBands, "params": {}},
+    "moving_averages": {"func": ta.volatility.BollingerBands, "params": {"window": 20}},  # Using BB for MA, adjust as needed
+    "adx": {"func": ta.trend.ADXIndicator, "params": {}},
+    "cci": {"func": ta.trend.CCIIndicator, "params": {}},
+    "ema": {"func": None, "params": {"window": 20}},  # Marked for manual calculation
+    "force_index": {"func": ta.volume.ForceIndexIndicator, "params": {"window": 13}},
+    "eom": {"func": ta.volume.EaseOfMovementIndicator, "params": {"window": 14}},
+    "roc": {"func": ta.momentum.ROCIndicator, "params": {"window": 12}},
+    "kama": {"func": ta.momentum.KAMAIndicator, "params": {"window": 10, "pow1": 2, "pow2": 30}},
 }
+
+def calculate_ema(series: pd.Series, window: int = 20) -> pd.Series:
+    return series.ewm(span=window, adjust=False).mean()
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 @lru_cache(maxsize=None)
 def calculate_wavelet_features(series: np.ndarray, wavelet: str = 'db4', level: int = 4) -> np.ndarray:
     """
-    Calculates wavelet features and returns a NumPy array.
+    Calculates wavelet features.
     
-    Args:
-        series (np.ndarray): Input data series as a NumPy array.
-        wavelet (str, optional): Wavelet type. Defaults to 'db4'.
-        level (int, optional): Level of decomposition. Defaults to 4.
-    
-    Returns:
-        np.ndarray: Flattened array containing wavelet coefficients.
+    :param series: Input numpy array
+    :param wavelet: Wavelet type (default: 'db4')
+    :param level: Decomposition level (default: 4)
+    :return: Wavelet features as a numpy array
     """
     try:
-        coeffs = pywt.wavedec(series, wavelet, level=level)
-        # Flatten the coefficients into a single array:
+        if torch.cuda.is_available():
+            tensor = torch.tensor(series, device='cuda:0')
+            coeffs = pywt.wavedec(tensor.cpu().numpy(), wavelet, level=level)
+        else:
+            coeffs = pywt.wavedec(series, wavelet, level=level)
         return np.concatenate(coeffs)
+    
     except Exception as e:
         logging.error(f"Error in calculate_wavelet_features: {e}", exc_info=True)
-        return np.array([])  # Return empty NumPy array if error
+        return np.array([])
 
-def calculate_indicators(df: cudf.DataFrame) -> cudf.DataFrame:
+def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Calculates technical indicators and their rolling statistics, including advanced features.
+    Calculates technical indicators and their rolling statistics.
     
-    Args:
-        df (cudf.DataFrame): Input DataFrame containing 'Close', 'High', 'Low', 'Volume' columns.
-    
-    Returns:
-        cudf.DataFrame: DataFrame with added technical indicators and their rolling statistics.
+    :param df: Input pandas DataFrame
+    :return: DataFrame with technical indicators
     """
-    try:
-        # 1. Convert to Pandas for compatibility with `ta` and other non-cuDF operations
-        df_pandas = df.to_pandas()
-        close_numpy = df_pandas['Close'].values  # Get NumPy array for Wavelet and t-SNE
+    close = df['Close']
+    high = df['High']
+    low = df['Low']
+    volume = df['Volume']
 
-        close = df_pandas['Close']
-        high = df_pandas['High']
-        low = df_pandas['Low']
-        volume = df_pandas['Volume']
+    calculated_indicators = {}
+    for name, indicator_data in indicator_functions.items():
+        if indicator_data["func"] is not None:
+            indicator = indicator_data["func"](high=high, low=low, close=close, volume=volume, **indicator_data["params"])
+            calculated_indicators[name] = getattr(indicator, name, None)
+        elif name == "ema":  # Manual EMA calculation
+            calculated_indicators[name] = calculate_ema(close, window=indicator_functions[name]["params"]["window"])
 
-        calculated_indicators = {}  # Store the calculated indicators
-        for name, indicator_data in indicator_functions.items():
-            indicator_func = indicator_data["func"]
-            params = indicator_data["params"]
-            # Apply the indicator function
-            indicator = indicator_func(high=high, low=low, close=close, volume=volume, **params)
-            
-            # Get the primary indicator value
-            try:
-                main_indicator_value = getattr(indicator, name.lower())  # Try to get the attribute by lowercase name
-            except AttributeError:
-                main_indicator_value = getattr(indicator, name)  # If lowercase fails, try original name
-            
-            calculated_indicators[name] = main_indicator_value
+    # Assign calculated indicators to the DataFrame
+    for name, value in calculated_indicators.items():
+        if value is not None:
+            df[name] = value
 
-        # 2. Wavelet Transforms
-        close_wavelet_features = calculate_wavelet_features(close_numpy)
-        if close_wavelet_features.size > 0:
-            wavelet_columns = [f'wavelet_{i}' for i in range(close_wavelet_features.size)]
-            df_pandas = pd.concat([df_pandas, pd.DataFrame(close_wavelet_features.reshape(1, -1), columns=wavelet_columns)], axis=1)  # Reshape and add to DataFrame
-        else:
-            logging.warning("Wavelet features calculation returned empty array.")
+    # Rolling Statistics (optimized)
+    core_features = [
+        feature for feature in [
+            'Close', 'Volume', 'RSI', 'MACD', 'BollingerBands', 'ATR', 'OBV',
+            'StochasticOscillator', 'ADX', 'CCI', 'EMA', 'Cluster', 'TSNE1', 'TSNE2'
+        ] if feature in df.columns
+    ]  # Adding conditional to prevent errors
 
-        # 3. Clustering (using cuML KMeans if available, otherwise fallback to scikit-learn)
-        try:  # Prefer cuML if available
-            kmeans = cuKMeans(n_clusters=5, random_state=42)
-            df['Cluster'] = kmeans.fit_predict(df[['Close', 'Volume']].astype('float32'))  # cuML prefers float32
-        except Exception as e:  # Fallback to scikit-learn if cuML fails
-            logging.warning(f"cuML KMeans failed. Falling back to scikit-learn: {e}")
-            kmeans = skKMeans(n_clusters=5, random_state=42)
-            df_pandas['Cluster'] = kmeans.fit_predict(df_pandas[['Close', 'Volume']].fillna(0).values)
+    for window in [3, 7, 14, 21]:
+        rolled = df[core_features].rolling(window)
+        df = df.join(rolled.agg(['mean','std','min','max']).add_prefix(f'rolling{window}_'))  # More efficient rolling
 
-        # 4. t-SNE Embeddings (Dimensionality reduction)
-        tsne = TSNE(n_components=2, random_state=42, learning_rate='auto', init='random', n_jobs=-1)  # Add n_jobs for parallelization
-        tsne_embeddings = tsne.fit_transform(close_numpy.reshape(-1, 1))  # Reshape for single feature
-        df_pandas[['TSNE1', 'TSNE2']] = tsne_embeddings
+    scaler = MinMaxScaler()
+    df[core_features] = scaler.fit_transform(df[core_features].fillna(0))
 
-        # Convert back to cuDF before Fourier transforms and other cuDF operations
-        df = cudf.from_pandas(df_pandas)
+    return df
 
-        # 8. Fourier Transforms
-        fft_features = calculate_fft(df['Close'].fillna(0))
-        df = df.merge(fft_features, left_index=True, right_index=True, how='outer')
+def calculate_tsne_features(df: pd.DataFrame, n_components: int = 2, perplexity: int = 30) -> pd.DataFrame:
+    """
+    Calculates t-SNE features.
+    
+    :param df: Input pandas DataFrame
+    :param n_components: Number of t-SNE components (default: 2)
+    :param perplexity: t-SNE perplexity (default: 30)
+    :return: DataFrame with t-SNE features
+    """
+    tsne = TSNE(n_components=n_components, perplexity=perplexity)
+    tsne_features = tsne.fit_transform(df)
+    tsne_df = pd.DataFrame(tsne_features, columns=[f'TSNE_{i+1}' for i in range(n_components)])
+    return tsne_df
 
-        # 5. Rolling Statistics
-        # Define core features including new advanced features
-        core_features = ['Close', 'Volume', 'RSI', 'MACD', 'BollingerBands', 'ATR', 'OBV',
-                         'StochasticOscillator', 'ADX', 'CCI', 'EMA',
-                         'Cluster', 'TSNE1', 'TSNE2'] + wavelet_columns
+def calculate_kmeans_features(df: pd.DataFrame, n_clusters: int = 5) -> pd.DataFrame:
+    """
+    Calculates K-Means clustering features.
+    
+    :param df: Input pandas DataFrame
+    :param n_clusters: Number of K-Means clusters (default: 5)
+    :return: DataFrame with K-Means cluster labels
+    """
+    kmeans = KMeans(n_clusters=n_clusters)
+    cluster_labels = kmeans.fit_predict(df)
+    cluster_df = pd.DataFrame(cluster_labels, columns=['Cluster'])
+    return cluster_df
 
-        for feature in core_features:
-            if feature in df.columns:
-                for window in [3, 7, 14, 21]:  # Defined rolling windows
-                    rolling_stats = calculate_rolling_statistics(df[feature], window)
-                    rolling_stats = rolling_stats.add_prefix(f'{feature}_rolling{window}_')
-                    df = df.join(rolling_stats)
-            else:
-                logging.warning(f"Feature '{feature}' not found in DataFrame for rolling statistics.")
-
-        # 6. Feature Scaling using cuML MinMaxScaler if available, fallback to scikit-learn
-        try:
-            scaler = MinMaxScaler()
-            df[core_features] = scaler.fit_transform(df[core_features].astype("float32"))  # Use cuML MinMaxScaler
-        except Exception as e:
-            logging.warning(f"cuML MinMaxScaler failed, falling back to scikit-learn MinMaxScaler: {e}")
-            df_pandas = df.to_pandas()
-            scaler = MinMaxScaler()  # Using scikit-learn
-            df_pandas[core_features] = scaler.fit_transform(df_pandas[core_features].fillna(0))
-            df = cudf.from_pandas(df_pandas)  # Convert back
-
-        return df
-
-    except Exception as e:
-        logging.error(f"Error in calculate_indicators: {e}", exc_info=True)
-        raise
+def main_feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Main feature engineering function.
+    
+    :param df: Input pandas DataFrame
+    :return: DataFrame with engineered features
+    """
+    # Calculate technical indicators
+    df = calculate_indicators(df)
+    
+    # Calculate wavelet features
+    close_numpy = df['Close'].values
+    close_wavelet_features = calculate_wavelet_features(close_numpy)
+    
+    if close_wavelet_features.size > 0:
+        wavelet_columns = [f'wavelet_{i}' for i in range(close_wavelet_features.size)]
+        df = pd.concat([df, pd.DataFrame(close_wavelet_features.reshape(1, -1), columns=wavelet_columns)], axis=1)
+    
+    # Calculate t-SNE features
+    tsne_features = calculate_tsne_features(df)
+    df = pd.concat([df, tsne_features], axis=1)
+    
+    # Calculate K-Means clustering features
+    cluster_features = calculate_kmeans_features(df)
+    df = pd.concat([df, cluster_features], axis=1)
+    
+    return df
