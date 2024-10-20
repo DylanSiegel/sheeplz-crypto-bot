@@ -4,259 +4,699 @@
     - feature_engineering.py
     - logging_config.py
     - main.py
+    - test_program.py
+  data\raw
+    - btc_15m_data_2018_to_2024-2024-10-10.csv
+    - btc_1d_data_2018_to_2024-2024-10-10.csv
+    - btc_1h_data_2018_to_2024-2024-10-10.csv
+    - btc_4h_data_2018_to_2024-2024-10-10.csv
 // File: data_transformation.py
-# data_transformation.py
 import pandas as pd
 import numpy as np
 import torch
-import pywt
 from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.preprocessing import StandardScaler, RobustScaler, OneHotEncoder
 from scipy.fft import fft
 import logging
-from typing import Optional
+from logging_config import get_logger
 
-# Set logging configuration
-# Moved to logging_config.py
-from logging_config import setup_logging
-
-# Setup logging
-setup_logging()
+logger = get_logger(__name__)
 
 def calculate_fft(series: pd.Series) -> pd.DataFrame:
-    """Calculates FFT features, handling NaN/infinite values."""
+    """
+    Calculates FFT features on a Pandas Series.
+
+    Args:
+        series: The input Pandas Series.
+
+    Returns:
+        A DataFrame with FFT features. Returns an empty DataFrame if the input series is empty after handling NaNs.
+    """
     series = series.dropna()
-    fft_values = fft(series.values)
-    return pd.DataFrame({
-        'FFT_Real': np.real(fft_values),
-        'FFT_Imag': np.imag(fft_values),
-        'FFT_Magnitude': np.abs(fft_values),
-        'FFT_Phase': np.angle(fft_values)
-    })
+    if series.empty:  
+        return pd.DataFrame()
 
-def perform_pca(df: pd.DataFrame, n_components: int = 5, scaler_type: str = 'standard') -> pd.DataFrame:
-    """Performs PCA on numerical columns with optional scaling."""
-    num_cols = df.select_dtypes(include=['number']).columns  # Use 'number' for broader type selection
+    if torch.cuda.is_available():
+        fft_values = torch.fft.fft(torch.tensor(series.values, device='cuda:0', dtype=torch.float32))
+        return pd.DataFrame({
+            'FFT_Real': fft_values.real.cpu().numpy(),
+            'FFT_Imag': fft_values.imag.cpu().numpy(),
+            'FFT_Magnitude': torch.abs(fft_values).cpu().numpy(),
+            'FFT_Phase': torch.angle(fft_values).cpu().numpy()
+        })
+    else:
+        fft_values = fft(series.values)
+        return pd.DataFrame({
+            'FFT_Real': np.real(fft_values),
+            'FFT_Imag': np.imag(fft_values),
+            'FFT_Magnitude': np.abs(fft_values),
+            'FFT_Phase': np.angle(fft_values)
+        })
+
+def handle_missing_values(df: pd.DataFrame, strategy: str ='median') -> pd.DataFrame:
+    """
+    Handles missing values in a DataFrame.
+
+    Args:
+        df: The input DataFrame.
+        strategy: The strategy to use for filling missing values ('mean','median','most_frequent', 'drop').
+
+    Returns:
+        DataFrame with missing values handled.
+    """
+    numeric_df = df.select_dtypes(include=np.number)
+    if strategy =='mean':
+        df.loc[:, numeric_df.columns] = numeric_df.fillna(numeric_df.mean())
+    elif strategy =='median':
+        df.loc[:, numeric_df.columns] = numeric_df.fillna(numeric_df.median())
+    elif strategy =='most_frequent':
+        df.loc[:, numeric_df.columns] = numeric_df.fillna(numeric_df.mode().iloc[0])
+    elif strategy == 'drop':
+        df = df.dropna()  
+    else:
+        logger.error(f"Invalid strategy: {strategy}. Using'mean'.")
+        df.loc[:, numeric_df.columns] = numeric_df.fillna(numeric_df.mean())
+    return df
+
+def encode_categorical_variables(df: pd.DataFrame, columns: list) -> pd.DataFrame:
+    """
+    One-hot encodes categorical variables.
+
+    Args:
+        df: The input DataFrame.
+        columns: A list of categorical column names.
+
+    Returns:
+        DataFrame with categorical variables one-hot encoded.
+    """
+    encoder = OneHotEncoder(handle_unknown='ignore', sparse_output=False)  
+    encoded_data = pd.DataFrame(encoder.fit_transform(df[columns]))
+    encoded_data.columns = encoder.get_feature_names_out(columns)
+    return pd.concat([df.drop(columns, axis=1), encoded_data], axis=1)
+
+def scale_numerical_features(df: pd.DataFrame, columns: list, scaler_type: str ='standard') -> pd.DataFrame:
+    """
+    Scales numerical features.
+
+    Args:
+        df: The input DataFrame.
+        columns: A list of numerical column names.
+        scaler_type: Type of scaler to use ('standard', 'robust').
+
+    Returns:
+        DataFrame with scaled numerical features.
+    """
+    if scaler_type =='standard':
+        scaler = StandardScaler()
+    elif scaler_type == 'robust':
+        scaler = RobustScaler()
+    else:
+        logger.error(f"Invalid scaler type: {scaler_type}. Using'standard'.")
+        scaler = StandardScaler()
+    df.loc[:, columns] = scaler.fit_transform(df[columns])
+    return df
+
+def apply_fourier_transformation(series: pd.Series) -> pd.DataFrame:
+    """
+    Applies Fourier transformation.
+
+    Args:
+        series: The input series.
+
+    Returns:
+        DataFrame with Fourier transformation applied.
+    """
+    if not isinstance(series, pd.Series):
+        raise ValueError("Input must be a Pandas Series")
+    return calculate_fft(series)
+
+def perform_pca(df: pd.DataFrame, n_components: int = 5, scaler_type: str ='standard') -> pd.DataFrame:
+    """
+    Performs Principal Component Analysis (PCA) on the input DataFrame.
+
+    Args:
+        df (pd.DataFrame): Input DataFrame.
+        n_components (int, optional): Number of PCA components. Defaults to 5.
+        scaler_type (str, optional): Type of scaler to use before PCA ('standard', 'robust'). Defaults to'standard'.
+
+    Returns:
+        pd.DataFrame: DataFrame with PCA applied.
+    """
+    num_cols = df.select_dtypes(include=['number']).columns
     if not len(num_cols):
-        return pd.DataFrame()  # Return empty DataFrame if no numerical columns
-
-    scaler = RobustScaler() if scaler_type == 'robust' else StandardScaler()
-    scaled_data = scaler.fit_transform(df[num_cols])
-
-    pca = PCA(n_components=n_components)
-    pca_result = pca.fit_transform(scaled_data)
+        return pd.DataFrame()
     
+    df.loc[:, num_cols] = scale_numerical_features(df[num_cols], num_cols.to_list(), scaler_type)  
+
+    n_components = min(n_components, len(num_cols), len(df))  
+    pca = PCA(n_components=n_components)
+    pca_result = pca.fit_transform(df[num_cols])
     return pd.DataFrame(pca_result, columns=[f'PCA_{i+1}' for i in range(n_components)])
 
+def main_data_transformation(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Main data transformation pipeline.
+
+    Args:
+        df: Input DataFrame.
+
+    Returns:
+        Transformed DataFrame.
+    """
+    df = handle_missing_values(df)
+
+    categorical_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
+    if categorical_cols:
+        df = encode_categorical_variables(df, categorical_cols)
+
+    numerical_cols = df.select_dtypes(include=np.number).columns.tolist()
+    if numerical_cols:
+        df = scale_numerical_features(df, numerical_cols)
+
+    if 'time_series_column' in df.columns:
+        fourier_features = apply_fourier_transformation(df['time_series_column'])
+        if not fourier_features.empty:  
+            df = pd.concat([df, fourier_features], axis=1)
+
+    pca_features = perform_pca(df, n_components=5)
+    if not pca_features.empty:  
+        df = pd.concat([df, pca_features], axis=1)
+    
+    return df
 
 // File: feature_engineering.py
-# feature_engineering.py
+import pandas as pd
+import numpy as np
+import torch
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler, RobustScaler, OneHotEncoder
+from scipy.fft import fft
+import logging
+from logging_config import get_logger
 import ta
 from functools import lru_cache
-import logging
-import pandas as pd
-import torch
 import pywt
 from sklearn.manifold import TSNE
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.cluster import KMeans
-import numpy as np
 from typing import Dict
-
-# logging config moved to logging_config.py
 from logging_config import setup_logging
 
-# Setup logging
 setup_logging()
 
-indicator_functions = {  # Use lowercase keys for consistency
-    "rsi": {"func": ta.momentum.RSIIndicator, "params": {"window": 14}},
-    "macd": {"func": ta.trend.MACD, "params": {}},
-    # ... (rest of the indicators)
-}
+logger = get_logger(__name__)
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+def calculate_fft(series: pd.Series) -> pd.DataFrame:
+    """
+    Calculates FFT features on a Pandas Series.
 
-@lru_cache(maxsize=None)
+    Args:
+        series: The input Pandas Series.
+
+    Returns:
+        A DataFrame with FFT features. Returns an empty DataFrame if the input series is empty after handling NaNs.
+    """
+    series = series.dropna()
+    if series.empty:  
+        return pd.DataFrame()
+
+    if torch.cuda.is_available():
+        fft_values = torch.fft.fft(torch.tensor(series.values, device='cuda:0', dtype=torch.float32))
+        return pd.DataFrame({
+            'FFT_Real': fft_values.real.cpu().numpy(),
+            'FFT_Imag': fft_values.imag.cpu().numpy(),
+            'FFT_Magnitude': torch.abs(fft_values).cpu().numpy(),
+            'FFT_Phase': torch.angle(fft_values).cpu().numpy()
+        })
+    else:
+        fft_values = fft(series.values)
+        return pd.DataFrame({
+            'FFT_Real': np.real(fft_values),
+            'FFT_Imag': np.imag(fft_values),
+            'FFT_Magnitude': np.abs(fft_values),
+            'FFT_Phase': np.angle(fft_values)
+        })
+
+def handle_missing_values(df: pd.DataFrame, strategy: str ='median') -> pd.DataFrame:
+    """
+    Handles missing values in a DataFrame.
+
+    Args:
+        df: The input DataFrame.
+        strategy: The strategy to use for filling missing values ('mean','median','most_frequent', 'drop').
+
+    Returns:
+        DataFrame with missing values handled.
+    """
+    numeric_df = df.select_dtypes(include=np.number)
+    if strategy =='mean':
+        df.loc[:, numeric_df.columns] = numeric_df.fillna(numeric_df.mean())
+    elif strategy =='median':
+        df.loc[:, numeric_df.columns] = numeric_df.fillna(numeric_df.median())
+    elif strategy =='most_frequent':
+        df.loc[:, numeric_df.columns] = numeric_df.fillna(numeric_df.mode().iloc[0])
+    elif strategy == 'drop':
+        df = df.dropna()  
+    else:
+        logger.error(f"Invalid strategy: {strategy}. Using'mean'.")
+        df.loc[:, numeric_df.columns] = numeric_df.fillna(numeric_df.mean())
+    return df
+
+def encode_categorical_variables(df: pd.DataFrame, columns: list) -> pd.DataFrame:
+    """
+    One-hot encodes categorical variables.
+
+    Args:
+        df: The input DataFrame.
+        columns: A list of categorical column names.
+
+    Returns:
+        DataFrame with categorical variables one-hot encoded.
+    """
+    encoder = OneHotEncoder(handle_unknown='ignore', sparse_output=False)  
+    encoded_data = pd.DataFrame(encoder.fit_transform(df[columns]))
+    encoded_data.columns = encoder.get_feature_names_out(columns)
+    return pd.concat([df.drop(columns, axis=1), encoded_data], axis=1)
+
+def scale_numerical_features(df: pd.DataFrame, columns: list, scaler_type: str ='standard') -> pd.DataFrame:
+    """
+    Scales numerical features.
+
+    Args:
+        df: The input DataFrame.
+        columns: A list of numerical column names.
+        scaler_type: Type of scaler to use ('standard', 'robust').
+
+    Returns:
+        DataFrame with scaled numerical features.
+    """
+    if scaler_type =='standard':
+        scaler = StandardScaler()
+    elif scaler_type == 'robust':
+        scaler = RobustScaler()
+    else:
+        logger.error(f"Invalid scaler type: {scaler_type}. Using'standard'.")
+        scaler = StandardScaler()
+    df.loc[:, columns] = scaler.fit_transform(df[columns])
+    return df
+
+def apply_fourier_transformation(series: pd.Series) -> pd.DataFrame:
+    """
+    Applies Fourier transformation.
+
+    Args:
+        series: The input series.
+
+    Returns:
+        DataFrame with Fourier transformation applied.
+    """
+    if not isinstance(series, pd.Series):
+        raise ValueError("Input must be a Pandas Series")
+    return calculate_fft(series)
+
+def perform_pca(df: pd.DataFrame, n_components: int = 5, scaler_type: str ='standard') -> pd.DataFrame:
+    """
+    Performs Principal Component Analysis (PCA) on the input DataFrame.
+
+    Args:
+        df (pd.DataFrame): Input DataFrame.
+        n_components (int, optional): Number of PCA components. Defaults to 5.
+        scaler_type (str, optional): Type of scaler to use before PCA ('standard', 'robust'). Defaults to'standard'.
+
+    Returns:
+        pd.DataFrame: DataFrame with PCA applied.
+    """
+    num_cols = df.select_dtypes(include=['number']).columns
+    if not len(num_cols):
+        return pd.DataFrame()
+    
+    df.loc[:, num_cols] = scale_numerical_features(df[num_cols], num_cols.to_list(), scaler_type)  
+
+    n_components = min(n_components, len(num_cols), len(df))  
+    pca = PCA(n_components=n_components)
+    pca_result = pca.fit_transform(df[num_cols])
+    return pd.DataFrame(pca_result, columns=[f'PCA_{i+1}' for i in range(n_components)])
+
+def calculate_ema(series: pd.Series, window: int = 20) -> pd.Series:
+    return series.ewm(span=window, adjust=False).mean()
+
 def calculate_wavelet_features(series: np.ndarray, wavelet: str = 'db4', level: int = 4) -> np.ndarray:
-    """Calculates wavelet features and returns a NumPy array."""
+    """
+    Calculates wavelet features for the input series.
+
+    Args:
+        series (np.ndarray): Input numpy array.
+        wavelet (str, optional): Wavelet type. Defaults to 'db4'.
+        level (int, optional): Decomposition level. Defaults to 4.
+
+    Returns:
+        np.ndarray: Wavelet features.
+    """
+    key = tuple(series)
+    if key in calculate_wavelet_features.cache:
+        return calculate_wavelet_features.cache[key]
+
     try:
-        tensor = torch.tensor(series, device=device)
-        coeffs = pywt.wavedec(tensor.cpu().numpy(), wavelet, level=level)  # Move back to CPU for pywt
-        return np.concatenate(coeffs)
+        coeffs = pywt.wavedec(series, wavelet, level=level)
+        result = np.concatenate(coeffs)
     except Exception as e:
         logging.error(f"Error in calculate_wavelet_features: {e}", exc_info=True)
-        return np.array([])
+        result = np.array([])
+
+    calculate_wavelet_features.cache[key] = result
+    return result
+
+calculate_wavelet_features.cache = {}
 
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculates technical indicators and their rolling statistics."""
+    """
+    Calculates technical indicators and their rolling statistics.
+    
+    :param df: Input pandas DataFrame
+    :return: DataFrame with technical indicators
+    """
+    try:
+        close = df['Close']
+        high = df['High']
+        low = df['Low']
+        volume = df['Volume']
 
-    close = df['Close']
-    high = df['High']
-    low = df['Low']
-    volume = df['Volume']
+        for name, indicator_data in indicator_functions.items():
+            try:
+                if indicator_data["func"] is not None:
+                    if name == "ema":
+                        df[name] = calculate_ema(close, window=indicator_data["params"]["window"])
+                    elif hasattr(ta, "volume") and "volume" in name.lower():
+                        indicator = indicator_data["func"](close=close, high=high, low=low, volume=volume, **indicator_data["params"])
+                    elif hasattr(ta, "momentum") and "momentum" in name.lower():
+                        indicator = indicator_data["func"](close=close, **indicator_data["params"])
+                    else:
+                        indicator = indicator_data["func"](high=high, low=low, close=close, **indicator_data["params"])
+                        
+                    if hasattr(indicator, 'notna') and indicator.notna().all():
+                        df[name] = indicator
+            except Exception as e:
+                logging.error(f"Error calculating {name}: {e}", exc_info=True)
+        
+        # Normalize core features using MinMaxScaler
+        core_features = df.columns.difference(['Open', 'High', 'Low', 'Close', 'Volume'])
+        scaler = MinMaxScaler()
+        df[core_features] = scaler.fit_transform(df[core_features].fillna(df[core_features].median()))
 
-    calculated_indicators = {}
-    for name, indicator_data in indicator_functions.items():
-        indicator = indicator_data["func"](high=high, low=low, close=close, volume=volume, **indicator_data["params"])
-        calculated_indicators[name] = getattr(indicator, name, None)  # Simplified attribute access
+        return df
+    except Exception as e:
+        logger.error(f"Error calculating indicators: {e}", exc_info=True)
+        raise
 
-    if calculated_indicators["rsi"] is not None:
-        df['RSI'] = calculated_indicators['rsi']
-    if calculated_indicators["macd"] is not None:
-        df['MACD'] = calculated_indicators["macd"].macd()  # added .macd()
-    # Add other indicators if not None
+def calculate_rolling_features(df: pd.DataFrame, windows: list = [3, 7, 14, 21]) -> pd.DataFrame:
+    """
+    Calculates rolling features over given windows
+    
+    :param df: Input pandas DataFrame
+    :param windows: List of rolling windows
+    :return: DataFrame with rolling statistics features
+    """
+    core_features = df.columns.difference(['Open', 'High', 'Low', 'Close', 'Volume'])
+    
+    for window in windows:
+        rolled = df[core_features].rolling(window=window)
+        df[[f"{col}_mean_{window}" for col in core_features]] = rolled.mean()
+        df[[f"{col}_std_{window}" for col in core_features]] = rolled.std()
+        df[[f"{col}_min_{window}" for col in core_features]] = rolled.min()
+        df[[f"{col}_max_{window}" for col in core_features]] = rolled.max()
 
-    # Rolling Statistics (optimized)
-    core_features = [
-        feature for feature in [
-            'Close', 'Volume', 'RSI', 'MACD', 'BollingerBands', 'ATR', 'OBV',
-            'StochasticOscillator', 'ADX', 'CCI', 'EMA', 'Cluster', 'TSNE1', 'TSNE2'
-        ] if feature in df.columns
-    ]  # adding conditional to prevent errors
+    return df
 
-    for window in [3, 7, 14, 21]:
-        rolled = df[core_features].rolling(window)
-        df = df.join(rolled.agg(['mean', 'std', 'min', 'max']).add_prefix(f'rolling{window}_'))  # More efficient rolling
+def calculate_tsne_features(df: pd.DataFrame, n_components: int = 2, perplexity: int = 5) -> pd.DataFrame:
+    """
+    Calculates t-SNE features.
+    
+    :param df: Input pandas DataFrame
+    :param n_components: Number of t-SNE components (default: 2)
+    :param perplexity: t-SNE perplexity (default: 5)
+    :return: DataFrame with t-SNE features
+    """
+    tsne = TSNE(n_components=n_components, perplexity=min(perplexity, len(df)-1))
+    tsne_features = tsne.fit_transform(df)
+    tsne_df = pd.DataFrame(tsne_features, columns=[f'TSNE_{i+1}' for i in range(n_components)])
+    return tsne_df
 
-    scaler = MinMaxScaler()
-    df[core_features] = scaler.fit_transform(df[core_features].fillna(0))
+def calculate_kmeans_features(df: pd.DataFrame, n_clusters: int = 5) -> pd.DataFrame:
+    """
+    Calculates K-Means clustering features.
+    
+    :param df: Input pandas DataFrame
+    :param n_clusters: Number of K-Means clusters (default: 5)
+    :return: DataFrame with K-Means cluster labels
+    """
+    kmeans = KMeans(n_clusters=n_clusters)
+    cluster_labels = kmeans.fit_predict(df)
+    cluster_df = pd.DataFrame(cluster_labels, columns=['Cluster'])
+    return cluster_df
 
+def main_feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Main feature engineering function.
+    
+    :param df: Input pandas DataFrame
+    :return: DataFrame with engineered features
+    """
+    df = calculate_indicators(df)
+    
+    df = calculate_rolling_features(df)
+    
+    close_numpy = df['Close'].values
+    close_wavelet_features = calculate_wavelet_features(close_numpy)
+    
+    if close_wavelet_features.size > 0:
+        wavelet_columns = [f'wavelet_{i}' for i in range(close_wavelet_features.size)]
+        df = pd.concat([df, pd.DataFrame(close_wavelet_features.reshape(1, -1), columns=wavelet_columns)], axis=1)
+    
+    tsne_features = calculate_tsne_features(df)
+    df = pd.concat([df, tsne_features], axis=1)
+    
+    cluster_features = calculate_kmeans_features(df)
+    df = pd.concat([df, cluster_features], axis=1)
+    
+    return df
+
+def main_data_transformation(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Main data transformation pipeline.
+
+    Args:
+        df: Input DataFrame.
+
+    Returns:
+        Transformed DataFrame.
+    """
+    df = handle_missing_values(df)
+
+    categorical_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
+    if categorical_cols:
+        df = encode_categorical_variables(df, categorical_cols)
+
+    numerical_cols = df.select_dtypes(include=np.number).columns.tolist()
+    if numerical_cols:
+        df = scale_numerical_features(df, numerical_cols)
+
+    if 'time_series_column' in df.columns:
+        fourier_features = apply_fourier_transformation(df['time_series_column'])
+        if not fourier_features.empty:  
+            df = pd.concat([df, fourier_features], axis=1)
+
+    pca_features = perform_pca(df, n_components=5)
+    if not pca_features.empty:  
+        df = pd.concat([df, pca_features], axis=1)
+    
     return df
 
 
 // File: logging_config.py
 # logging_config.py
+import loguru
+import sys
 
-import logging
+logger = loguru.logger
 
-def setup_logging(log_file: str = 'data_processing.log') -> None:
-    """
-    Configures the logging settings for the application.
-    
-    Args:
-        log_file (str): Path to the log file. Defaults to 'data_processing.log'.
-    """
-    logging.basicConfig(
-        filename=log_file,
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        filemode='a'  # Append mode to avoid overwriting existing logs
-    )
+# --- CHANGE --- Updated logging configuration
+logger.remove(0)  # Remove default handler
+logger.add(sys.stderr, format="{time:MMMM D, YYYY at HH:mm:ss!UTC} | {level} | {message}")
+logger.add("data_processing.log", rotation="1 day", compression="zip", format="{time:MMMM D, YYYY at HH:mm:ss!UTC} | {level} | {message}")
+
+def setup_logging():
+    # --- CHANGE --- No need for setup with Loguru
+    pass
+
+def get_logger(name: str) -> loguru.logger:
+    return logger
 
 
 // File: main.py
-# main.py
 import time
 import logging
-from logging_config import setup_logging  # Import the setup_logging function
+from logging_config import get_logger
 import glob
 import os
 import dask.dataframe as dd
 from dask.distributed import Client, LocalCluster
-import pandas as pd  # Import pandas
-from data_transformation import calculate_fft, perform_pca
-from feature_engineering import calculate_indicators
+import pandas as pd
+from data_transformation import main_data_transformation  
+from feature_engineering import main_feature_engineering  
 
-
+logger = get_logger(__name__)
 
 def process_chunk(chunk):
+    """
+    Process a chunk of data.
+    
+    :param chunk: List of file paths
+    :return: Processed pandas DataFrame
+    """
     try:
-        # Use dask.dataframe to read CSV files
-        df = dd.read_csv(chunk).compute()  # compute to pandas df
-        df = pd.DataFrame(df)  # Convert to DataFrame
+        ddf = dd.read_csv(chunk)
+        df = ddf.compute()  
+        
+        df = main_data_transformation(df)
 
-        # Calculate technical indicators
-        df = calculate_indicators(df.to_pandas())  # Convert back to pandas for feature engineering
-        df = pd.DataFrame(df)  # Convert back to DataFrame
-
-        # Perform FFT
-        fft_features = calculate_fft(df['Close'])
-        df = df.join(fft_features)
-
-        # Perform PCA
-        pca_result = perform_pca(df, n_components=5)
-        df = df.join(pd.DataFrame(pca_result))
+        df = main_feature_engineering(df)
 
         return df
     except FileNotFoundError:
-        logging.error(f"Error: One or more files in the chunk not found: {chunk}")
-        return pd.DataFrame()  # Return empty DataFrame in case of error
+        logger.error(f"File not found: {chunk}")
+        return pd.DataFrame()
     except Exception as e:
-        logging.error(f"Error processing chunk {chunk}: {e}")
+        logger.error(f"Error processing chunk: {e}", exc_info=True)
         return pd.DataFrame()
 
-
-def optimize_dataframe(df):
-    # Example optimization: drop unnecessary columns and convert data types
-    df = df.dropna()  # Drop rows with NaN values
-    df = df.astype({col: 'float32' for col in df.columns if df[col].dtype == 'float64'})  # Convert float64 to float32
-    return df
-
-
 def validate_dataframe(df):
-    # Example validation: ensure no NaN values and required columns exist
-    required_columns = ['Close', 'Volume', 'RSI', 'MACD']
-    for col in required_columns:
-        if col not in df.columns or df[col].isnull().any():
-            logging.error(f"Validation failed: Missing or NaN values in column {col}")
-            return False
+    """
+    Validate the processed DataFrame.
+    
+    :param df: Input pandas DataFrame
+    :return: Boolean indicating validation success
+    """
+    required_columns = ['Close', 'Volume', 'RSI', 'MACD', 'PCA_1', 'TSNE_1', 'Cluster']
+    
+    if not all(col in df.columns for col in required_columns):
+        missing_cols = [col for col in required_columns if col not in df.columns]
+        logger.error(f"Missing columns: {missing_cols}")
+        return False
+    if df[required_columns].isnull().values.any():
+        logger.error(f"NaN values present in required columns.")
+        return False
     return True
 
-
 def main():
-    setup_logging()
+    get_logger()
     start_time = time.time()
 
     try:
-        cluster = LocalCluster(n_workers=min(8, os.cpu_count()), threads_per_worker=2, processes=True, memory_limit='16GB')
-        client = Client(cluster)  # Connect to the cluster
-        logging.info("Dask cluster initialized.")
+        cluster = LocalCluster(n_workers=min(12, os.cpu_count()),  
+                               threads_per_worker=2,  
+                               processes=True,  
+                               memory_limit='16GB')  
+        client = Client(cluster)  
+        logger.info("Dask cluster initialized.")
 
         RAW_DATA_PATH = r"C:\Users\dylan\Desktop\DATA-LAKE\data\raw\*.csv"
         PROCESSED_DATA_PATH = r"C:\Users\dylan\Desktop\DATA-LAKE\data\processed\btc_merged_advanced_features.parquet"
 
         file_paths = glob.glob(RAW_DATA_PATH)
-        output_path = PROCESSED_DATA_PATH
-
-        # Process and write data in chunks
-        chunk_size = 1000  # Increased chunk size for better efficiency
+        chunk_size = 1000  
         for i in range(0, len(file_paths), chunk_size):
             chunk = file_paths[i:i + chunk_size]
 
-            # Using dask.dataframe for efficient CSV reading
             futures = client.map(process_chunk, chunk)
             dfs = client.gather(futures)
-            dfs = [df for df in dfs if not df.empty]  # Prevent errors
-            if len(dfs) > 0:  # Prevent errors
+            dfs = [df for df in dfs if not df.empty]  
+            
+            if len(dfs) > 0:
                 combined = pd.concat(dfs, ignore_index=True)
-
-                # Optimize DataFrame
-                combined = optimize_dataframe(combined)
-
-                # Validate DataFrame
-                if validate_dataframe(combined.to_pandas()):
-                    combined.to_parquet(output_path, engine='pyarrow', compression='snappy', append=os.path.exists(output_path))
-                    logging.info(f"Processed and written chunk {i // chunk_size + 1} of {len(file_paths) // chunk_size + 1}")
+                
+                if validate_dataframe(combined):
+                    combined.to_parquet(PROCESSED_DATA_PATH, engine='pyarrow', compression='snappy', append=os.path.exists(PROCESSED_DATA_PATH))
+                    logger.info(f"Processed and written chunk {i // chunk_size + 1} of {len(file_paths) // chunk_size + 1}")
                 else:
-                    logging.error(f"Validation failed for chunk {i // chunk_size + 1}")
+                    logger.error(f"Validation failed for chunk {i // chunk_size + 1}")
 
     except Exception as e:
-        logging.error(f"Error in main processing loop: {e}", exc_info=True)
+        logger.error(f"Error in main processing loop: {e}", exc_info=True)
     finally:
         try:
             client.close()
-            cluster.close()  # Close the cluster as well.
-            logging.info("Dask cluster and client closed.")
+            cluster.close()  
+            logger.info("Dask cluster and client closed.")
         except:
-            logging.warning("Dask client/cluster was not initialized or already closed.")
+            logger.warning("Dask client/cluster was not initialized or already closed.")
 
     end_time = time.time()
     elapsed_time = end_time - start_time
-    logging.info(f"Total processing time: {elapsed_time:.2f} seconds")
+    logger.info(f"Total processing time: {elapsed_time:.2f} seconds")
 
 
 if __name__ == "__main__":
     main()
 
+// File: test_program.py
 
+
+// File: data\raw\btc_15m_data_2018_to_2024-2024-10-10.csv
+// Snippet:
+          Open time     Open     High      Low    Close     Volume              Close time  Quote asset volume  Number of trades  Taker buy base asset volume  Taker buy quote asset volume  Ignore
+2018-01-01 00:00:00 13715.65 13715.65 13400.01 13556.15 123.616013 2018-01-01 00:14:59.999        1.675545e+06              1572                    63.227133                  8.576108e+05       0
+2018-01-01 00:15:00 13533.75 13550.87 13402.00 13521.12  98.136430 2018-01-01 00:29:59.999        1.321757e+06              1461                    47.686389                  6.422812e+05       0
+2018-01-01 00:30:00 13500.00 13545.37 13450.00 13470.41  79.904037 2018-01-01 00:44:59.999        1.078825e+06              1000                    43.710406                  5.900347e+05       0
+2018-01-01 00:45:00 13494.65 13690.87 13450.00 13529.01 141.699719 2018-01-01 00:59:59.999        1.917783e+06              1195                    73.897993                  1.000614e+06       0
+2018-01-01 01:00:00 13528.99 13571.74 13402.28 13445.63  72.537533 2018-01-01 01:14:59.999        9.778198e+05               898                    34.257652                  4.618369e+05       0
+
+// File: data\raw\btc_1d_data_2018_to_2024-2024-10-10.csv
+// Snippet:
+ Open time     Open     High      Low    Close       Volume              Close time  Quote asset volume  Number of trades  Taker buy base asset volume  Taker buy quote asset volume  Ignore
+2018-01-01 13715.65 13818.55 12750.00 13380.00  8609.915844 2018-01-01 23:59:59.999        1.147997e+08            105595                  3961.938946                  5.280975e+07       0
+2018-01-02 13382.16 15473.49 12890.02 14675.11 20078.092111 2018-01-02 23:59:59.999        2.797171e+08            177728                 11346.326739                  1.580801e+08       0
+2018-01-03 14690.00 15307.56 14150.00 14919.51 15905.667639 2018-01-03 23:59:59.999        2.361169e+08            162787                  8994.953566                  1.335873e+08       0
+2018-01-04 14919.51 15280.00 13918.04 15059.54 21329.649574 2018-01-04 23:59:59.999        3.127816e+08            170310                 12680.812951                  1.861168e+08       0
+2018-01-05 15059.56 17176.24 14600.00 16960.39 23251.491125 2018-01-05 23:59:59.999        3.693220e+08            192969                 13346.622293                  2.118299e+08       0
+
+// File: data\raw\btc_1h_data_2018_to_2024-2024-10-10.csv
+// Snippet:
+          Open time     Open     High      Low    Close     Volume              Close time  Quote asset volume  Number of trades  Taker buy base asset volume  Taker buy quote asset volume  Ignore
+2018-01-01 00:00:00 13715.65 13715.65 13400.01 13529.01 443.356199 2018-01-01 00:59:59.999        5.993910e+06              5228                   228.521921                  3.090541e+06       0
+2018-01-01 01:00:00 13528.99 13595.89 13155.38 13203.06 383.697006 2018-01-01 01:59:59.999        5.154522e+06              4534                   180.840403                  2.430449e+06       0
+2018-01-01 02:00:00 13203.00 13418.43 13200.00 13330.18 429.064572 2018-01-01 02:59:59.999        5.710192e+06              4887                   192.237935                  2.558505e+06       0
+2018-01-01 03:00:00 13330.26 13611.27 13290.00 13410.03 420.087030 2018-01-01 03:59:59.999        5.657448e+06              4789                   137.918407                  1.858041e+06       0
+2018-01-01 04:00:00 13434.98 13623.29 13322.15 13601.01 340.807329 2018-01-01 04:59:59.999        4.588047e+06              4563                   172.957635                  2.328058e+06       0
+
+// File: data\raw\btc_4h_data_2018_to_2024-2024-10-10.csv
+// Snippet:
+          Open time     Open     High      Low    Close      Volume              Close time  Quote asset volume  Number of trades  Taker buy base asset volume  Taker buy quote asset volume  Ignore
+2018-01-01 00:00:00 13715.65 13715.65 13155.38 13410.03 1676.204807 2018-01-01 03:59:59.999        2.251607e+07             19438                   739.518666                  9.937537e+06       0
+2018-01-01 04:00:00 13434.98 13818.55 13322.15 13570.35 1302.214836 2018-01-01 07:59:59.999        1.770254e+07             18061                   588.516222                  7.998796e+06       0
+2018-01-01 08:00:00 13569.98 13735.24 13001.13 13220.56 1319.755931 2018-01-01 11:59:59.999        1.765121e+07             17200                   582.668293                  7.792109e+06       0
+2018-01-01 12:00:00 13220.56 13330.00 12750.00 13247.00 1831.933153 2018-01-01 15:59:59.999        2.391259e+07             21357                   830.314747                  1.083304e+07       0
+2018-01-01 16:00:00 13247.00 13290.65 12940.00 13240.37 1092.337234 2018-01-01 19:59:59.999        1.434887e+07             13178                   557.453779                  7.324320e+06       0
+
+├── **data**
+│   ├── **raw**
+│   │   ├── btc_15m_data_2018_to_2024-2024-10-10.csv
+│   │   ├── btc_1d_data_2018_to_2024-2024-10-10.csv
+│   │   ├── btc_1h_data_2018_to_2024-2024-10-10.csv
+│   │   └── btc_4h_data_2018_to_2024-2024-10-10.csv
+│   ├── **processed**
+│   │   ├── btc_15m_processed.parquet
+│   │   ├── btc_1d_processed.parquet
+│   │   ├── btc_1h_processed.parquet
+│   │   └── btc_4h_processed.parquet
+│   └── **data_loader.py**
+├── **feature_engineering**
+│   ├── **technical_indicators.py**
+│   ├── **wavelet_features.py**
+│   ├── **advanced_features.py**  # (e.g., sentiment analysis, statistical features)
+│   └── **feature_engineering_pipeline.py**
+├── **utils**
+│   ├── **logging_config.py**
+│   └── **data_utilities.py**  # (e.g., data cleaning, handling missing values)
+├── **main.py**
+└── **requirements.txt**
+		

@@ -1,127 +1,117 @@
-# main.py
-import time
-import logging
-from logging_config import setup_logging
-import glob
-import os
-import dask.dataframe as dd
-from dask.distributed import Client, LocalCluster
 import pandas as pd
-from data_transformation import calculate_fft, perform_pca, handle_missing_values
-from feature_engineering import calculate_indicators, calculate_wavelet_features
+import logging
+from ta import add_all_ta_features
+from ta.utils import dropna
+from ta.trend import SMAIndicator, EMAIndicator, MACD, ADXIndicator, AroonIndicator, CCIIndicator, PSARIndicator
+from ta.momentum import RSIIndicator, StochasticOscillator, WilliamsRIndicator, TSIIndicator, UltimateOscillator, AwesomeOscillatorIndicator
+from ta.volatility import BollingerBands, AverageTrueRange, KeltnerChannel, DonchianChannel, UlcerIndex
+from ta.volume import MFIIndicator, OnBalanceVolumeIndicator, ChaikinMoneyFlowIndicator, ForceIndexIndicator, VolumeWeightedAveragePrice, AccDistIndexIndicator, EaseOfMovementIndicator, VolumePriceTrendIndicator, NegativeVolumeIndexIndicator
+import os
+import glob
 
-# Set up logging configuration
-setup_logging()
+# Initialize logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger()
 
-def process_chunk(chunk):
-    """
-    Process a chunk of data.
-    
-    :param chunk: List of file paths
-    :return: Processed pandas DataFrame
-    """
+# Define the directory path containing the raw data files
+data_dir = 'data/raw'
+output_dir = 'data/processed'
+
+# Dictionary-based window sizes for each file type
+window_sizes = {
+    '15m': [(3, '45m'), (12, '3h'), (48, '12h')],
+    '1h': [(4, '4h'), (24, '1d'), (168, '1w')],
+    '4h': [(2, '8h'), (6, '1d'), (42, '1w')],
+    '1d': [(7, '1w'), (30, '1m'), (365, '1y')]
+}
+
+def apply_rolling_window_ta(df, window, suffix):
     try:
-        # Efficient Dask DataFrame Concatenation
-        df = pd.concat(dd.read_csv(chunk).to_delayed(), ignore_index=True)
-        
-        # Calculate technical indicators
-        df = calculate_indicators(df)
-        
-        # Perform FFT
-        fft_features = calculate_fft(df['Close'])
-        df = df.join(fft_features)
-        
-        # Perform PCA
-        pca_result = perform_pca(df, n_components=5)
-        df = df.join(pca_result)
-        
-        # Calculate Wavelet Features
-        close_numpy = df['Close'].values
-        close_wavelet_features = calculate_wavelet_features(close_numpy)
-        
-        if close_wavelet_features.size > 0:
-            wavelet_columns = [f'wavelet_{i}' for i in range(close_wavelet_features.size)]
-            df = pd.concat([df, pd.DataFrame(close_wavelet_features.reshape(1, -1), columns=wavelet_columns)], axis=1)
-        
-        return df  # Return the processed chunk as a Pandas DataFrame
-    
-    except FileNotFoundError:
-        logging.error(f"Error: One or more files in the chunk not found: {chunk}")
-        return pd.DataFrame()  # Return empty DataFrame in case of error
-    
+        # Trend Indicators
+        df[f'SMA_{suffix}'] = SMAIndicator(df['close'], window=window).sma_indicator()
+        df[f'EMA_{suffix}'] = EMAIndicator(df['close'], window=window).ema_indicator()
+        macd = MACD(df['close'], window_fast=12, window_slow=26, window_sign=9)
+        df[f'MACD_{suffix}'] = macd.macd()
+        df[f'MACD_Signal_{suffix}'] = macd.macd_signal()
+        df[f'MACD_Diff_{suffix}'] = macd.macd_diff()
+        #... (other indicators)
+
+        logger.info(f"Successfully applied rolling window TA for window {window}, suffix {suffix}")
+        return df
     except Exception as e:
-        logging.error(f"Error processing chunk {chunk}: {e}")
-        return pd.DataFrame()
+        logger.error(f"Error applying rolling window TA for window {window}, suffix {suffix}: {str(e)}")
+        return df
 
-
-def validate_dataframe(df):
-    """
-    Validate the processed DataFrame.
-    
-    :param df: Input pandas DataFrame
-    :return: Boolean indicating validation success
-    """
-    required_columns = ['Close', 'Volume', 'RSI', 'MACD']
-    for col in required_columns:
-        if col not in df.columns or df[col].isnull().any():
-            logging.error(f"Validation failed: Missing or NaN values in column {col}")
-            return False
-    return True
-
-
-def main():
-    setup_logging()
-    start_time = time.time()
+def process_file(filename):
+    file_type = [ft for ft in window_sizes.keys() if ft in filename][0]
+    file_path = os.path.join(data_dir, filename)
+    output_filename = f"{file_type}_{filename.split('.')[0]}_with_comprehensive_ta.csv"
+    output_file_path = os.path.join(output_dir, output_filename)
 
     try:
-        # Set up Dask cluster with efficient configuration
-        cluster = LocalCluster(n_workers=min(12, os.cpu_count()),  # Adjust based on available CPU cores
-                               threads_per_worker=2,  # Balance between parallelism and overhead
-                               processes=True,  # Use separate processes for true parallelism
-                               memory_limit='16GB')  # Ensure sufficient memory for workers
-        client = Client(cluster)  # Connect to the cluster
-        logging.info("Dask cluster initialized.")
+        # Load the CSV file
+        df = pd.read_csv(file_path)
+        logger.info(f"Loaded file: {filename} (Shape: {df.shape})")
 
-        # Define data paths
-        RAW_DATA_PATH = r"C:\Users\dylan\Desktop\DATA-LAKE\data\raw\*.csv"
-        PROCESSED_DATA_PATH = r"C:\Users\dylan\Desktop\DATA-LAKE\data\processed\btc_merged_advanced_features.parquet"
+        # Convert 'Open time' to datetime and set as index
+        df['Open time'] = pd.to_datetime(df['Open time'], errors='coerce')
+        df.dropna(subset=['Open time'], inplace=True)
+        df.set_index('Open time', inplace=True)
+        logger.info(f"Converted 'Open time' to datetime and set as index (Shape: {df.shape})")
 
-        # Gather file paths in chunks
-        file_paths = glob.glob(RAW_DATA_PATH)
-        chunk_size = 1000  # Adjust based on system memory and processing capacity
-        for i in range(0, len(file_paths), chunk_size):
-            chunk = file_paths[i:i + chunk_size]
+        # Rename columns to match ta library expectations
+        df.rename(columns={
+            'Open': 'open',
+            'High': 'high',
+            'Low': 'low',
+            'Close': 'close',
+            'Volume': 'volume'
+        }, inplace=True)
+        logger.info("Renamed columns to match ta library expectations")
 
-            # Process and write data in chunks, utilizing Dask's parallel processing
-            futures = client.map(process_chunk, chunk)
-            dfs = client.gather(futures)
-            dfs = [df for df in dfs if not df.empty]  # Filter out empty DataFrames
-            
-            if len(dfs) > 0:
-                combined = pd.concat(dfs, ignore_index=True)
-                
-                # Validate the combined DataFrame
-                if validate_dataframe(combined):
-                    # Write to parquet, appending if the file exists
-                    combined.to_parquet(PROCESSED_DATA_PATH, engine='pyarrow', compression='snappy', append=os.path.exists(PROCESSED_DATA_PATH))
-                    logging.info(f"Processed and written chunk {i // chunk_size + 1} of {len(file_paths) // chunk_size + 1}")
-                else:
-                    logging.error(f"Validation failed for chunk {i // chunk_size + 1}")
+        # Ensure required columns exist
+        required_columns = ['open', 'high', 'low', 'close', 'volume']
+        if not all(col in df.columns for col in required_columns):
+            logger.error(f"Missing required columns in {filename}. Skipping processing.")
+            return
 
-    except Exception as e:
-        logging.error(f"Error in main processing loop: {e}", exc_info=True)
-    finally:
+        # Check for and handle any remaining NaN values
+        if df.isna().values.any():
+            logger.warning(f"NaN values detected in {filename}. Dropping rows with NaN values.")
+            df = df.dropna(subset=['close'])
+            logger.info(f"Dropped rows with NaN values (Shape: {df.shape})")
+
+        # Add all TA features
         try:
-            client.close()
-            cluster.close()  # Close the cluster as well.
-            logging.info("Dask cluster and client closed.")
-        except:
-            logging.warning("Dask client/cluster was not initialized or already closed.")
+            df = add_all_ta_features(
+                df, 
+                open="open", 
+                high="high", 
+                low="low", 
+                close="close", 
+                volume="volume",
+                fillna=True
+            )
+            logger.info("Successfully added all TA features")
+        except Exception as e:
+            logger.error(f"Error adding all TA features to {filename}: {str(e)}")
 
-    end_time = time.time()
-    elapsed_time = end_time - start_time
-    logging.info(f"Total processing time: {elapsed_time:.2f} seconds")
+        # Apply rolling window calculations
+        for window, suffix in window_sizes[file_type]:
+            df = apply_rolling_window_ta(df, window=window, suffix=suffix)
+            if df.empty:
+                logger.error(f"DataFrame became empty after applying rolling window TA for window {window}, suffix {suffix}. Skipping further processing.")
+                return
 
+        # Save the updated DataFrame to a new CSV file
+        os.makedirs(os.path.dirname(output_file_path), exist_ok=True)
+        df.to_csv(output_file_path)
+        logger.info(f"Comprehensive TA features added to {filename} and saved to {output_filename}")
+        logger.info("-----------------------------------")
+    except Exception as e:
+        logger.error(f"Error processing file {filename}: {str(e)}")
 
-if __name__ == "__main__":
-    main()
+# Iterate through each file in the directory
+for filename in glob.glob(os.path.join(data_dir, '*.csv')):
+    filename = os.path.basename(filename)
+    process_file(filename)
