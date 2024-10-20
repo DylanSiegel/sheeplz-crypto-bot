@@ -1,645 +1,170 @@
 **File Tree (Relevant Files Only)**
   .
-    - data_transformation.py
-    - feature_engineering.py
-    - logging_config.py
     - main.py
-    - test_program.py
+  data\processed
+    - 15m_btc_15m_data_2018_to_2024-2024-10-10_with_comprehensive_ta.csv
+    - 1d_btc_1d_data_2018_to_2024-2024-10-10_with_comprehensive_ta.csv
+    - 1h_btc_1h_data_2018_to_2024-2024-10-10_with_comprehensive_ta.csv
+    - 4h_btc_4h_data_2018_to_2024-2024-10-10_with_comprehensive_ta.csv
   data\raw
     - btc_15m_data_2018_to_2024-2024-10-10.csv
     - btc_1d_data_2018_to_2024-2024-10-10.csv
     - btc_1h_data_2018_to_2024-2024-10-10.csv
     - btc_4h_data_2018_to_2024-2024-10-10.csv
-// File: data_transformation.py
-import pandas as pd
-import numpy as np
-import torch
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler, RobustScaler, OneHotEncoder
-from scipy.fft import fft
-import logging
-from logging_config import get_logger
-
-logger = get_logger(__name__)
-
-def calculate_fft(series: pd.Series) -> pd.DataFrame:
-    """
-    Calculates FFT features on a Pandas Series.
-
-    Args:
-        series: The input Pandas Series.
-
-    Returns:
-        A DataFrame with FFT features. Returns an empty DataFrame if the input series is empty after handling NaNs.
-    """
-    series = series.dropna()
-    if series.empty:  
-        return pd.DataFrame()
-
-    if torch.cuda.is_available():
-        fft_values = torch.fft.fft(torch.tensor(series.values, device='cuda:0', dtype=torch.float32))
-        return pd.DataFrame({
-            'FFT_Real': fft_values.real.cpu().numpy(),
-            'FFT_Imag': fft_values.imag.cpu().numpy(),
-            'FFT_Magnitude': torch.abs(fft_values).cpu().numpy(),
-            'FFT_Phase': torch.angle(fft_values).cpu().numpy()
-        })
-    else:
-        fft_values = fft(series.values)
-        return pd.DataFrame({
-            'FFT_Real': np.real(fft_values),
-            'FFT_Imag': np.imag(fft_values),
-            'FFT_Magnitude': np.abs(fft_values),
-            'FFT_Phase': np.angle(fft_values)
-        })
-
-def handle_missing_values(df: pd.DataFrame, strategy: str ='median') -> pd.DataFrame:
-    """
-    Handles missing values in a DataFrame.
-
-    Args:
-        df: The input DataFrame.
-        strategy: The strategy to use for filling missing values ('mean','median','most_frequent', 'drop').
-
-    Returns:
-        DataFrame with missing values handled.
-    """
-    numeric_df = df.select_dtypes(include=np.number)
-    if strategy =='mean':
-        df.loc[:, numeric_df.columns] = numeric_df.fillna(numeric_df.mean())
-    elif strategy =='median':
-        df.loc[:, numeric_df.columns] = numeric_df.fillna(numeric_df.median())
-    elif strategy =='most_frequent':
-        df.loc[:, numeric_df.columns] = numeric_df.fillna(numeric_df.mode().iloc[0])
-    elif strategy == 'drop':
-        df = df.dropna()  
-    else:
-        logger.error(f"Invalid strategy: {strategy}. Using'mean'.")
-        df.loc[:, numeric_df.columns] = numeric_df.fillna(numeric_df.mean())
-    return df
-
-def encode_categorical_variables(df: pd.DataFrame, columns: list) -> pd.DataFrame:
-    """
-    One-hot encodes categorical variables.
-
-    Args:
-        df: The input DataFrame.
-        columns: A list of categorical column names.
-
-    Returns:
-        DataFrame with categorical variables one-hot encoded.
-    """
-    encoder = OneHotEncoder(handle_unknown='ignore', sparse_output=False)  
-    encoded_data = pd.DataFrame(encoder.fit_transform(df[columns]))
-    encoded_data.columns = encoder.get_feature_names_out(columns)
-    return pd.concat([df.drop(columns, axis=1), encoded_data], axis=1)
-
-def scale_numerical_features(df: pd.DataFrame, columns: list, scaler_type: str ='standard') -> pd.DataFrame:
-    """
-    Scales numerical features.
-
-    Args:
-        df: The input DataFrame.
-        columns: A list of numerical column names.
-        scaler_type: Type of scaler to use ('standard', 'robust').
-
-    Returns:
-        DataFrame with scaled numerical features.
-    """
-    if scaler_type =='standard':
-        scaler = StandardScaler()
-    elif scaler_type == 'robust':
-        scaler = RobustScaler()
-    else:
-        logger.error(f"Invalid scaler type: {scaler_type}. Using'standard'.")
-        scaler = StandardScaler()
-    df.loc[:, columns] = scaler.fit_transform(df[columns])
-    return df
-
-def apply_fourier_transformation(series: pd.Series) -> pd.DataFrame:
-    """
-    Applies Fourier transformation.
-
-    Args:
-        series: The input series.
-
-    Returns:
-        DataFrame with Fourier transformation applied.
-    """
-    if not isinstance(series, pd.Series):
-        raise ValueError("Input must be a Pandas Series")
-    return calculate_fft(series)
-
-def perform_pca(df: pd.DataFrame, n_components: int = 5, scaler_type: str ='standard') -> pd.DataFrame:
-    """
-    Performs Principal Component Analysis (PCA) on the input DataFrame.
-
-    Args:
-        df (pd.DataFrame): Input DataFrame.
-        n_components (int, optional): Number of PCA components. Defaults to 5.
-        scaler_type (str, optional): Type of scaler to use before PCA ('standard', 'robust'). Defaults to'standard'.
-
-    Returns:
-        pd.DataFrame: DataFrame with PCA applied.
-    """
-    num_cols = df.select_dtypes(include=['number']).columns
-    if not len(num_cols):
-        return pd.DataFrame()
-    
-    df.loc[:, num_cols] = scale_numerical_features(df[num_cols], num_cols.to_list(), scaler_type)  
-
-    n_components = min(n_components, len(num_cols), len(df))  
-    pca = PCA(n_components=n_components)
-    pca_result = pca.fit_transform(df[num_cols])
-    return pd.DataFrame(pca_result, columns=[f'PCA_{i+1}' for i in range(n_components)])
-
-def main_data_transformation(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Main data transformation pipeline.
-
-    Args:
-        df: Input DataFrame.
-
-    Returns:
-        Transformed DataFrame.
-    """
-    df = handle_missing_values(df)
-
-    categorical_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
-    if categorical_cols:
-        df = encode_categorical_variables(df, categorical_cols)
-
-    numerical_cols = df.select_dtypes(include=np.number).columns.tolist()
-    if numerical_cols:
-        df = scale_numerical_features(df, numerical_cols)
-
-    if 'time_series_column' in df.columns:
-        fourier_features = apply_fourier_transformation(df['time_series_column'])
-        if not fourier_features.empty:  
-            df = pd.concat([df, fourier_features], axis=1)
-
-    pca_features = perform_pca(df, n_components=5)
-    if not pca_features.empty:  
-        df = pd.concat([df, pca_features], axis=1)
-    
-    return df
-
-// File: feature_engineering.py
-import pandas as pd
-import numpy as np
-import torch
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler, RobustScaler, OneHotEncoder
-from scipy.fft import fft
-import logging
-from logging_config import get_logger
-import ta
-from functools import lru_cache
-import pywt
-from sklearn.manifold import TSNE
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.cluster import KMeans
-from typing import Dict
-from logging_config import setup_logging
-
-setup_logging()
-
-logger = get_logger(__name__)
-
-def calculate_fft(series: pd.Series) -> pd.DataFrame:
-    """
-    Calculates FFT features on a Pandas Series.
-
-    Args:
-        series: The input Pandas Series.
-
-    Returns:
-        A DataFrame with FFT features. Returns an empty DataFrame if the input series is empty after handling NaNs.
-    """
-    series = series.dropna()
-    if series.empty:  
-        return pd.DataFrame()
-
-    if torch.cuda.is_available():
-        fft_values = torch.fft.fft(torch.tensor(series.values, device='cuda:0', dtype=torch.float32))
-        return pd.DataFrame({
-            'FFT_Real': fft_values.real.cpu().numpy(),
-            'FFT_Imag': fft_values.imag.cpu().numpy(),
-            'FFT_Magnitude': torch.abs(fft_values).cpu().numpy(),
-            'FFT_Phase': torch.angle(fft_values).cpu().numpy()
-        })
-    else:
-        fft_values = fft(series.values)
-        return pd.DataFrame({
-            'FFT_Real': np.real(fft_values),
-            'FFT_Imag': np.imag(fft_values),
-            'FFT_Magnitude': np.abs(fft_values),
-            'FFT_Phase': np.angle(fft_values)
-        })
-
-def handle_missing_values(df: pd.DataFrame, strategy: str ='median') -> pd.DataFrame:
-    """
-    Handles missing values in a DataFrame.
-
-    Args:
-        df: The input DataFrame.
-        strategy: The strategy to use for filling missing values ('mean','median','most_frequent', 'drop').
-
-    Returns:
-        DataFrame with missing values handled.
-    """
-    numeric_df = df.select_dtypes(include=np.number)
-    if strategy =='mean':
-        df.loc[:, numeric_df.columns] = numeric_df.fillna(numeric_df.mean())
-    elif strategy =='median':
-        df.loc[:, numeric_df.columns] = numeric_df.fillna(numeric_df.median())
-    elif strategy =='most_frequent':
-        df.loc[:, numeric_df.columns] = numeric_df.fillna(numeric_df.mode().iloc[0])
-    elif strategy == 'drop':
-        df = df.dropna()  
-    else:
-        logger.error(f"Invalid strategy: {strategy}. Using'mean'.")
-        df.loc[:, numeric_df.columns] = numeric_df.fillna(numeric_df.mean())
-    return df
-
-def encode_categorical_variables(df: pd.DataFrame, columns: list) -> pd.DataFrame:
-    """
-    One-hot encodes categorical variables.
-
-    Args:
-        df: The input DataFrame.
-        columns: A list of categorical column names.
-
-    Returns:
-        DataFrame with categorical variables one-hot encoded.
-    """
-    encoder = OneHotEncoder(handle_unknown='ignore', sparse_output=False)  
-    encoded_data = pd.DataFrame(encoder.fit_transform(df[columns]))
-    encoded_data.columns = encoder.get_feature_names_out(columns)
-    return pd.concat([df.drop(columns, axis=1), encoded_data], axis=1)
-
-def scale_numerical_features(df: pd.DataFrame, columns: list, scaler_type: str ='standard') -> pd.DataFrame:
-    """
-    Scales numerical features.
-
-    Args:
-        df: The input DataFrame.
-        columns: A list of numerical column names.
-        scaler_type: Type of scaler to use ('standard', 'robust').
-
-    Returns:
-        DataFrame with scaled numerical features.
-    """
-    if scaler_type =='standard':
-        scaler = StandardScaler()
-    elif scaler_type == 'robust':
-        scaler = RobustScaler()
-    else:
-        logger.error(f"Invalid scaler type: {scaler_type}. Using'standard'.")
-        scaler = StandardScaler()
-    df.loc[:, columns] = scaler.fit_transform(df[columns])
-    return df
-
-def apply_fourier_transformation(series: pd.Series) -> pd.DataFrame:
-    """
-    Applies Fourier transformation.
-
-    Args:
-        series: The input series.
-
-    Returns:
-        DataFrame with Fourier transformation applied.
-    """
-    if not isinstance(series, pd.Series):
-        raise ValueError("Input must be a Pandas Series")
-    return calculate_fft(series)
-
-def perform_pca(df: pd.DataFrame, n_components: int = 5, scaler_type: str ='standard') -> pd.DataFrame:
-    """
-    Performs Principal Component Analysis (PCA) on the input DataFrame.
-
-    Args:
-        df (pd.DataFrame): Input DataFrame.
-        n_components (int, optional): Number of PCA components. Defaults to 5.
-        scaler_type (str, optional): Type of scaler to use before PCA ('standard', 'robust'). Defaults to'standard'.
-
-    Returns:
-        pd.DataFrame: DataFrame with PCA applied.
-    """
-    num_cols = df.select_dtypes(include=['number']).columns
-    if not len(num_cols):
-        return pd.DataFrame()
-    
-    df.loc[:, num_cols] = scale_numerical_features(df[num_cols], num_cols.to_list(), scaler_type)  
-
-    n_components = min(n_components, len(num_cols), len(df))  
-    pca = PCA(n_components=n_components)
-    pca_result = pca.fit_transform(df[num_cols])
-    return pd.DataFrame(pca_result, columns=[f'PCA_{i+1}' for i in range(n_components)])
-
-def calculate_ema(series: pd.Series, window: int = 20) -> pd.Series:
-    return series.ewm(span=window, adjust=False).mean()
-
-def calculate_wavelet_features(series: np.ndarray, wavelet: str = 'db4', level: int = 4) -> np.ndarray:
-    """
-    Calculates wavelet features for the input series.
-
-    Args:
-        series (np.ndarray): Input numpy array.
-        wavelet (str, optional): Wavelet type. Defaults to 'db4'.
-        level (int, optional): Decomposition level. Defaults to 4.
-
-    Returns:
-        np.ndarray: Wavelet features.
-    """
-    key = tuple(series)
-    if key in calculate_wavelet_features.cache:
-        return calculate_wavelet_features.cache[key]
-
-    try:
-        coeffs = pywt.wavedec(series, wavelet, level=level)
-        result = np.concatenate(coeffs)
-    except Exception as e:
-        logging.error(f"Error in calculate_wavelet_features: {e}", exc_info=True)
-        result = np.array([])
-
-    calculate_wavelet_features.cache[key] = result
-    return result
-
-calculate_wavelet_features.cache = {}
-
-def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Calculates technical indicators and their rolling statistics.
-    
-    :param df: Input pandas DataFrame
-    :return: DataFrame with technical indicators
-    """
-    try:
-        close = df['Close']
-        high = df['High']
-        low = df['Low']
-        volume = df['Volume']
-
-        for name, indicator_data in indicator_functions.items():
-            try:
-                if indicator_data["func"] is not None:
-                    if name == "ema":
-                        df[name] = calculate_ema(close, window=indicator_data["params"]["window"])
-                    elif hasattr(ta, "volume") and "volume" in name.lower():
-                        indicator = indicator_data["func"](close=close, high=high, low=low, volume=volume, **indicator_data["params"])
-                    elif hasattr(ta, "momentum") and "momentum" in name.lower():
-                        indicator = indicator_data["func"](close=close, **indicator_data["params"])
-                    else:
-                        indicator = indicator_data["func"](high=high, low=low, close=close, **indicator_data["params"])
-                        
-                    if hasattr(indicator, 'notna') and indicator.notna().all():
-                        df[name] = indicator
-            except Exception as e:
-                logging.error(f"Error calculating {name}: {e}", exc_info=True)
-        
-        # Normalize core features using MinMaxScaler
-        core_features = df.columns.difference(['Open', 'High', 'Low', 'Close', 'Volume'])
-        scaler = MinMaxScaler()
-        df[core_features] = scaler.fit_transform(df[core_features].fillna(df[core_features].median()))
-
-        return df
-    except Exception as e:
-        logger.error(f"Error calculating indicators: {e}", exc_info=True)
-        raise
-
-def calculate_rolling_features(df: pd.DataFrame, windows: list = [3, 7, 14, 21]) -> pd.DataFrame:
-    """
-    Calculates rolling features over given windows
-    
-    :param df: Input pandas DataFrame
-    :param windows: List of rolling windows
-    :return: DataFrame with rolling statistics features
-    """
-    core_features = df.columns.difference(['Open', 'High', 'Low', 'Close', 'Volume'])
-    
-    for window in windows:
-        rolled = df[core_features].rolling(window=window)
-        df[[f"{col}_mean_{window}" for col in core_features]] = rolled.mean()
-        df[[f"{col}_std_{window}" for col in core_features]] = rolled.std()
-        df[[f"{col}_min_{window}" for col in core_features]] = rolled.min()
-        df[[f"{col}_max_{window}" for col in core_features]] = rolled.max()
-
-    return df
-
-def calculate_tsne_features(df: pd.DataFrame, n_components: int = 2, perplexity: int = 5) -> pd.DataFrame:
-    """
-    Calculates t-SNE features.
-    
-    :param df: Input pandas DataFrame
-    :param n_components: Number of t-SNE components (default: 2)
-    :param perplexity: t-SNE perplexity (default: 5)
-    :return: DataFrame with t-SNE features
-    """
-    tsne = TSNE(n_components=n_components, perplexity=min(perplexity, len(df)-1))
-    tsne_features = tsne.fit_transform(df)
-    tsne_df = pd.DataFrame(tsne_features, columns=[f'TSNE_{i+1}' for i in range(n_components)])
-    return tsne_df
-
-def calculate_kmeans_features(df: pd.DataFrame, n_clusters: int = 5) -> pd.DataFrame:
-    """
-    Calculates K-Means clustering features.
-    
-    :param df: Input pandas DataFrame
-    :param n_clusters: Number of K-Means clusters (default: 5)
-    :return: DataFrame with K-Means cluster labels
-    """
-    kmeans = KMeans(n_clusters=n_clusters)
-    cluster_labels = kmeans.fit_predict(df)
-    cluster_df = pd.DataFrame(cluster_labels, columns=['Cluster'])
-    return cluster_df
-
-def main_feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Main feature engineering function.
-    
-    :param df: Input pandas DataFrame
-    :return: DataFrame with engineered features
-    """
-    df = calculate_indicators(df)
-    
-    df = calculate_rolling_features(df)
-    
-    close_numpy = df['Close'].values
-    close_wavelet_features = calculate_wavelet_features(close_numpy)
-    
-    if close_wavelet_features.size > 0:
-        wavelet_columns = [f'wavelet_{i}' for i in range(close_wavelet_features.size)]
-        df = pd.concat([df, pd.DataFrame(close_wavelet_features.reshape(1, -1), columns=wavelet_columns)], axis=1)
-    
-    tsne_features = calculate_tsne_features(df)
-    df = pd.concat([df, tsne_features], axis=1)
-    
-    cluster_features = calculate_kmeans_features(df)
-    df = pd.concat([df, cluster_features], axis=1)
-    
-    return df
-
-def main_data_transformation(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Main data transformation pipeline.
-
-    Args:
-        df: Input DataFrame.
-
-    Returns:
-        Transformed DataFrame.
-    """
-    df = handle_missing_values(df)
-
-    categorical_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
-    if categorical_cols:
-        df = encode_categorical_variables(df, categorical_cols)
-
-    numerical_cols = df.select_dtypes(include=np.number).columns.tolist()
-    if numerical_cols:
-        df = scale_numerical_features(df, numerical_cols)
-
-    if 'time_series_column' in df.columns:
-        fourier_features = apply_fourier_transformation(df['time_series_column'])
-        if not fourier_features.empty:  
-            df = pd.concat([df, fourier_features], axis=1)
-
-    pca_features = perform_pca(df, n_components=5)
-    if not pca_features.empty:  
-        df = pd.concat([df, pca_features], axis=1)
-    
-    return df
-
-
-// File: logging_config.py
-# logging_config.py
-import loguru
-import sys
-
-logger = loguru.logger
-
-# --- CHANGE --- Updated logging configuration
-logger.remove(0)  # Remove default handler
-logger.add(sys.stderr, format="{time:MMMM D, YYYY at HH:mm:ss!UTC} | {level} | {message}")
-logger.add("data_processing.log", rotation="1 day", compression="zip", format="{time:MMMM D, YYYY at HH:mm:ss!UTC} | {level} | {message}")
-
-def setup_logging():
-    # --- CHANGE --- No need for setup with Loguru
-    pass
-
-def get_logger(name: str) -> loguru.logger:
-    return logger
-
-
 // File: main.py
-import time
-import logging
-from logging_config import get_logger
-import glob
-import os
-import dask.dataframe as dd
-from dask.distributed import Client, LocalCluster
 import pandas as pd
-from data_transformation import main_data_transformation  
-from feature_engineering import main_feature_engineering  
+import logging
+from ta import add_all_ta_features
+from ta.utils import dropna
+from ta.trend import SMAIndicator, EMAIndicator, MACD, ADXIndicator, AroonIndicator, CCIIndicator, PSARIndicator
+from ta.momentum import RSIIndicator, StochasticOscillator, WilliamsRIndicator, TSIIndicator, UltimateOscillator, AwesomeOscillatorIndicator
+from ta.volatility import BollingerBands, AverageTrueRange, KeltnerChannel, DonchianChannel, UlcerIndex
+from ta.volume import MFIIndicator, OnBalanceVolumeIndicator, ChaikinMoneyFlowIndicator, ForceIndexIndicator, VolumeWeightedAveragePrice, AccDistIndexIndicator, EaseOfMovementIndicator, VolumePriceTrendIndicator, NegativeVolumeIndexIndicator
+import os
+import glob
 
-logger = get_logger(__name__)
+# Initialize logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger()
 
-def process_chunk(chunk):
-    """
-    Process a chunk of data.
-    
-    :param chunk: List of file paths
-    :return: Processed pandas DataFrame
-    """
+# Define the directory path containing the raw data files
+data_dir = 'data/raw'
+output_dir = 'data/processed'
+
+# Dictionary-based window sizes for each file type
+window_sizes = {
+    '15m': [(3, '45m'), (12, '3h'), (48, '12h')],
+    '1h': [(4, '4h'), (24, '1d'), (168, '1w')],
+    '4h': [(2, '8h'), (6, '1d'), (42, '1w')],
+    '1d': [(7, '1w'), (30, '1m'), (365, '1y')]
+}
+
+def apply_rolling_window_ta(df, window, suffix):
     try:
-        ddf = dd.read_csv(chunk)
-        df = ddf.compute()  
-        
-        df = main_data_transformation(df)
+        # Trend Indicators
+        df[f'SMA_{suffix}'] = SMAIndicator(df['close'], window=window).sma_indicator()
+        df[f'EMA_{suffix}'] = EMAIndicator(df['close'], window=window).ema_indicator()
+        macd = MACD(df['close'], window_fast=12, window_slow=26, window_sign=9)
+        df[f'MACD_{suffix}'] = macd.macd()
+        df[f'MACD_Signal_{suffix}'] = macd.macd_signal()
+        df[f'MACD_Diff_{suffix}'] = macd.macd_diff()
+        #... (other indicators)
 
-        df = main_feature_engineering(df)
-
+        logger.info(f"Successfully applied rolling window TA for window {window}, suffix {suffix}")
         return df
-    except FileNotFoundError:
-        logger.error(f"File not found: {chunk}")
-        return pd.DataFrame()
     except Exception as e:
-        logger.error(f"Error processing chunk: {e}", exc_info=True)
-        return pd.DataFrame()
+        logger.error(f"Error applying rolling window TA for window {window}, suffix {suffix}: {str(e)}")
+        return df
 
-def validate_dataframe(df):
-    """
-    Validate the processed DataFrame.
-    
-    :param df: Input pandas DataFrame
-    :return: Boolean indicating validation success
-    """
-    required_columns = ['Close', 'Volume', 'RSI', 'MACD', 'PCA_1', 'TSNE_1', 'Cluster']
-    
-    if not all(col in df.columns for col in required_columns):
-        missing_cols = [col for col in required_columns if col not in df.columns]
-        logger.error(f"Missing columns: {missing_cols}")
-        return False
-    if df[required_columns].isnull().values.any():
-        logger.error(f"NaN values present in required columns.")
-        return False
-    return True
-
-def main():
-    get_logger()
-    start_time = time.time()
+def process_file(filename):
+    file_type = [ft for ft in window_sizes.keys() if ft in filename][0]
+    file_path = os.path.join(data_dir, filename)
+    output_filename = f"{file_type}_{filename.split('.')[0]}_with_comprehensive_ta.csv"
+    output_file_path = os.path.join(output_dir, output_filename)
 
     try:
-        cluster = LocalCluster(n_workers=min(12, os.cpu_count()),  
-                               threads_per_worker=2,  
-                               processes=True,  
-                               memory_limit='16GB')  
-        client = Client(cluster)  
-        logger.info("Dask cluster initialized.")
+        # Load the CSV file
+        df = pd.read_csv(file_path)
+        logger.info(f"Loaded file: {filename} (Shape: {df.shape})")
 
-        RAW_DATA_PATH = r"C:\Users\dylan\Desktop\DATA-LAKE\data\raw\*.csv"
-        PROCESSED_DATA_PATH = r"C:\Users\dylan\Desktop\DATA-LAKE\data\processed\btc_merged_advanced_features.parquet"
+        # Convert 'Open time' to datetime and set as index
+        df['Open time'] = pd.to_datetime(df['Open time'], errors='coerce')
+        df.dropna(subset=['Open time'], inplace=True)
+        df.set_index('Open time', inplace=True)
+        logger.info(f"Converted 'Open time' to datetime and set as index (Shape: {df.shape})")
 
-        file_paths = glob.glob(RAW_DATA_PATH)
-        chunk_size = 1000  
-        for i in range(0, len(file_paths), chunk_size):
-            chunk = file_paths[i:i + chunk_size]
+        # Rename columns to match ta library expectations
+        df.rename(columns={
+            'Open': 'open',
+            'High': 'high',
+            'Low': 'low',
+            'Close': 'close',
+            'Volume': 'volume'
+        }, inplace=True)
+        logger.info("Renamed columns to match ta library expectations")
 
-            futures = client.map(process_chunk, chunk)
-            dfs = client.gather(futures)
-            dfs = [df for df in dfs if not df.empty]  
-            
-            if len(dfs) > 0:
-                combined = pd.concat(dfs, ignore_index=True)
-                
-                if validate_dataframe(combined):
-                    combined.to_parquet(PROCESSED_DATA_PATH, engine='pyarrow', compression='snappy', append=os.path.exists(PROCESSED_DATA_PATH))
-                    logger.info(f"Processed and written chunk {i // chunk_size + 1} of {len(file_paths) // chunk_size + 1}")
-                else:
-                    logger.error(f"Validation failed for chunk {i // chunk_size + 1}")
+        # Ensure required columns exist
+        required_columns = ['open', 'high', 'low', 'close', 'volume']
+        if not all(col in df.columns for col in required_columns):
+            logger.error(f"Missing required columns in {filename}. Skipping processing.")
+            return
 
-    except Exception as e:
-        logger.error(f"Error in main processing loop: {e}", exc_info=True)
-    finally:
+        # Check for and handle any remaining NaN values
+        if df.isna().values.any():
+            logger.warning(f"NaN values detected in {filename}. Dropping rows with NaN values.")
+            df = df.dropna(subset=['close'])
+            logger.info(f"Dropped rows with NaN values (Shape: {df.shape})")
+
+        # Add all TA features
         try:
-            client.close()
-            cluster.close()  
-            logger.info("Dask cluster and client closed.")
-        except:
-            logger.warning("Dask client/cluster was not initialized or already closed.")
+            df = add_all_ta_features(
+                df, 
+                open="open", 
+                high="high", 
+                low="low", 
+                close="close", 
+                volume="volume",
+                fillna=True
+            )
+            logger.info("Successfully added all TA features")
+        except Exception as e:
+            logger.error(f"Error adding all TA features to {filename}: {str(e)}")
 
-    end_time = time.time()
-    elapsed_time = end_time - start_time
-    logger.info(f"Total processing time: {elapsed_time:.2f} seconds")
+        # Apply rolling window calculations
+        for window, suffix in window_sizes[file_type]:
+            df = apply_rolling_window_ta(df, window=window, suffix=suffix)
+            if df.empty:
+                logger.error(f"DataFrame became empty after applying rolling window TA for window {window}, suffix {suffix}. Skipping further processing.")
+                return
 
+        # Save the updated DataFrame to a new CSV file
+        os.makedirs(os.path.dirname(output_file_path), exist_ok=True)
+        df.to_csv(output_file_path)
+        logger.info(f"Comprehensive TA features added to {filename} and saved to {output_filename}")
+        logger.info("-----------------------------------")
+    except Exception as e:
+        logger.error(f"Error processing file {filename}: {str(e)}")
 
-if __name__ == "__main__":
-    main()
+# Iterate through each file in the directory
+for filename in glob.glob(os.path.join(data_dir, '*.csv')):
+    filename = os.path.basename(filename)
+    process_file(filename)
 
-// File: test_program.py
+// File: data\processed\15m_btc_15m_data_2018_to_2024-2024-10-10_with_comprehensive_ta.csv
+// Snippet:
+          Open time     open     high      low    close     volume              Close time  Quote asset volume  Number of trades  Taker buy base asset volume  Taker buy quote asset volume  Ignore  volume_adi  volume_obv  volume_cmf    volume_fi     volume_em  volume_sma_em  volume_vpt  volume_vwap  volume_mfi  volume_nvi  volatility_bbm  volatility_bbh  volatility_bbl  volatility_bbw  volatility_bbp  volatility_bbhi  volatility_bbli  volatility_kcc  volatility_kch  volatility_kcl  volatility_kcw  volatility_kcp  volatility_kchi  volatility_kcli  volatility_dcl  volatility_dch  volatility_dcm  volatility_dcw  volatility_dcp  volatility_atr  volatility_ui  trend_macd  trend_macd_signal  trend_macd_diff  trend_sma_fast  trend_sma_slow  trend_ema_fast  trend_ema_slow  trend_vortex_ind_pos  trend_vortex_ind_neg  trend_vortex_ind_diff  trend_trix  trend_mass_index    trend_dpo   trend_kst  trend_kst_sig  trend_kst_diff  trend_ichimoku_conv  trend_ichimoku_base  trend_ichimoku_a  trend_ichimoku_b  trend_stc  trend_adx  trend_adx_pos  trend_adx_neg  trend_cci  trend_visual_ichimoku_a  trend_visual_ichimoku_b  trend_aroon_up  trend_aroon_down  trend_aroon_ind  trend_psar_up  trend_psar_down  trend_psar_up_indicator  trend_psar_down_indicator  momentum_rsi  momentum_stoch_rsi  momentum_stoch_rsi_k  momentum_stoch_rsi_d  momentum_tsi  momentum_uo  momentum_stoch  momentum_stoch_signal  momentum_wr  momentum_ao  momentum_roc  momentum_ppo  momentum_ppo_signal  momentum_ppo_hist  momentum_pvo  momentum_pvo_signal  momentum_pvo_hist  momentum_kama  others_dr  others_dlr  others_cr      SMA_45m      EMA_45m  MACD_45m  MACD_Signal_45m  MACD_Diff_45m  SMA_3h  EMA_3h  MACD_3h  MACD_Signal_3h  MACD_Diff_3h  SMA_12h  EMA_12h  MACD_12h  MACD_Signal_12h  MACD_Diff_12h
+2018-01-01 00:00:00 13715.65 13715.65 13400.01 13556.15 123.616013 2018-01-01 00:14:59.999        1.675545e+06              1572                    63.227133                  8.576108e+05       0   -1.315897  123.616013   -0.010645     0.000000  0.000000e+00   0.000000e+00    0.000000 13557.270000   50.000000 1000.000000    13556.150000    13556.150000    13556.150000        0.000000        0.000000              0.0              0.0    13557.270000    13872.910000    13241.630000        4.656395        0.498226              0.0              0.0        13400.01        13715.65        13557.83        2.328390        0.494677             0.0            0.0    0.000000           0.000000         0.000000    13556.150000    13556.150000    13556.150000    13556.150000              0.000000              0.000000               0.000000  -48.139169          1.000000 12587.523574 -481.474937    -481.474937        0.000000             13557.83             13557.83          13557.83          13557.83        0.0        0.0            0.0            0.0   0.000000             26130.822906              26116.40235             0.0               0.0              0.0       13155.38      13715.65000                      0.0                        0.0    100.000000                 0.0                   0.0                   0.0      0.000000     0.000000       49.467748              49.467748   -50.532252          0.0           0.0      0.000000             0.000000           0.000000      0.000000             0.000000           0.000000   13556.150000   0.000000    0.000000   0.000000          NaN          NaN       NaN              NaN            NaN     NaN     NaN      NaN             NaN           NaN      NaN      NaN       NaN              NaN            NaN
+2018-01-01 00:15:00 13533.75 13550.87 13402.00 13521.12  98.136430 2018-01-01 00:29:59.999        1.321757e+06              1461                    47.686389                  6.422812e+05       0   57.597603   25.479583    0.259738 -3437.719143 -1.234738e+10  -1.234738e+10   -0.253591 13528.088287    0.000000  997.415933    13538.635000    13573.665000    13503.605000        0.517482        0.250000              0.0              0.0    13524.300000    13756.555000    13292.045000        3.434632        0.493154              0.0              0.0        13400.01        13715.65        13557.83        2.331402        0.383697             0.0            0.0   -2.794416          -0.558883        -2.235533    13538.635000    13538.635000    13550.760769    13553.555185              0.011697              0.024318              -0.012622   -0.000505          1.913638 12605.038574 -482.144888    -481.809912       -0.334976             13557.83             13557.83          13557.83          13557.83        0.0        0.0            0.0            0.0 -66.666667             26130.822906              26116.40235             0.0               0.0              0.0       13155.38      13715.65000                      0.0                        0.0      0.000000                 0.0                   0.0                   0.0   -100.000000    25.356010       38.369662              43.918705   -61.630338          0.0           0.0     -0.020618            -0.004124          -0.016494     -1.669746            -0.333949          -1.335797   13540.615679  -0.258407   -0.258741  -0.258407          NaN          NaN       NaN              NaN            NaN     NaN     NaN      NaN             NaN           NaN      NaN      NaN       NaN              NaN            NaN
+2018-01-01 00:30:00 13500.00 13545.37 13450.00 13470.41  79.904037 2018-01-01 00:44:59.999        1.078825e+06              1000                    43.710406                  5.900347e+05       0   11.893868  -54.424454    0.039429 -3525.464082  2.536308e+09  -4.905534e+09   -0.553266 13517.626697    0.000000  993.675195    13515.893333    13586.288891    13445.497776        1.041671        0.176945              0.0              0.0    13512.397778    13699.024444    13325.771111        2.762303        0.387509              0.0              0.0        13400.01        13715.65        13557.83        2.335325        0.223039             0.0            0.0   -8.997170          -2.246541        -6.750630    13515.893333    13515.893333    13538.399112    13547.396283              0.022645              0.031903              -0.009258   -0.002055          2.740577 12627.780241 -483.014761    -482.211529       -0.803232             13557.83             13557.83          13557.83          13557.83        0.0        0.0            0.0            0.0 -53.049400             26130.822906              26116.40235             0.0               0.0              0.0       13155.38      13715.65000                      0.0                        1.0      0.000000                 0.0                   0.0                   0.0   -100.000000    24.688584       22.303891              36.713767   -77.696109          0.0           0.0     -0.066413            -0.016581          -0.049831     -4.262220            -1.119603          -3.142616   13509.463577  -0.375043   -0.375748  -0.632480 13515.893333 13504.522500       NaN              NaN            NaN     NaN     NaN      NaN             NaN           NaN      NaN      NaN       NaN              NaN            NaN
+2018-01-01 00:45:00 13494.65 13690.87 13450.00 13529.01 141.699719 2018-01-01 00:59:59.999        1.917783e+06              1195                    73.897993                  1.000614e+06       0  -36.845376   87.275265   -0.083106 -1835.597280  1.236650e+10   8.518100e+08    0.063167 13530.091358   44.438571  993.675195    13519.172500    13581.186096    13457.158904        0.917417        0.579317              0.0              0.0    13523.455000    13723.642500    13323.267500        2.960597        0.513874              0.0              0.0        13400.01        13715.65        13557.83        2.334758        0.408693             0.0            0.0   -9.079702          -3.613173        -5.466529    13519.172500    13519.172500    13536.954634    13546.034336              0.040434              0.038529               0.001905   -0.003392          3.594825 12624.501074 -482.889332    -482.380979       -0.508353             13557.83             13557.83          13557.83          13557.83        0.0        0.0            0.0            0.0  66.026407             26130.822906              26116.40235             0.0               0.0              0.0       13155.38      13710.33700                      0.0                        0.0     43.122386                 0.0                   0.0                   0.0    -96.381838    27.113135       40.869345              33.847632   -59.130655          0.0           0.0     -0.067028            -0.026671          -0.040358     -2.026040            -1.300891          -0.725150   13518.116931   0.435028    0.434084  -0.200204 13506.846667 13516.766250       NaN              NaN            NaN     NaN     NaN      NaN             NaN           NaN      NaN      NaN       NaN              NaN            NaN
+2018-01-01 01:00:00 13528.99 13571.74 13402.28 13445.63  72.537533 2018-01-01 01:14:59.999        9.778198e+05               898                    34.257652                  4.618369e+05       0  -72.270882   14.737732   -0.140089 -2437.394740 -1.948950e+10  -4.233517e+09   -0.383885 13522.094460   36.244255  987.551123    13504.464000    13585.321828    13423.606172        1.197498        0.136189              0.0              0.0    13513.407333    13707.449333    13319.365333        2.871844        0.325354              0.0              0.0        13400.01        13715.65        13557.83        2.337301        0.144532             0.0            0.0  -15.692288          -6.028996        -9.663292    13504.464000    13504.464000    13522.904690    13538.596978              0.049005              0.059572              -0.010567   -0.005723          4.429901 12639.209574 -483.451935    -482.595171       -0.856764             13557.83             13557.83          13557.83          13557.83        0.0        0.0            0.0            0.0 -76.921114             26130.822906              26116.40235             0.0               0.0              0.0       13155.38      13705.13026                      0.0                        0.0     25.965263                 0.0                   0.0                   0.0    -93.706751    26.847020       14.453175              25.875470   -85.546825          0.0           0.0     -0.115908            -0.044518          -0.071390     -5.031126            -2.046938          -2.984188   13485.950812  -0.616305   -0.618212  -0.815276 13481.683333 13481.198125       NaN              NaN            NaN     NaN     NaN      NaN             NaN           NaN      NaN      NaN       NaN              NaN            NaN
 
+// File: data\processed\1d_btc_1d_data_2018_to_2024-2024-10-10_with_comprehensive_ta.csv
+// Snippet:
+ Open time     open     high      low    close       volume              Close time  Quote asset volume  Number of trades  Taker buy base asset volume  Taker buy quote asset volume  Ignore   volume_adi   volume_obv  volume_cmf    volume_fi     volume_em  volume_sma_em  volume_vpt  volume_vwap  volume_mfi  volume_nvi  volatility_bbm  volatility_bbh  volatility_bbl  volatility_bbw  volatility_bbp  volatility_bbhi  volatility_bbli  volatility_kcc  volatility_kch  volatility_kcl  volatility_kcw  volatility_kcp  volatility_kchi  volatility_kcli  volatility_dcl  volatility_dch  volatility_dcm  volatility_dcw  volatility_dcp  volatility_atr  volatility_ui  trend_macd  trend_macd_signal  trend_macd_diff  trend_sma_fast  trend_sma_slow  trend_ema_fast  trend_ema_slow  trend_vortex_ind_pos  trend_vortex_ind_neg  trend_vortex_ind_diff  trend_trix  trend_mass_index    trend_dpo   trend_kst  trend_kst_sig  trend_kst_diff  trend_ichimoku_conv  trend_ichimoku_base  trend_ichimoku_a  trend_ichimoku_b  trend_stc  trend_adx  trend_adx_pos  trend_adx_neg  trend_cci  trend_visual_ichimoku_a  trend_visual_ichimoku_b  trend_aroon_up  trend_aroon_down  trend_aroon_ind  trend_psar_up  trend_psar_down  trend_psar_up_indicator  trend_psar_down_indicator  momentum_rsi  momentum_stoch_rsi  momentum_stoch_rsi_k  momentum_stoch_rsi_d  momentum_tsi  momentum_uo  momentum_stoch  momentum_stoch_signal  momentum_wr  momentum_ao  momentum_roc  momentum_ppo  momentum_ppo_signal  momentum_ppo_hist  momentum_pvo  momentum_pvo_signal  momentum_pvo_hist  momentum_kama  others_dr  others_dlr  others_cr  SMA_1w  EMA_1w  MACD_1w  MACD_Signal_1w  MACD_Diff_1w  SMA_1m  EMA_1m  MACD_1m  MACD_Signal_1m  MACD_Diff_1m  SMA_1y  EMA_1y  MACD_1y  MACD_Signal_1y  MACD_Diff_1y
+2018-01-01 13715.65 13818.55 12750.00 13380.00  8609.915844 2018-01-01 23:59:59.999        1.147997e+08            105595                  3961.938946                  5.280975e+07       0  1542.621673  8609.915844    0.179168 0.000000e+00  0.000000e+00   0.000000e+00    0.000000 13316.183333   50.000000 1000.000000    13380.000000    13380.000000    13380.000000        0.000000        0.000000              0.0              0.0    13316.183333    14384.733333    12247.633333       16.048893        0.529861              0.0              0.0         12750.0        13818.55       13284.275        7.986173        0.589584             0.0            0.0    0.000000           0.000000         0.000000    13380.000000    13380.000000    13380.000000    13380.000000              0.000000              0.000000               0.000000  -47.024833          1.000000 12274.639590 -478.456910    -478.456910        0.000000            13284.275            13284.275         13284.275         13284.275        0.0        0.0            0.0            0.0   0.000000             25420.109307             25170.733376             0.0               0.0              0.0        14150.0         13818.55                      0.0                        0.0         100.0                 0.0                   0.0                   0.0           0.0     0.000000       58.958402              58.958402   -41.041598          0.0           0.0      0.000000             0.000000           0.000000      0.000000             0.000000           0.000000   13380.000000   0.000000    0.000000   0.000000     NaN     NaN      NaN             NaN           NaN     NaN     NaN      NaN             NaN           NaN     NaN     NaN      NaN             NaN           NaN
+2018-01-02 13382.16 15473.49 12890.02 14675.11 20078.092111 2018-01-02 23:59:59.999        2.797171e+08            177728                 11346.326739                  1.580801e+08       0  9211.088605 28688.007955    0.321078 2.600334e+07  1.154797e+10   1.154797e+10 1943.448272 14037.073518  100.000000 1000.000000    14027.555000    15322.665000    12732.445000       18.465228        0.750000              0.0              0.0    13831.195000    15657.205000    12005.185000       26.404226        0.731082              0.0              0.0         12750.0        15473.49       14111.745       19.415287        0.706854             0.0            0.0  103.313618          20.662724        82.650895    14027.555000    14027.555000    13579.247692    13475.934074              0.175844              0.059951               0.115893    0.018905          2.214664 11627.084590 -453.215667    -465.836289       12.620622            14111.745            14111.745         14111.745         14111.745        0.0        0.0            0.0            0.0  66.666667             25420.109307             25170.733376             4.0               0.0              4.0        14150.0         13818.55                      0.0                        0.0         100.0                 0.0                   0.0                   0.0         100.0    48.879524       70.685407              64.821904   -29.314593          0.0           0.0      0.766653             0.153331           0.613322      9.671219             1.934244           7.736975   14021.535809   9.679447    9.239181   9.679447     NaN     NaN      NaN             NaN           NaN     NaN     NaN      NaN             NaN           NaN     NaN     NaN      NaN             NaN           NaN
+2018-01-03 14690.00 15307.56 14150.00 14919.51 15905.667639 2018-01-03 23:59:59.999        2.361169e+08            162787                  8994.953566                  1.335873e+08       0 14452.610408 44593.675594    0.324096 2.284391e+07  3.981061e+09   7.764517e+09 2208.342039 14306.467834  100.000000 1016.654049    14324.873333    15675.944071    12973.802595       18.863284        0.720061              0.0              0.0    14151.582222    15754.775556    12548.388889       22.657443        0.739499              0.0              0.0         12750.0        15473.49       14111.745       19.012315        0.796592             0.0            0.0  202.576269          57.045433       145.530837    14324.873333    14324.873333    13785.441893    13582.865624              0.308851              0.135292               0.173559    0.053184          3.351247 11329.766257 -441.626405    -457.766327       16.139922            14111.745            14111.745         14111.745         14111.745        0.0        0.0            0.0            0.0  76.702813             25420.109307             25170.733376             4.0               0.0              4.0        14150.0         13818.55                      0.0                        1.0         100.0                 0.0                   0.0                   0.0         100.0    53.114825       79.659187              69.767665   -20.340813          0.0           0.0      1.491410             0.420947           1.070464     12.965065             4.140408           8.824657   14453.163349   1.665405    1.651689  11.506054     NaN     NaN      NaN             NaN           NaN     NaN     NaN      NaN             NaN           NaN     NaN     NaN      NaN             NaN           NaN
+2018-01-04 14919.51 15280.00 13918.04 15059.54 21329.649574 2018-01-04 23:59:59.999        3.127816e+08            170310                 12680.812951                  1.861168e+08       0 28877.013800 65923.325168    0.438039 2.000718e+07 -8.285552e+08   4.900159e+09 2408.535666 14450.791237   62.450017 1016.654049    14508.540000    15840.397889    13176.682111       18.359640        0.706854              0.0              0.0    14301.818333    15844.703333    12758.933333       21.576068        0.745554              0.0              0.0         12750.0        15473.49       14111.745       18.771634        0.848008             0.0            0.0  289.208076         103.477961       185.730114    14508.540000    14508.540000    13981.456987    13692.248911              0.348243              0.202222               0.146021    0.098184          4.461911 11146.099590 -434.467206    -451.941547       17.474341            14111.745            14111.745         14111.745         14111.745        0.0        0.0            0.0            0.0  60.970283             25420.109307             25170.733376             4.0               0.0              4.0        14150.0         13818.55                      1.0                        0.0         100.0                 0.0                   0.0                   0.0         100.0    59.889428       84.800752              78.381782   -15.199248          0.0           0.0      2.112203             0.759198           1.353005     18.541685             7.020664          11.521022   14739.452049   0.938570    0.934193  12.552616     NaN     NaN      NaN             NaN           NaN     NaN     NaN      NaN             NaN           NaN     NaN     NaN      NaN             NaN           NaN
+2018-01-05 15059.56 17176.24 14600.00 16960.39 23251.491125 2018-01-05 23:59:59.999        3.693220e+08            192969                 13346.622293                  2.118299e+08       0 48232.257402 89174.816293    0.540873 2.346295e+07  1.428309e+10   7.245892e+09 5343.392701 14918.755895   74.117013 1016.654049    14998.910000    17293.791291    12704.028709       30.600641        0.927360              0.0              0.0    14690.563333    16440.119333    12941.007333       23.818773        1.148686              1.0              0.0         12750.0        17176.24       14963.120       29.510411        0.951234             0.0            0.0  505.420937         183.866556       321.554381    14998.910000    14998.910000    14439.754373    13934.333436              0.462946              0.209948               0.252999    0.175852          5.700442 10655.729590 -415.352925    -444.623823       29.270898            14963.120            14963.120         14963.120         14963.120        0.0        0.0            0.0            0.0 150.787109             25420.109307             25170.733376            16.0               0.0             16.0        14150.0         13818.55                      0.0                        0.0         100.0                 0.0                   0.0                   0.0         100.0    69.234594       95.123400              86.527780    -4.876600          0.0           0.0      3.627163             1.332791           2.294372     22.950237            10.206578          12.743659   15571.182211  12.622231   11.886895  26.759268     NaN     NaN      NaN             NaN           NaN     NaN     NaN      NaN             NaN           NaN     NaN     NaN      NaN             NaN           NaN
+
+// File: data\processed\1h_btc_1h_data_2018_to_2024-2024-10-10_with_comprehensive_ta.csv
+// Snippet:
+          Open time     open     high      low    close     volume              Close time  Quote asset volume  Number of trades  Taker buy base asset volume  Taker buy quote asset volume  Ignore  volume_adi  volume_obv  volume_cmf      volume_fi     volume_em  volume_sma_em  volume_vpt  volume_vwap  volume_mfi  volume_nvi  volatility_bbm  volatility_bbh  volatility_bbl  volatility_bbw  volatility_bbp  volatility_bbhi  volatility_bbli  volatility_kcc  volatility_kch  volatility_kcl  volatility_kcw  volatility_kcp  volatility_kchi  volatility_kcli  volatility_dcl  volatility_dch  volatility_dcm  volatility_dcw  volatility_dcp  volatility_atr  volatility_ui  trend_macd  trend_macd_signal  trend_macd_diff  trend_sma_fast  trend_sma_slow  trend_ema_fast  trend_ema_slow  trend_vortex_ind_pos  trend_vortex_ind_neg  trend_vortex_ind_diff  trend_trix  trend_mass_index    trend_dpo   trend_kst  trend_kst_sig  trend_kst_diff  trend_ichimoku_conv  trend_ichimoku_base  trend_ichimoku_a  trend_ichimoku_b  trend_stc  trend_adx  trend_adx_pos  trend_adx_neg  trend_cci  trend_visual_ichimoku_a  trend_visual_ichimoku_b  trend_aroon_up  trend_aroon_down  trend_aroon_ind  trend_psar_up  trend_psar_down  trend_psar_up_indicator  trend_psar_down_indicator  momentum_rsi  momentum_stoch_rsi  momentum_stoch_rsi_k  momentum_stoch_rsi_d  momentum_tsi  momentum_uo  momentum_stoch  momentum_stoch_signal  momentum_wr  momentum_ao  momentum_roc  momentum_ppo  momentum_ppo_signal  momentum_ppo_hist  momentum_pvo  momentum_pvo_signal  momentum_pvo_hist  momentum_kama  others_dr  others_dlr  others_cr   SMA_4h     EMA_4h  MACD_4h  MACD_Signal_4h  MACD_Diff_4h  SMA_1d  EMA_1d  MACD_1d  MACD_Signal_1d  MACD_Diff_1d  SMA_1w  EMA_1w  MACD_1w  MACD_Signal_1w  MACD_Diff_1w
+2018-01-01 00:00:00 13715.65 13715.65 13400.01 13529.01 443.356199 2018-01-01 00:59:59.999        5.993910e+06              5228                   228.521921                  3.090541e+06       0  -80.962651  443.356199   -0.182613       0.000000  0.000000e+00   0.000000e+00    0.000000 13548.223333   50.000000 1000.000000    13529.010000    13529.010000    13529.010000        0.000000        0.000000              0.0              0.0    13548.223333    13863.863333    13232.583333        4.659504        0.469564              0.0              0.0        13400.01        13715.65       13557.830        2.333061        0.408693             0.0            0.0    0.000000           0.000000         0.000000    13529.010000    13529.010000    13529.010000    13529.010000              0.000000              0.000000               0.000000  -48.216904          1.000000 12614.263060 -482.505118    -482.505118        0.000000            13557.830            13557.830         13557.830         13557.830        0.0        0.0            0.0            0.0   0.000000             26110.755035             26073.949425             0.0               0.0              0.0        13200.0      13715.65000                      0.0                        0.0    100.000000                 0.0                   0.0                   0.0      0.000000     0.000000       40.869345              40.869345   -59.130655          0.0           0.0      0.000000             0.000000           0.000000      0.000000             0.000000           0.000000   13529.010000   0.000000    0.000000   0.000000      NaN        NaN      NaN             NaN           NaN     NaN     NaN      NaN             NaN           NaN     NaN     NaN      NaN             NaN           NaN
+2018-01-01 01:00:00 13528.99 13595.89 13155.38 13203.06 383.697006 2018-01-01 01:59:59.999        5.154522e+06              4534                   180.840403                  2.430449e+06       0 -381.598327   59.659193   -0.461395 -125066.039106 -2.091721e+10  -2.091721e+10   -9.244286 13441.466239    0.000000  975.907328    13366.035000    13691.985000    13040.085000        4.877288        0.250000              0.0              0.0    13433.166667    13811.241667    13055.091667        5.628978        0.195686              0.0              0.0        13155.38        13715.65       13435.515        4.191744        0.085102             0.0            0.0  -26.001709          -5.200342       -20.801368    13366.035000    13366.035000    13478.863846    13504.865556              0.014858              0.042497              -0.027639   -0.004706          2.062311 12777.238060 -488.739035    -485.622077       -3.116959            13435.515            13435.515         13435.515         13435.515        0.0        0.0            0.0            0.0 -66.666667             26110.755035             26073.949425             0.0               4.0             -4.0        13200.0      13715.65000                      0.0                        0.0      0.000000                 0.0                   0.0                   0.0   -100.000000     6.305627        8.510183              24.689764   -91.489817          0.0           0.0     -0.192536            -0.038507          -0.154029     -1.084242            -0.216848          -0.867393   13386.024519  -2.409267   -2.438765  -2.409267      NaN        NaN      NaN             NaN           NaN     NaN     NaN      NaN             NaN           NaN     NaN     NaN      NaN             NaN           NaN
+2018-01-01 02:00:00 13203.00 13418.43 13200.00 13330.18 429.064572 2018-01-01 02:59:59.999        5.710192e+06              4887                   192.237935                  2.558505e+06       0 -299.234744  488.723765   -0.238222  -99407.649463 -3.381337e+09  -1.214928e+10   -5.113222 13398.678949    0.000000  975.907328    13354.083333    13622.358702    13085.807964        4.017878        0.455450              0.0              0.0    13394.178889    13719.038889    13069.318889        4.850764        0.401498              0.0              0.0        13155.38        13715.65       13435.515        4.195496        0.311992             0.0            0.0  -35.936476         -11.347569       -24.588908    13354.083333    13354.083333    13455.989408    13491.925885              0.034243              0.071343              -0.037101   -0.010518          3.051158 12789.189726 -489.196196    -486.813450       -2.382746            13435.515            13435.515         13435.515         13435.515        0.0        0.0            0.0            0.0 -50.618869             26110.755035             26073.949425             0.0               4.0             -4.0        13200.0      13715.65000                      0.0                        1.0     29.577383                 0.0                   0.0                   0.0    -99.137076    18.249913       31.199243              26.859590   -68.800757          0.0           0.0     -0.266355            -0.084077          -0.182279     -1.098686            -0.393216          -0.705471   13361.945273   0.962807    0.958202  -1.469657      NaN        NaN      NaN             NaN           NaN     NaN     NaN      NaN             NaN           NaN     NaN     NaN      NaN             NaN           NaN
+2018-01-01 03:00:00 13330.26 13611.27 13290.00 13410.03 420.087030 2018-01-01 03:59:59.999        5.657448e+06              4789                   137.918407                  1.858041e+06       0 -405.423519  908.810795   -0.241870  -80414.563919  1.081538e+10  -4.494390e+09   -2.596831 13408.307955   34.276298  981.753176    13368.070000    13605.401577    13130.738423        3.550723        0.588400              0.0              0.0    13404.909167    13728.871667    13080.946667        4.833490        0.507903              0.0              0.0        13155.38        13715.65       13435.515        4.191106        0.454513             0.0            0.0  -36.940793         -16.466214       -20.474579    13368.070000    13368.070000    13448.918730    13485.859523              0.063410              0.079032              -0.015622   -0.015649          4.044774 12775.203060 -488.661195    -487.275386       -1.385809            13435.515            13435.515         13435.515         13435.515        0.0        0.0            0.0            0.0  24.455777             26110.755035             26073.949425             0.0               4.0             -4.0        13200.0      13705.33700                      0.0                        0.0     41.318438                 0.0                   0.0                   0.0    -97.893070    22.988000       45.451300              28.386909   -54.548700          0.0           0.0     -0.273922            -0.122046          -0.151876     -1.263364            -0.567246          -0.696119   13382.843016   0.599017    0.597230  -0.879444 13368.07 13386.7620      NaN             NaN           NaN     NaN     NaN      NaN             NaN           NaN     NaN     NaN      NaN             NaN           NaN
+2018-01-01 04:00:00 13434.98 13623.29 13322.15 13601.01 340.807329 2018-01-01 04:59:59.999        4.588047e+06              4563                   172.957635                  2.328058e+06       0 -115.045806 1249.618124   -0.057038  -59628.571403  1.951448e+09  -2.882931e+09    2.256804 13426.416995   48.641246  995.734891    13414.658000    13697.125856    13132.190144        4.211331        0.829864              0.0              0.0    13427.024000    13746.422000    13107.626000        4.757540        0.772366              0.0              0.0        13155.38        13715.65       13435.515        4.176551        0.795384             0.0            0.0  -22.071801         -17.587331        -4.484470    13414.658000    13414.658000    13472.317387    13494.389188              0.085813              0.097950              -0.012137   -0.017316          5.031577 12728.615060 -486.879169    -487.196143        0.316974            13435.515            13435.515         13435.515         13435.515        0.0        0.0            0.0            0.0  67.095568             26110.755035             26073.949425             0.0               4.0             -4.0        13200.0      13695.23026                      0.0                        0.0     58.947586                 0.0                   0.0                   0.0    -95.558929    36.114816       79.538437              52.062993   -20.461563          0.0           0.0     -0.163563            -0.130349          -0.033213     -2.869745            -1.027746          -1.842000   13476.581439   1.424158    1.414112   0.532190 13386.07 13472.4612      NaN             NaN           NaN     NaN     NaN      NaN             NaN           NaN     NaN     NaN      NaN             NaN           NaN
+
+// File: data\processed\4h_btc_4h_data_2018_to_2024-2024-10-10_with_comprehensive_ta.csv
+// Snippet:
+          Open time     open     high      low    close      volume              Close time  Quote asset volume  Number of trades  Taker buy base asset volume  Taker buy quote asset volume  Ignore  volume_adi  volume_obv  volume_cmf     volume_fi     volume_em  volume_sma_em  volume_vpt  volume_vwap  volume_mfi  volume_nvi  volatility_bbm  volatility_bbh  volatility_bbl  volatility_bbw  volatility_bbp  volatility_bbhi  volatility_bbli  volatility_kcc  volatility_kch  volatility_kcl  volatility_kcw  volatility_kcp  volatility_kchi  volatility_kcli  volatility_dcl  volatility_dch  volatility_dcm  volatility_dcw  volatility_dcp  volatility_atr  volatility_ui  trend_macd  trend_macd_signal  trend_macd_diff  trend_sma_fast  trend_sma_slow  trend_ema_fast  trend_ema_slow  trend_vortex_ind_pos  trend_vortex_ind_neg  trend_vortex_ind_diff  trend_trix  trend_mass_index    trend_dpo   trend_kst  trend_kst_sig  trend_kst_diff  trend_ichimoku_conv  trend_ichimoku_base  trend_ichimoku_a  trend_ichimoku_b  trend_stc  trend_adx  trend_adx_pos  trend_adx_neg   trend_cci  trend_visual_ichimoku_a  trend_visual_ichimoku_b  trend_aroon_up  trend_aroon_down  trend_aroon_ind  trend_psar_up  trend_psar_down  trend_psar_up_indicator  trend_psar_down_indicator  momentum_rsi  momentum_stoch_rsi  momentum_stoch_rsi_k  momentum_stoch_rsi_d  momentum_tsi  momentum_uo  momentum_stoch  momentum_stoch_signal  momentum_wr  momentum_ao  momentum_roc  momentum_ppo  momentum_ppo_signal  momentum_ppo_hist  momentum_pvo  momentum_pvo_signal  momentum_pvo_hist  momentum_kama  others_dr  others_dlr  others_cr    SMA_8h       EMA_8h  MACD_8h  MACD_Signal_8h  MACD_Diff_8h  SMA_1d  EMA_1d  MACD_1d  MACD_Signal_1d  MACD_Diff_1d  SMA_1w  EMA_1w  MACD_1w  MACD_Signal_1w  MACD_Diff_1w
+2018-01-01 00:00:00 13715.65 13715.65 13155.38 13410.03 1676.204807 2018-01-01 03:59:59.999        2.251607e+07             19438                   739.518666                  9.937537e+06       0 -152.491047 1676.204807   -0.090974      0.000000  0.000000e+00   0.000000e+00    0.000000 13427.020000   50.000000 1000.000000    13410.030000    13410.030000    13410.030000        0.000000        0.000000              0.0              0.0    13427.020000    13987.290000    12866.750000        8.345411        0.484838              0.0              0.0        13155.38        13715.65       13435.515        4.177992        0.454513             0.0            0.0    0.000000           0.000000         0.000000    13410.030000    13410.030000    13410.030000    13410.030000              0.000000              0.000000               0.000000  -48.554196          1.000000 12725.292576 -486.900154    -486.900154        0.000000            13435.515            13435.515         13435.515         13435.515        0.0        0.0            0.0            0.0    0.000000              26054.92477             25971.948193             0.0               0.0              0.0        12750.0        13715.650                      0.0                        0.0    100.000000                 0.0                   0.0                   0.0      0.000000     0.000000       45.451300              45.451300   -54.548700          0.0           0.0      0.000000             0.000000           0.000000      0.000000             0.000000           0.000000   13410.030000   0.000000    0.000000   0.000000       NaN          NaN      NaN             NaN           NaN     NaN     NaN      NaN             NaN           NaN     NaN     NaN      NaN             NaN           NaN
+2018-01-01 04:00:00 13434.98 13818.55 13322.15 13570.35 1302.214836 2018-01-01 07:59:59.999        1.770254e+07             18061                   588.516222                  7.998796e+06       0 -152.491047 2978.419643   -0.051199 208771.082508  5.139866e+09   5.139866e+09   15.568279 13489.686271  100.000000 1011.955231    13490.190000    13650.510000    13329.870000        2.376838        0.750000              0.0              0.0    13498.685000    14027.020000    12970.350000        7.827948        0.567822              0.0              0.0        13155.38        13818.55       13486.965        4.915943        0.625737             0.0            0.0   12.789060           2.557812        10.231248    13490.190000    13490.190000    13434.694615    13421.905556              0.049210              0.029199               0.020011    0.002335          1.981677 12645.132576 -483.833040    -485.366597        1.533557            13486.965            13486.965         13486.965         13486.965        0.0        0.0            0.0            0.0   66.666667              26054.92477             25971.948193             4.0               0.0              4.0        12750.0        13715.650                      0.0                        0.0    100.000000                 0.0                   0.0                   0.0    100.000000    23.488885       62.573699              54.012500   -37.426301          0.0           0.0      0.095285             0.019057           0.076228     -1.809762            -0.361952          -1.447809   13483.649755   1.195523    1.188433   1.195523 13490.190 13516.910000      NaN             NaN           NaN     NaN     NaN      NaN             NaN           NaN     NaN     NaN      NaN             NaN           NaN
+2018-01-01 08:00:00 13569.98 13735.24 13001.13 13220.56 1319.755931 2018-01-01 11:59:59.999        1.765121e+07             17200                   582.668293                  7.792109e+06       0 -683.280627 1658.663712   -0.158970 112998.438277 -1.124536e+10  -3.052749e+09  -18.449814 13437.269842   50.132928 1011.955231    13400.313333    13686.246058    13114.380608        4.267553        0.185672              0.0              0.0    13438.782222    14035.708889    12841.855556        8.883642        0.317212              0.0              0.0        13001.13        13818.55       13409.840        6.100007        0.268442             0.0            0.0   -5.240242           0.998201        -6.238443    13400.313333    13400.313333    13401.750828    13406.991070              0.075737              0.085213              -0.009476    0.001035          3.020180 12735.009243 -487.271936    -486.001710       -1.270226            13409.840            13409.840         13409.840         13409.840        0.0        0.0            0.0            0.0  -91.059952              26054.92477             25971.948193             4.0               8.0             -4.0        12750.0        13715.650                      0.0                        1.0     29.853808                 0.0                   0.0                   0.0     95.266260    26.113202       26.844217              44.956405   -73.155783          0.0           0.0     -0.039086             0.007428          -0.046514     -3.168972            -0.923356          -2.245615   13361.820674  -2.577605   -2.611407  -1.412898 13395.455 13319.343333      NaN             NaN           NaN     NaN     NaN      NaN             NaN           NaN     NaN     NaN      NaN             NaN           NaN
+2018-01-01 12:00:00 13220.56 13330.00 12750.00 13247.00 1831.933153 2018-01-01 15:59:59.999        2.391259e+07             21357                   830.314747                  1.083304e+07       0  624.340623 3490.596865    0.101848 103775.277461 -1.039052e+10  -5.498671e+09  -14.786103 13339.169069   29.818229 1011.955231    13361.985000    13642.959867    13081.010133        4.205586        0.295382              0.0              0.0    13356.336667    13949.031667    12763.641667        8.875113        0.407763              0.0              0.0        12750.00        13818.55       13284.275        7.996941        0.465116             0.0            0.0  -17.196871          -2.640813       -14.556058    13361.985000    13361.985000    13377.943009    13395.139880              0.095003              0.148485              -0.053482   -0.002262          4.049399 12773.337576 -488.738470    -486.685900       -2.052570            13284.275            13284.275         13284.275         13284.275        0.0        0.0            0.0            0.0 -115.836348              26054.92477             25971.948193             4.0              12.0             -8.0        12750.0        13818.550                      0.0                        0.0     33.642859                 0.0                   0.0                   0.0     91.580849    40.688297       46.511628              45.309848   -53.488372          0.0           0.0     -0.128381            -0.019734          -0.108648     -1.645296            -1.067744          -0.577551   13308.984209   0.199992    0.199792  -1.215732 13233.780 13271.114444      NaN             NaN           NaN     NaN     NaN      NaN             NaN           NaN     NaN     NaN      NaN             NaN           NaN
+2018-01-01 16:00:00 13247.00 13290.65 12940.00 13240.37 1092.337234 2018-01-01 19:59:59.999        1.434887e+07             13178                   557.453779                  7.324320e+06       0 1403.415538 2398.259631    0.194313  87915.638415  2.418000e+09  -3.519503e+09  -15.332808 13311.618461   43.515937 1011.448756    13337.662000    13607.148983    13068.175017        4.040993        0.319487              0.0              0.0    13316.470667    13860.756667    12772.184667        8.174628        0.430091              0.0              0.0        12750.00        13818.55       13284.275        8.011524        0.458912             0.0            0.0  -26.897514          -7.492153       -19.405360    13337.662000    13337.662000    13356.777930    13383.675444              0.128510              0.170804              -0.042294   -0.006846          5.006545 12797.660576 -489.669126    -487.282545       -2.386581            13284.275            13284.275         13284.275         13284.275        0.0        0.0            0.0            0.0  -72.430696              26054.92477             25971.948193             4.0              12.0             -8.0        12750.0        13775.808                      0.0                        0.0     33.159170                 0.0                   0.0                   0.0     88.552137    46.482915       45.891161              39.749002   -54.108839          0.0           0.0     -0.200973            -0.055981          -0.144991     -4.157383            -1.685672          -2.471711   13277.499903  -0.050049   -0.050062  -1.265172 13243.685 13250.618148      NaN             NaN           NaN     NaN     NaN      NaN             NaN           NaN     NaN     NaN      NaN             NaN           NaN
 
 // File: data\raw\btc_15m_data_2018_to_2024-2024-10-10.csv
 // Snippet:
@@ -677,26 +202,3 @@ if __name__ == "__main__":
 2018-01-01 12:00:00 13220.56 13330.00 12750.00 13247.00 1831.933153 2018-01-01 15:59:59.999        2.391259e+07             21357                   830.314747                  1.083304e+07       0
 2018-01-01 16:00:00 13247.00 13290.65 12940.00 13240.37 1092.337234 2018-01-01 19:59:59.999        1.434887e+07             13178                   557.453779                  7.324320e+06       0
 
-├── **data**
-│   ├── **raw**
-│   │   ├── btc_15m_data_2018_to_2024-2024-10-10.csv
-│   │   ├── btc_1d_data_2018_to_2024-2024-10-10.csv
-│   │   ├── btc_1h_data_2018_to_2024-2024-10-10.csv
-│   │   └── btc_4h_data_2018_to_2024-2024-10-10.csv
-│   ├── **processed**
-│   │   ├── btc_15m_processed.parquet
-│   │   ├── btc_1d_processed.parquet
-│   │   ├── btc_1h_processed.parquet
-│   │   └── btc_4h_processed.parquet
-│   └── **data_loader.py**
-├── **feature_engineering**
-│   ├── **technical_indicators.py**
-│   ├── **wavelet_features.py**
-│   ├── **advanced_features.py**  # (e.g., sentiment analysis, statistical features)
-│   └── **feature_engineering_pipeline.py**
-├── **utils**
-│   ├── **logging_config.py**
-│   └── **data_utilities.py**  # (e.g., data cleaning, handling missing values)
-├── **main.py**
-└── **requirements.txt**
-		
