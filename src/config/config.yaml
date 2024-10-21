@@ -1,3 +1,5 @@
+# src/config/config.yaml
+
 data:
   raw_dir: "../../data/raw"
   final_dir: "../../data/final"
