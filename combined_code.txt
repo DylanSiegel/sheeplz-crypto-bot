@@ -1,66 +1,950 @@
 **File Tree (Relevant Files Only)**
   .
-    - run_preprocessing.py
-  data\final
-    - processed_data_15m.csv
+    - lnn_module.py
+    - preprocess.py
+    - test.py
   data\raw
     - btc_15m_data_2018_to_2024-2024-10-10.csv
     - btc_1d_data_2018_to_2024-2024-10-10.csv
     - btc_1h_data_2018_to_2024-2024-10-10.csv
     - btc_4h_data_2018_to_2024-2024-10-10.csv
-  src
-    - __init__.py
-  src\agent
-    - agent.py
-    - custom_policy.py
-    - environment.py
-    - __init__.py
-  src\config
-    - config.yaml
-    - __init__.py
-  src\data_preprocessing
-    - indicators.py
-    - preprocess.py
-    - utils.py
-    - __init__.py
-  src\models
-    - liquid_nn.py
-    - __init__.py
-  src\training
-    - train.py
-    - __init__.py
-// File: run_preprocessing.py
-# run_preprocessing.py
 
+// File: lnn_module.py
+# File: lnn_module.py
+
+import pandas as pd
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+from sklearn.preprocessing import StandardScaler
+import joblib
 import os
-import sys
 from datetime import datetime
+import torch.nn as nn
+import torch.optim as optim
+from tqdm import tqdm
+import multiprocessing
+from torch.cuda.amp import GradScaler, autocast
 
-# Ensure the src directory is in the PYTHONPATH
-project_root = os.path.abspath(os.path.dirname(__file__))
-src_dir = os.path.join(project_root, 'src')
-if src_dir not in sys.path:
-    sys.path.insert(0, src_dir)
+# Define file paths for all timeframes
+PROCESSED_DATA_DIR = r"data\final"
+PROCESSED_DATA_PATHS = {
+    "15m": os.path.join(PROCESSED_DATA_DIR, "processed_data_15m.csv.gz"),
+    "1h": os.path.join(PROCESSED_DATA_DIR, "processed_data_1h.csv.gz"),
+    "4h": os.path.join(PROCESSED_DATA_DIR, "processed_data_4h.csv.gz"),
+    "1d": os.path.join(PROCESSED_DATA_DIR, "processed_data_1d.csv.gz")
+}
 
-from src.data_preprocessing.preprocess import main
+# Parameters
+TARGET_COLUMNS = {
+    '15m': ['target_15m', 'target_1h', 'target_4h', 'target_1d'],
+    '1h': ['target_1h', 'target_4h', 'target_1d'],
+    '4h': ['target_4h', 'target_1d'],
+    '1d': ['target_1d']
+}
+FEATURE_COLUMNS = {
+    '15m': [
+        'open', 'high', 'low', 'close', 'volume',
+        'return_15m', 'return_1h', 'return_4h', 'return_1d',
+        'ema_14', 'sma_14', 'rsi_14', 'stoch_k', 'stoch_d',
+        'bb_mavg', 'bb_hband', 'bb_lband', 'bb_pband', 'bb_wband',
+        'kc_hband', 'kc_lband', 'kc_mband', 'kc_pband', 'kc_wband',
+        'atr_14', 'obv', 'macd', 'macd_signal', 'macd_diff',
+        'adx', 'adx_pos', 'adx_neg', 'ulcer_index',
+        'adi', 'cmf', 'eom', 'vpt'
+    ],
+    '1h': [
+        'open', 'high', 'low', 'close', 'volume',
+        'return_15m', 'return_1h', 'return_4h', 'return_1d',
+        'ema_14', 'sma_14', 'rsi_14', 'stoch_k', 'stoch_d',
+        'bb_mavg', 'bb_hband', 'bb_lband', 'bb_pband', 'bb_wband',
+        'kc_hband', 'kc_lband', 'kc_mband', 'kc_pband', 'kc_wband',
+        'atr_14', 'obv', 'macd', 'macd_signal', 'macd_diff',
+        'adx', 'adx_pos', 'adx_neg', 'ulcer_index',
+        'adi', 'cmf', 'eom', 'vpt'
+    ],
+    '4h': [
+        'open', 'high', 'low', 'close', 'volume',
+        'return_15m', 'return_1h', 'return_4h', 'return_1d',
+        'ema_14', 'sma_14', 'rsi_14', 'stoch_k', 'stoch_d',
+        'bb_mavg', 'bb_hband', 'bb_lband', 'bb_pband', 'bb_wband',
+        'kc_hband', 'kc_lband', 'kc_mband', 'kc_pband', 'kc_wband',
+        'atr_14', 'obv', 'macd', 'macd_signal', 'macd_diff',
+        'adx', 'adx_pos', 'adx_neg', 'ulcer_index',
+        'adi', 'cmf', 'eom', 'vpt'
+    ],
+    '1d': [
+        'open', 'high', 'low', 'close', 'volume',
+        'return_15m', 'return_1h', 'return_4h', 'return_1d',
+        'ema_14', 'sma_14', 'rsi_14', 'stoch_k', 'stoch_d',
+        'bb_mavg', 'bb_hband', 'bb_lband', 'bb_pband', 'bb_wband',
+        'kc_hband', 'kc_lband', 'kc_mband', 'kc_pband', 'kc_wband',
+        'atr_14', 'obv', 'macd', 'macd_signal', 'macd_diff',
+        'adx', 'adx_pos', 'adx_neg', 'ulcer_index',
+        'adi', 'cmf', 'eom', 'vpt'
+    ]
+}
+SEQ_LENGTH = 10
+BATCH_SIZE = 256  # Adjust based on GPU memory
+NUM_WORKERS = multiprocessing.cpu_count()
+SCALER_DIR = 'scalers'
+MODEL_DIR = 'models'
+NUM_EPOCHS = 50
+LEARNING_RATE = 0.0001
+
+# Ensure directories exist
+os.makedirs(SCALER_DIR, exist_ok=True)
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+# Enable CUDA benchmark for optimized performance on fixed input sizes
+torch.backends.cudnn.benchmark = True
+
+# Check device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def load_and_preprocess(processed_path, feature_cols, target_cols, scaler_path):
+    """
+    Loads and preprocesses the data.
+
+    Parameters:
+    - processed_path: Path to the processed CSV file.
+    - feature_cols: List of feature column names.
+    - target_cols: List of target column names.
+    - scaler_path: Path to save/load the scaler.
+
+    Returns:
+    - df_scaled: DataFrame with scaled features and targets.
+    """
+    # Load processed data
+    df_processed = pd.read_csv(
+        processed_path,
+        parse_dates=['open time'],
+        dtype={col: np.float32 for col in feature_cols},
+        compression='gzip'
+    )
+
+    # Handle missing values using forward and backward fill
+    df_processed.ffill(inplace=True)
+    df_processed.bfill(inplace=True)
+
+    # Feature scaling
+    scaler = StandardScaler()
+    scaled_features = scaler.fit_transform(df_processed[feature_cols].astype(np.float32))
+    df_scaled = pd.DataFrame(scaled_features, columns=feature_cols, index=df_processed.index)
+    df_scaled['open time'] = df_processed['open time']
+    for target in target_cols:
+        df_scaled[target] = df_processed[target].astype(np.float32)
+
+    # Save the scaler
+    joblib.dump(scaler, scaler_path)
+
+    return df_scaled
+
+def create_sequences(data, seq_length, feature_cols, target_cols):
+    """
+    Creates input sequences and corresponding targets.
+
+    Parameters:
+    - data: DataFrame containing features and targets.
+    - seq_length: Number of time steps in each input sequence.
+    - feature_cols: List of feature column names.
+    - target_cols: List of target column names.
+
+    Returns:
+    - sequences: Numpy array of shape (num_samples, seq_length, num_features)
+    - targets: Dictionary of Numpy arrays for each target
+    """
+    sequences = []
+    targets = {target: [] for target in target_cols}
+
+    for i in range(len(data) - seq_length):
+        seq = data[feature_cols].iloc[i:i+seq_length].values
+        sequences.append(seq)
+        for target in target_cols:
+            targets[target].append(data[target].iloc[i+seq_length])
+
+    sequences = np.array(sequences, dtype=np.float32)
+    for target in target_cols:
+        targets[target] = np.array(targets[target], dtype=np.float32)
+
+    return sequences, targets
+
+class FinancialDataset(Dataset):
+    """
+    Custom Dataset for financial data sequences.
+    """
+    def __init__(self, sequences, targets):
+        self.sequences = torch.tensor(sequences, dtype=torch.float32)
+        self.targets = {key: torch.tensor(val, dtype=torch.float32).unsqueeze(1) for key, val in targets.items()}
+
+    def __len__(self):
+        return len(self.sequences)
+
+    def __getitem__(self, idx):
+        sequence = self.sequences[idx]
+        target = {key: self.targets[key][idx] for key in self.targets}
+        return sequence, target
+
+class LNNModel(nn.Module):
+    """
+    Optimized Liquid Neural Network Model using LSTM layers with dropout and batch normalization.
+    """
+    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout=0.3):
+        super(LNNModel, self).__init__()
+        self.lstm = nn.LSTM(
+            input_size,
+            hidden_size,
+            num_layers,
+            batch_first=True,
+            dropout=dropout,
+            bidirectional=True
+        )
+        self.batch_norm = nn.BatchNorm1d(hidden_size * 2)
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, output_size)
+        )
+
+    def forward(self, x):
+        # Forward propagate LSTM
+        out, _ = self.lstm(x)
+
+        # Apply batch normalization on the last time step
+        out = self.batch_norm(out[:, -1, :])
+
+        # Decode the hidden state of the last time step
+        out = self.fc(out)
+        return out
+
+def train_model(timeframe):
+    """
+    Trains the LNN model for a specific timeframe.
+
+    Parameters:
+    - timeframe: Timeframe identifier (e.g., '15m', '1h').
+
+    Returns:
+    - None
+    """
+    processed_path = PROCESSED_DATA_PATHS[timeframe]
+    feature_cols = FEATURE_COLUMNS[timeframe]
+    target_cols = TARGET_COLUMNS[timeframe]
+    scaler_path = os.path.join(SCALER_DIR, f"scaler_{timeframe}.save")
+    model_save_path = os.path.join(MODEL_DIR, f"lnn_model_{timeframe}.pth")
+
+    # Load and preprocess data
+    df_scaled = load_and_preprocess(processed_path, feature_cols, target_cols, scaler_path)
+
+    # Create sequences and targets
+    sequences, targets = create_sequences(df_scaled, SEQ_LENGTH, feature_cols, target_cols)
+
+    # For simplicity, let's train to predict the first target in target_cols
+    primary_target = target_cols[0]
+    dataset = FinancialDataset(sequences, {primary_target: targets[primary_target]})
+    data_loader = DataLoader(
+        dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=True
+    )
+
+    # Initialize model, loss function, and optimizer
+    input_size = len(feature_cols)
+    hidden_size = 256
+    num_layers = 3
+    output_size = 1
+
+    model = LNNModel(input_size, hidden_size, num_layers, output_size).to(device)
+    criterion = nn.MSELoss()
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5)
+
+    # Initialize GradScaler for mixed precision training
+    scaler = GradScaler()
+
+    # Learning rate scheduler
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
+
+    # Training loop
+    for epoch in range(NUM_EPOCHS):
+        model.train()
+        epoch_loss = 0
+        progress = tqdm(
+            data_loader,
+            desc=f"{timeframe} Epoch {epoch+1}/{NUM_EPOCHS}",
+            leave=False,
+            ncols=100
+        )
+
+        for sequences_batch, targets_batch in progress:
+            sequences_batch = sequences_batch.to(device, non_blocking=True)
+            targets_batch = targets_batch.to(device, non_blocking=True)
+
+            optimizer.zero_grad()
+
+            # Mixed precision forward pass
+            with autocast():
+                outputs = model(sequences_batch)
+                loss = criterion(outputs, targets_batch)
+
+            # Scales loss and backpropagates
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            epoch_loss += loss.item()
+            progress.set_postfix(loss=loss.item())
+
+        avg_loss = epoch_loss / len(data_loader)
+        print(f"{timeframe} Epoch [{epoch+1}/{NUM_EPOCHS}], Loss: {avg_loss:.6f}")
+
+        # Step the scheduler
+        scheduler.step(avg_loss)
+
+    # Save the trained model
+    torch.save(model.state_dict(), model_save_path)
+    print(f"{timeframe} Model training complete and saved to {model_save_path}")
+
+def main():
+    """
+    Main function to train models for all timeframes in parallel.
+    """
+    timeframes = list(PROCESSED_DATA_PATHS.keys())
+    with Pool(processes=cpu_count()) as pool:
+        pool.map(train_model, timeframes)
 
 if __name__ == "__main__":
-    start_time = datetime.now()
-    print(f"Starting data preprocessing at {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     main()
-    end_time = datetime.now()
-    print(f"Data preprocessing completed at {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Total duration: {end_time - start_time}")
 
 
-// File: data\final\processed_data_15m.csv
-// Snippet:
-          Open time      open      high       low     close    volume timeframe  return_15m  return_1h  return_4h  return_1d    ema_14    sma_14    rsi_14  stoch_k  stoch_d   bb_mavg  bb_hband  bb_lband  bb_pband  bb_wband  kc_hband  kc_lband  kc_mband  kc_pband  kc_wband   atr_14      obv      macd  macd_signal  macd_diff       adx   adx_pos   adx_neg  ulcer_index       adi      cmf       eom      vpt  target_15m  target_1h  target_4h  target_1d
-2018-01-02 08:15:00 -0.650249 -0.649854 -0.651853 -0.652802 -0.479828       15m   -0.948318   1.118089   1.558018  -0.607880 -0.655741 -0.658159  0.145356 0.967241 1.638338 -0.658179 -0.653196 -0.663132  0.681056  0.779322 -0.654277 -0.662415 -0.658336  0.470376  1.718020 0.090990 0.270198 -0.199154    -0.497168   0.893645 -0.538575  0.137923 -0.092188     1.388288 -1.434890 1.278633  0.296820 1.781499           0          1          1          1
-2018-01-02 08:30:00 -0.652795 -0.652909 -0.652401 -0.653054 -0.495970       15m   -0.097393   0.184753   1.405218  -0.219456 -0.655382 -0.657595  0.114156 0.919495 1.355023 -0.658373 -0.653874 -0.662834  0.704164  0.705694 -0.654573 -0.662369 -0.658462  0.470738  1.647853 0.046731 0.269087 -0.152085    -0.430033   0.839996 -0.658614  0.051452 -0.097265     1.186745 -1.434925 0.995821 -0.209438 1.781485           0          1          1          1
-2018-01-02 08:45:00 -0.653046 -0.653159 -0.653509 -0.654021 -0.484050       15m   -0.363928  -0.171318   1.010842  -0.390759 -0.655200 -0.657049 -0.010562 0.736145 0.954567 -0.658444 -0.654073 -0.662774  0.588905  0.686151 -0.654837 -0.662280 -0.658550  0.399495  1.575160 0.015231 0.267896 -0.125811    -0.370745   0.741811 -0.758162 -0.061001 -0.045244     0.970939 -1.434977 0.920483 -0.095335 1.781429           1          1          1          1
-2018-01-02 09:00:00 -0.653154 -0.645850 -0.652307 -0.646172 -0.514480       15m    2.924090   0.766556   1.472767  -0.258326 -0.653995 -0.655912  0.836702 1.524905 1.157525 -0.658331 -0.653519 -0.663109  1.592141  0.753319 -0.654662 -0.662261 -0.658452  1.127525  1.607158 0.054721 0.268881 -0.004877    -0.297629   0.914832 -0.767657  0.699485 -0.337897     0.779443 -1.434903 0.896526  1.930892 1.781804           0          1          1          1
-2018-01-02 09:15:00 -0.645824 -0.646801 -0.650062 -0.647648 -0.528700       15m   -0.547805   0.973166   1.397995  -0.236341 -0.653148 -0.654877  0.637847 1.291313 1.292846 -0.657301 -0.652537 -0.662030  1.263801  0.744766 -0.654861 -0.660726 -0.657788  1.058353  1.247912 0.055549 0.267992  0.071174    -0.222983   0.933969 -0.776475  0.458936 -0.514066     0.563215 -1.434876 1.499806  0.218340 1.781741           0          1          1          1
+// File: preprocess.py
+# File: preprocess.py
+
+import pandas as pd
+import numpy as np
+import os
+from ta import trend, momentum, volatility, volume
+from multiprocessing import Pool, cpu_count
+from functools import partial
+from tqdm import tqdm
+
+# Define file paths for all timeframes
+RAW_DATA_PATHS = {
+    "15m": r"data\raw\btc_15m_data_2018_to_2024-2024-10-10.csv",
+    "1h": r"data\raw\btc_1h_data_2018_to_2024-2024-10-10.csv",
+    "4h": r"data\raw\btc_4h_data_2018_to_2024-2024-10-10.csv",
+    "1d": r"data\raw\btc_1d_data_2018_to_2024-2024-10-10.csv"
+}
+
+PROCESSED_DATA_DIR = r"data\final"
+
+# Parameters
+FEATURE_COLUMNS = [
+    'open', 'high', 'low', 'close', 'volume'
+]
+TARGET_COLUMNS = {
+    '15m': ['target_15m', 'target_1h', 'target_4h', 'target_1d'],
+    '1h': ['target_1h', 'target_4h', 'target_1d'],
+    '4h': ['target_4h', 'target_1d'],
+    '1d': ['target_1d']
+}
+SEQ_LENGTH = 10
+CHUNKSIZE = 500000  # Adjust based on memory constraints
+
+def preprocess_chunk(df_chunk, timeframe):
+    """
+    Preprocesses a chunk of the dataframe by calculating technical indicators.
+
+    Parameters:
+    - df_chunk: Pandas DataFrame chunk.
+    - timeframe: Timeframe identifier (e.g., '15m', '1h').
+
+    Returns:
+    - df_chunk: Processed DataFrame chunk with technical indicators.
+    """
+    # Ensure column names are lowercase
+    df_chunk.columns = df_chunk.columns.str.lower()
+
+    # Sort by time to ensure chronological order
+    df_chunk.sort_values('open time', inplace=True)
+    df_chunk.reset_index(drop=True, inplace=True)
+
+    # Handle missing values using forward and backward fill
+    df_chunk.ffill(inplace=True)
+    df_chunk.bfill(inplace=True)
+
+    # Feature Engineering
+    # Returns
+    df_chunk['return_15m'] = df_chunk['close'].pct_change(periods=1)
+    df_chunk['return_1h'] = df_chunk['close'].pct_change(periods=4)  # 1 hour = 4 * 15m
+    df_chunk['return_4h'] = df_chunk['close'].pct_change(periods=16)  # 4 hours = 16 * 15m
+    df_chunk['return_1d'] = df_chunk['close'].pct_change(periods=96)  # 1 day = 96 * 15m
+
+    # Technical Indicators
+    # EMA and SMA
+    df_chunk['ema_14'] = trend.EMAIndicator(close=df_chunk['close'], window=14).ema_indicator()
+    df_chunk['sma_14'] = trend.SMAIndicator(close=df_chunk['close'], window=14).sma_indicator()
+
+    # RSI
+    df_chunk['rsi_14'] = momentum.RSIIndicator(close=df_chunk['close'], window=14).rsi()
+
+    # Stochastic Oscillator
+    stochastic = momentum.StochasticOscillator(
+        high=df_chunk['high'],
+        low=df_chunk['low'],
+        close=df_chunk['close'],
+        window=14,
+        smooth_window=3
+    )
+    df_chunk['stoch_k'] = stochastic.stoch()
+    df_chunk['stoch_d'] = stochastic.stoch_signal()
+
+    # Bollinger Bands
+    bollinger = volatility.BollingerBands(close=df_chunk['close'], window=20, window_dev=2)
+    df_chunk['bb_mavg'] = bollinger.bollinger_mavg()
+    df_chunk['bb_hband'] = bollinger.bollinger_hband()
+    df_chunk['bb_lband'] = bollinger.bollinger_lband()
+    df_chunk['bb_pband'] = bollinger.bollinger_pband()
+    df_chunk['bb_wband'] = bollinger.bollinger_wband()
+
+    # Keltner Channels
+    keltner = volatility.KeltnerChannel(
+        high=df_chunk['high'],
+        low=df_chunk['low'],
+        close=df_chunk['close'],
+        window=20,
+        window_atr=10,
+        fillna=True
+    )
+    df_chunk['kc_hband'] = keltner.keltner_channel_hband()
+    df_chunk['kc_lband'] = keltner.keltner_channel_lband()
+    df_chunk['kc_mband'] = keltner.keltner_channel_mband()
+    df_chunk['kc_pband'] = keltner.keltner_channel_pband()
+    df_chunk['kc_wband'] = keltner.keltner_channel_wband()
+
+    # ATR
+    df_chunk['atr_14'] = volatility.AverageTrueRange(
+        high=df_chunk['high'],
+        low=df_chunk['low'],
+        close=df_chunk['close'],
+        window=14
+    ).average_true_range()
+
+    # OBV
+    df_chunk['obv'] = volume.OnBalanceVolumeIndicator(
+        close=df_chunk['close'],
+        volume=df_chunk['volume']
+    ).on_balance_volume()
+
+    # MACD
+    macd = trend.MACD(close=df_chunk['close'])
+    df_chunk['macd'] = macd.macd()
+    df_chunk['macd_signal'] = macd.macd_signal()
+    df_chunk['macd_diff'] = macd.macd_diff()
+
+    # ADX
+    adx_indicator = trend.ADXIndicator(
+        high=df_chunk['high'],
+        low=df_chunk['low'],
+        close=df_chunk['close'],
+        window=14
+    )
+    df_chunk['adx'] = adx_indicator.adx()
+    df_chunk['adx_pos'] = adx_indicator.adx_pos()
+    df_chunk['adx_neg'] = adx_indicator.adx_neg()
+
+    # Ulcer Index
+    df_chunk['ulcer_index'] = ulcer_index(df_chunk['close'], window=14)
+
+    # Accumulation/Distribution Indicator (ADI)
+    df_chunk['adi'] = volume.AccDistIndexIndicator(
+        high=df_chunk['high'],
+        low=df_chunk['low'],
+        close=df_chunk['close'],
+        volume=df_chunk['volume']
+    ).acc_dist_index()
+
+    # Chaikin Money Flow (CMF)
+    df_chunk['cmf'] = volume.ChaikinMoneyFlowIndicator(
+        high=df_chunk['high'],
+        low=df_chunk['low'],
+        close=df_chunk['close'],
+        volume=df_chunk['volume'],
+        window=20
+    ).chaikin_money_flow()
+
+    # Ease of Movement (EOM)
+    df_chunk['eom'] = ease_of_movement(
+        high=df_chunk['high'],
+        low=df_chunk['low'],
+        volume=df_chunk['volume'],
+        window=14
+    )
+
+    # Volume Price Trend (VPT)
+    df_chunk['vpt'] = volume.VolumePriceTrendIndicator(
+        close=df_chunk['close'],
+        volume=df_chunk['volume']
+    ).volume_price_trend()
+
+    return df_chunk
+
+def ulcer_index(series, window=14):
+    """
+    Calculates the Ulcer Index for a given series.
+
+    Parameters:
+    - series: Pandas Series of prices.
+    - window: Rolling window size.
+
+    Returns:
+    - ulcer: Pandas Series of Ulcer Index values.
+    """
+    drawdown = series.cummax() - series
+    ulcer = np.sqrt((drawdown**2).rolling(window=window).mean())
+    return ulcer
+
+def ease_of_movement(high, low, volume, window=14):
+    """
+    Calculates the Ease of Movement (EOM) indicator.
+
+    Parameters:
+    - high: Pandas Series of high prices.
+    - low: Pandas Series of low prices.
+    - volume: Pandas Series of volume.
+    - window: Rolling window size.
+
+    Returns:
+    - eom: Pandas Series of EOM values.
+    """
+    box_ratio = ((high + low) / 2 - (high.shift(1) + low.shift(1)) / 2) / volume
+    box_ratio = box_ratio.fillna(0)
+    eom = box_ratio.rolling(window=window).sum()
+    return eom
+
+def add_target_variables(df, timeframe):
+    """
+    Adds target variables based on the timeframe.
+
+    Parameters:
+    - df: Processed DataFrame.
+    - timeframe: Timeframe identifier (e.g., '15m', '1h').
+
+    Returns:
+    - df: DataFrame with added target variables.
+    """
+    if timeframe == '15m':
+        df['target_15m'] = df['return_15m'].shift(-1)
+        df['target_1h'] = df['return_1h'].shift(-4)  # 1 hour ahead
+        df['target_4h'] = df['return_4h'].shift(-16)  # 4 hours ahead
+        df['target_1d'] = df['return_1d'].shift(-96)  # 1 day ahead
+    elif timeframe == '1h':
+        df['target_1h'] = df['return_1h'].shift(-1)
+        df['target_4h'] = df['return_4h'].shift(-4)  # 4 hours ahead
+        df['target_1d'] = df['return_1d'].shift(-16)  # 16 hours ahead
+    elif timeframe == '4h':
+        df['target_4h'] = df['return_4h'].shift(-1)
+        df['target_1d'] = df['return_1d'].shift(-4)  # 4 days ahead
+    elif timeframe == '1d':
+        df['target_1d'] = df['return_1d'].shift(-1)
+    
+    # Drop rows with NaN targets
+    df.dropna(subset=TARGET_COLUMNS[timeframe], inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    
+    return df
+
+def preprocess_file(timeframe, raw_path, processed_path, chunksize=CHUNKSIZE):
+    """
+    Processes a single raw data file and saves the processed data.
+
+    Parameters:
+    - timeframe: Timeframe identifier (e.g., '15m', '1h').
+    - raw_path: Path to the raw CSV file.
+    - processed_path: Path to save the processed CSV file.
+    - chunksize: Number of rows per chunk.
+
+    Returns:
+    - None
+    """
+    processed_chunks = []
+    try:
+        # Read raw data in chunks
+        reader = pd.read_csv(raw_path, chunksize=chunksize, parse_dates=['Open time'])
+
+        for chunk in tqdm(reader, desc=f"Processing {timeframe} data"):
+            processed_chunk = preprocess_chunk(chunk, timeframe)
+            processed_chunks.append(processed_chunk)
+
+        # Concatenate all processed chunks
+        df_processed = pd.concat(processed_chunks, ignore_index=True)
+
+        # Add target variables
+        df_processed = add_target_variables(df_processed, timeframe)
+
+        # Save the processed data with gzip compression
+        df_processed.to_csv(processed_path, index=False, compression='gzip')
+        print(f"Processed data for {timeframe} saved to {processed_path}")
+
+    except Exception as e:
+        print(f"Error processing {timeframe} data: {e}")
+
+def main():
+    """
+    Main function to preprocess all raw data files in parallel.
+    """
+    # Ensure the output directory exists
+    os.makedirs(PROCESSED_DATA_DIR, exist_ok=True)
+
+    tasks = []
+    for timeframe, raw_path in RAW_DATA_PATHS.items():
+        processed_filename = f"processed_data_{timeframe}.csv.gz"
+        processed_path = os.path.join(PROCESSED_DATA_DIR, processed_filename)
+        tasks.append((timeframe, raw_path, processed_path))
+
+    # Use multiprocessing Pool to process files in parallel
+    with Pool(processes=cpu_count()) as pool:
+        pool.starmap(preprocess_file, tasks)
+
+if __name__ == "__main__":
+    main()
+
+
+// File: test.py
+# File: test.py
+
+import unittest
+import pandas as pd
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+from sklearn.preprocessing import StandardScaler
+from unittest.mock import patch, MagicMock
+import joblib
+import os
+import shutil
+
+# Import functions and classes from lnn_module.py
+from lnn_module import (
+    load_and_preprocess,
+    FEATURE_COLUMNS,
+    TARGET_COLUMNS,
+    create_sequences,
+    FinancialDataset,
+    LNNModel,
+    SEQ_LENGTH,
+    BATCH_SIZE,
+    SCALER_DIR,
+    MODEL_DIR
+)
+
+# Define constants for testing
+TEST_PROCESSED_DATA_DIR = 'test_data_final'
+TEST_RAW_DATA_DIR = 'test_data_raw'
+TEST_SCALER_DIR = 'test_scalers'
+TEST_MODEL_DIR = 'test_models'
+
+class TestLNNProgram(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        """
+        Set up synthetic datasets for testing purposes.
+        This method runs once before all tests.
+        """
+        os.makedirs(TEST_PROCESSED_DATA_DIR, exist_ok=True)
+        os.makedirs(TEST_RAW_DATA_DIR, exist_ok=True)
+        os.makedirs(TEST_SCALER_DIR, exist_ok=True)
+        os.makedirs(TEST_MODEL_DIR, exist_ok=True)
+
+        # Create synthetic raw data for each timeframe
+        cls.synthetic_raw_data = {}
+        timeframes = ['15m', '1h', '4h', '1d']
+        for timeframe in timeframes:
+            raw_filename = f"btc_{timeframe}_data_2018_to_2024-2024-10-10.csv"
+            raw_path = os.path.join(TEST_RAW_DATA_DIR, raw_filename)
+            freq = '15T' if timeframe == '15m' else 'H' if timeframe == '1h' else '4H' if timeframe == '4h' else 'D'
+            data = {
+                'Open time': pd.date_range(start='2022-01-01', periods=1000, freq=freq),
+                'Open': np.random.rand(1000).astype(np.float32) * 10000,
+                'High': np.random.rand(1000).astype(np.float32) * 10000,
+                'Low': np.random.rand(1000).astype(np.float32) * 10000,
+                'Close': np.random.rand(1000).astype(np.float32) * 10000,
+                'Volume': np.random.rand(1000).astype(np.float32) * 100,
+                'Close time': pd.date_range(start='2022-01-01', periods=1000, freq=freq),
+                'Quote asset volume': np.random.rand(1000).astype(np.float32) * 1e6,
+                'Number of trades': np.random.randint(100, 1000, size=1000),
+                'Taker buy base asset volume': np.random.rand(1000).astype(np.float32) * 100,
+                'Taker buy quote asset volume': np.random.rand(1000).astype(np.float32) * 1e5,
+                'Ignore': [0]*1000
+            }
+            df_raw = pd.DataFrame(data)
+            df_raw.to_csv(raw_path, index=False)
+            cls.synthetic_raw_data[timeframe] = raw_path
+
+        # Preprocess synthetic raw data
+        from preprocess import preprocess_file  # Import the preprocess_file function
+
+        for timeframe, raw_path in cls.synthetic_raw_data.items():
+            processed_filename = f"processed_data_{timeframe}.csv.gz"
+            processed_path = os.path.join(TEST_PROCESSED_DATA_DIR, processed_filename)
+            preprocess_file(timeframe, raw_path, processed_path)
+
+    @classmethod
+    def tearDownClass(cls):
+        """
+        Clean up the synthetic datasets after all tests have run.
+        """
+        shutil.rmtree(TEST_PROCESSED_DATA_DIR, ignore_errors=True)
+        shutil.rmtree(TEST_RAW_DATA_DIR, ignore_errors=True)
+        shutil.rmtree(TEST_SCALER_DIR, ignore_errors=True)
+        shutil.rmtree(TEST_MODEL_DIR, ignore_errors=True)
+
+    def test_load_and_preprocess(self):
+        """
+        Test the load_and_preprocess function to ensure it correctly loads data,
+        handles missing values, and scales features for all timeframes.
+        """
+        timeframes = ['15m', '1h', '4h', '1d']
+        for timeframe in timeframes:
+            with self.subTest(timeframe=timeframe):
+                processed_path = os.path.join(TEST_PROCESSED_DATA_DIR, f"processed_data_{timeframe}.csv.gz")
+                feature_cols = FEATURE_COLUMNS[timeframe]
+                target_cols = TARGET_COLUMNS[timeframe]
+                scaler_path = os.path.join(TEST_SCALER_DIR, f"scaler_{timeframe}.save")
+
+                df_scaled = load_and_preprocess(processed_path, feature_cols, target_cols, scaler_path)
+
+                # Check for missing values
+                self.assertFalse(df_scaled.isnull().values.any(), f"Missing values in {timeframe} data.")
+
+                # Check if scaler was saved
+                self.assertTrue(os.path.exists(scaler_path), f"Scaler not saved for {timeframe} data.")
+
+                # Load scaler and verify scaling
+                scaler = joblib.load(scaler_path)
+                original_features = pd.read_csv(processed_path, compression='gzip')[feature_cols].astype(np.float32)
+                scaled_features = scaler.transform(original_features)
+                np.testing.assert_array_almost_equal(
+                    df_scaled[feature_cols].values,
+                    scaled_features,
+                    decimal=5,
+                    err_msg=f"Feature scaling incorrect for {timeframe} data."
+                )
+
+    def test_create_sequences(self):
+        """
+        Test the create_sequences function to ensure it correctly creates input sequences and targets for all timeframes.
+        """
+        timeframes = ['15m', '1h', '4h', '1d']
+        for timeframe in timeframes:
+            with self.subTest(timeframe=timeframe):
+                processed_path = os.path.join(TEST_PROCESSED_DATA_DIR, f"processed_data_{timeframe}.csv.gz")
+                feature_cols = FEATURE_COLUMNS[timeframe]
+                target_cols = TARGET_COLUMNS[timeframe]
+                scaler_path = os.path.join(TEST_SCALER_DIR, f"scaler_{timeframe}.save")
+
+                df_scaled = load_and_preprocess(processed_path, feature_cols, target_cols, scaler_path)
+                sequences, targets = create_sequences(df_scaled, SEQ_LENGTH, feature_cols, target_cols)
+
+                expected_num_sequences = len(df_scaled) - SEQ_LENGTH
+                actual_num_sequences = sequences.shape[0]
+
+                self.assertEqual(
+                    actual_num_sequences,
+                    expected_num_sequences,
+                    f"Sequences count mismatch for {timeframe} data."
+                )
+
+                # Check shapes
+                self.assertEqual(
+                    sequences.shape[1],
+                    SEQ_LENGTH,
+                    f"Sequence length incorrect for {timeframe} data."
+                )
+                self.assertEqual(
+                    sequences.shape[2],
+                    len(feature_cols),
+                    f"Number of features incorrect for {timeframe} data."
+                )
+
+                for target in target_cols:
+                    self.assertEqual(
+                        len(targets[target]),
+                        expected_num_sequences,
+                        f"Target length mismatch for {timeframe} data."
+                    )
+
+    def test_financial_dataset(self):
+        """
+        Test the FinancialDataset class to ensure it correctly retrieves sequences and targets for all timeframes.
+        """
+        timeframes = ['15m', '1h', '4h', '1d']
+        for timeframe in timeframes:
+            with self.subTest(timeframe=timeframe):
+                processed_path = os.path.join(TEST_PROCESSED_DATA_DIR, f"processed_data_{timeframe}.csv.gz")
+                feature_cols = FEATURE_COLUMNS[timeframe]
+                target_cols = TARGET_COLUMNS[timeframe]
+                scaler_path = os.path.join(TEST_SCALER_DIR, f"scaler_{timeframe}.save")
+
+                df_scaled = load_and_preprocess(processed_path, feature_cols, target_cols, scaler_path)
+                sequences, targets = create_sequences(df_scaled, SEQ_LENGTH, feature_cols, target_cols)
+                dataset = FinancialDataset(sequences, {target_cols[0]: targets[target_cols[0]]})  # Testing first target
+
+                # Test dataset length
+                self.assertEqual(
+                    len(dataset),
+                    len(sequences),
+                    f"Dataset length mismatch for {timeframe} data."
+                )
+
+                # Test getting an item
+                sample_seq, sample_target = dataset[0]
+                np.testing.assert_array_almost_equal(
+                    sample_seq.numpy(),
+                    sequences[0],
+                    decimal=5,
+                    err_msg=f"Sequence data incorrect for {timeframe} data."
+                )
+                self.assertAlmostEqual(
+                    sample_target.item(),
+                    targets[target_cols[0]][0],
+                    places=6,
+                    msg=f"Target value incorrect for {timeframe} data."
+                )
+
+    def test_lnn_model_forward(self):
+        """
+        Test the LNNModel's forward pass to ensure it produces outputs of the correct shape for all timeframes.
+        """
+        timeframes = ['15m', '1h', '4h', '1d']
+        for timeframe in timeframes:
+            with self.subTest(timeframe=timeframe):
+                input_size = len(FEATURE_COLUMNS[timeframe])
+                hidden_size = 128
+                num_layers = 2
+                output_size = 1
+
+                model = LNNModel(input_size, hidden_size, num_layers, output_size)
+                model.eval()  # Set model to evaluation mode
+
+                # Create a dummy input tensor with batch_size=2
+                dummy_input = torch.randn(2, SEQ_LENGTH, input_size)
+                with torch.no_grad():
+                    output = model(dummy_input)
+
+                # Check output shape
+                self.assertEqual(
+                    output.shape,
+                    (2, output_size),
+                    f"Model output shape incorrect for {timeframe} data."
+                )
+
+    def test_full_pipeline(self):
+        """
+        Test the full data loading, preprocessing, dataset creation, and model initialization pipeline for all timeframes.
+        This ensures that all components work together without errors.
+        """
+        timeframes = ['15m', '1h', '4h', '1d']
+        for timeframe in timeframes:
+            with self.subTest(timeframe=timeframe):
+                try:
+                    processed_path = os.path.join(TEST_PROCESSED_DATA_DIR, f"processed_data_{timeframe}.csv.gz")
+                    feature_cols = FEATURE_COLUMNS[timeframe]
+                    target_cols = TARGET_COLUMNS[timeframe]
+                    scaler_path = os.path.join(TEST_SCALER_DIR, f"scaler_{timeframe}.save")
+                    model_save_path = os.path.join(TEST_MODEL_DIR, f"lnn_model_{timeframe}.pth")
+
+                    # Load and preprocess
+                    df_scaled = load_and_preprocess(processed_path, feature_cols, target_cols, scaler_path)
+
+                    # Create sequences and targets
+                    sequences, targets = create_sequences(df_scaled, SEQ_LENGTH, feature_cols, target_cols)
+
+                    # Create Dataset and DataLoader
+                    dataset = FinancialDataset(sequences, {target_cols[0]: targets[target_cols[0]]})  # Using first target
+                    data_loader = DataLoader(
+                        dataset,
+                        batch_size=BATCH_SIZE,
+                        shuffle=True,
+                        num_workers=NUM_WORKERS,
+                        pin_memory=True
+                    )
+
+                    # Initialize model
+                    input_size = len(feature_cols)
+                    hidden_size = 128
+                    num_layers = 2
+                    output_size = 1
+
+                    model = LNNModel(input_size, hidden_size, num_layers, output_size)
+                    criterion = torch.nn.MSELoss()
+                    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+                    # Perform a single training step
+                    model.train()
+                    for sequences_batch, targets_batch in data_loader:
+                        # Forward pass
+                        outputs = model(sequences_batch)
+                        loss = criterion(outputs, targets_batch)
+
+                        # Backward pass and optimization
+                        optimizer.zero_grad()
+                        loss.backward()
+                        optimizer.step()
+                        break  # Only one batch for testing
+
+                    # Check if loss is a finite number
+                    self.assertTrue(np.isfinite(loss.item()), f"Loss is not finite for {timeframe} data.")
+
+                except Exception as e:
+                    self.fail(f"Full pipeline test failed for {timeframe} with exception: {e}")
+
+    @patch('joblib.dump')
+    def test_scaler_save(self, mock_joblib_dump):
+        """
+        Test that the scaler is saved correctly during preprocessing for all timeframes.
+        """
+        timeframes = ['15m', '1h', '4h', '1d']
+        for timeframe in timeframes:
+            with self.subTest(timeframe=timeframe):
+                processed_path = os.path.join(TEST_PROCESSED_DATA_DIR, f"processed_data_{timeframe}.csv.gz")
+                feature_cols = FEATURE_COLUMNS[timeframe]
+                target_cols = TARGET_COLUMNS[timeframe]
+                scaler_path = os.path.join(TEST_SCALER_DIR, f"scaler_{timeframe}.save")
+
+                load_and_preprocess(processed_path, feature_cols, target_cols, scaler_path)
+
+                # Check that joblib.dump was called to save the scaler
+                mock_joblib_dump.assert_called_with(
+                    unittest.mock.ANY,  # The scaler object
+                    scaler_path
+                )
+
+    def test_model_save(self):
+        """
+        Test that the model can be saved without errors for all timeframes.
+        """
+        timeframes = ['15m', '1h', '4h', '1d']
+        for timeframe in timeframes:
+            with self.subTest(timeframe=timeframe):
+                model = LNNModel(
+                    input_size=len(FEATURE_COLUMNS[timeframe]),
+                    hidden_size=128,
+                    num_layers=2,
+                    output_size=1
+                )
+                model_save_path = os.path.join(TEST_MODEL_DIR, f"lnn_model_{timeframe}.pth")
+                try:
+                    torch.save(model.state_dict(), model_save_path)
+                    self.assertTrue(os.path.exists(model_save_path), f"Model not saved correctly for {timeframe} data.")
+                except Exception as e:
+                    self.fail(f"Model save test failed for {timeframe} with exception: {e}")
+
+if __name__ == '__main__':
+    unittest.main()
+
 
 // File: data\raw\btc_15m_data_2018_to_2024-2024-10-10.csv
 // Snippet:
@@ -97,433 +981,4 @@ if __name__ == "__main__":
 2018-01-01 08:00:00 13569.98 13735.24 13001.13 13220.56 1319.755931 2018-01-01 11:59:59.999        1.765121e+07             17200                   582.668293                  7.792109e+06       0
 2018-01-01 12:00:00 13220.56 13330.00 12750.00 13247.00 1831.933153 2018-01-01 15:59:59.999        2.391259e+07             21357                   830.314747                  1.083304e+07       0
 2018-01-01 16:00:00 13247.00 13290.65 12940.00 13240.37 1092.337234 2018-01-01 19:59:59.999        1.434887e+07             13178                   557.453779                  7.324320e+06       0
-
-// File: src\__init__.py
-
-
-// File: src\agent\agent.py
-# USE SWARM by OPEN AI
-
-
-
-// File: src\agent\custom_policy.py
-# USE PYTORCH not stable baseline
-
-
-
-// File: src\agent\environment.py
-#use SWARM
-
-// File: src\agent\__init__.py
-
-
-// File: src\config\config.yaml
-# src/config/config.yaml
-
-data:
-  raw_dir: "../../data/raw"
-  final_dir: "../../data/final"
-  visuals_dir: "../../data/visuals"
-
-preprocessing:
-  rolling_window_sizes:
-    '15m': [[3, '45m'], [12, '3h'], [48, '12h']]
-    '1h': [[4, '4h'], [24, '1d'], [168, '1w']]
-    '4h': [[2, '8h'], [6, '1d'], [42, '1w']]
-    '1d': [[7, '1w'], [30, '1m'], [365, '1y']]
-  correlation_threshold: 0.95
-  scaler_type: 'standard'  # options: 'standard', 'minmax'
-
-imbalance_handling:
-  oversample_strategy:
-    3: 2000
-    2: 2000
-    -3: 2000
-    -2: 2000
-  undersample_strategy:
-    1: 2000
-    0: 2000
-    -1: 2000
-
-training:
-  sequence_length: 30
-  batch_size: 64
-  total_timesteps: 200000
-  save_freq: 50000
-
-
-// File: src\config\__init__.py
-
-
-// File: src\data_preprocessing\indicators.py
-import pandas as pd
-from ta.volatility import BollingerBands, AverageTrueRange, KeltnerChannel, UlcerIndex
-from ta.trend import EMAIndicator, SMAIndicator, MACD, ADXIndicator
-from ta.momentum import RSIIndicator, StochasticOscillator
-from ta.volume import OnBalanceVolumeIndicator, AccDistIndexIndicator, ChaikinMoneyFlowIndicator, EaseOfMovementIndicator, VolumePriceTrendIndicator
-from loguru import logger
-
-def add_technical_indicators(df):
-    try:
-        df_list = []
-        for tf in df['timeframe'].unique():
-            df_tf = df[df['timeframe'] == tf].copy()
-            if df_tf.isnull().values.any():
-                logger.warning(f"NaN values found in data for timeframe {tf} before adding technical indicators. Dropping NaNs.")
-                df_tf.dropna(inplace=True)
-
-            # Ensure there is enough data for indicator calculation
-            min_required_length = 30  # Adjust based on the maximum window size required by indicators
-            if len(df_tf) < min_required_length:
-                logger.warning(f"Insufficient data for timeframe {tf}. Skipping indicator calculation.")
-                continue
-
-            logger.debug(f"Adding technical indicators for timeframe {tf}...")
-
-            # Add EMA
-            df_tf['ema_14'] = EMAIndicator(close=df_tf['close'], window=14).ema_indicator()
-
-            # Add SMA
-            df_tf['sma_14'] = SMAIndicator(close=df_tf['close'], window=14).sma_indicator()
-
-            # Add RSI
-            df_tf['rsi_14'] = RSIIndicator(close=df_tf['close'], window=14).rsi()
-
-            # Add Stochastic Oscillator
-            stoch = StochasticOscillator(high=df_tf['high'], low=df_tf['low'], close=df_tf['close'], window=14)
-            df_tf['stoch_k'] = stoch.stoch()
-            df_tf['stoch_d'] = stoch.stoch_signal()
-
-            # Add Bollinger Bands
-            bollinger = BollingerBands(close=df_tf['close'], window=20, window_dev=2)
-            df_tf['bb_mavg'] = bollinger.bollinger_mavg()
-            df_tf['bb_hband'] = bollinger.bollinger_hband()
-            df_tf['bb_lband'] = bollinger.bollinger_lband()
-            df_tf['bb_pband'] = bollinger.bollinger_pband()
-            df_tf['bb_wband'] = bollinger.bollinger_wband()
-
-            # Add Keltner Channel
-            keltner = KeltnerChannel(high=df_tf['high'], low=df_tf['low'], close=df_tf['close'], window=20)
-            df_tf['kc_hband'] = keltner.keltner_channel_hband()
-            df_tf['kc_lband'] = keltner.keltner_channel_lband()
-            df_tf['kc_mband'] = keltner.keltner_channel_mband()
-            df_tf['kc_pband'] = keltner.keltner_channel_pband()
-            df_tf['kc_wband'] = keltner.keltner_channel_wband()
-
-            # Add Average True Range (ATR)
-            df_tf['atr_14'] = AverageTrueRange(high=df_tf['high'], low=df_tf['low'], close=df_tf['close'], window=14).average_true_range()
-
-            # Add On-Balance Volume (OBV)
-            df_tf['obv'] = OnBalanceVolumeIndicator(close=df_tf['close'], volume=df_tf['volume']).on_balance_volume()
-
-            # Add MACD
-            macd = MACD(close=df_tf['close'], window_slow=26, window_fast=12, window_sign=9)
-            df_tf['macd'] = macd.macd()
-            df_tf['macd_signal'] = macd.macd_signal()
-            df_tf['macd_diff'] = macd.macd_diff()
-
-            # Add ADX
-            adx = ADXIndicator(high=df_tf['high'], low=df_tf['low'], close=df_tf['close'], window=14)
-            df_tf['adx'] = adx.adx()
-            df_tf['adx_pos'] = adx.adx_pos()
-            df_tf['adx_neg'] = adx.adx_neg()
-
-            # Add Ulcer Index (UI)
-            df_tf['ulcer_index'] = UlcerIndex(close=df_tf['close'], window=14).ulcer_index()
-
-            # Add Accumulation/Distribution Index (ADI)
-            if len(df_tf) > 1:  # Ensure there is more than one row for volume-based indicators
-                df_tf['adi'] = AccDistIndexIndicator(high=df_tf['high'], low=df_tf['low'], close=df_tf['close'], volume=df_tf['volume']).acc_dist_index()
-
-                # Add Chaikin Money Flow (CMF)
-                df_tf['cmf'] = ChaikinMoneyFlowIndicator(high=df_tf['high'], low=df_tf['low'], close=df_tf['close'], volume=df_tf['volume'], window=20).chaikin_money_flow()
-
-                # Add Ease of Movement (EoM)
-                eom = EaseOfMovementIndicator(high=df_tf['high'], low=df_tf['low'], volume=df_tf['volume'], window=14)
-                df_tf['eom'] = eom.ease_of_movement()
-
-                # Add Volume Price Trend (VPT)
-                df_tf['vpt'] = VolumePriceTrendIndicator(close=df_tf['close'], volume=df_tf['volume']).volume_price_trend()
-
-            if df_tf.empty:
-                logger.warning(f"Dataframe for timeframe {tf} is empty after adding indicators. Skipping this timeframe.")
-                continue
-
-            df_list.append(df_tf)
-
-        if not df_list:
-            logger.error("No dataframes were processed successfully. Returning original dataframe.")
-            return df
-
-        df = pd.concat(df_list, axis=0)
-        df.sort_index(inplace=True)  # Ensure the index is sorted after concatenation
-        logger.info("Technical indicators added successfully.")
-        return df
-    except Exception as e:
-        logger.error(f"Error adding technical indicators: {e}")
-        return df
-
-
-// File: src\data_preprocessing\preprocess.py
-# src/data_preprocessing/preprocess.py
-import os
-import sys
-import glob
-import pandas as pd
-from sklearn.preprocessing import StandardScaler
-from concurrent.futures import ProcessPoolExecutor
-import multiprocessing
-from datetime import datetime
-import yaml
-from loguru import logger
-from .indicators import add_technical_indicators
-
-def setup_logging():
-    log_dir = os.path.abspath('../../logs')
-    os.makedirs(log_dir, exist_ok=True)
-    log_filename = f"preprocess_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-
-    logger.remove()
-    logger.add(os.path.join(log_dir, log_filename), rotation="10 MB", level="DEBUG",
-               format="{time} {level} {message}")
-    logger.add(sys.stderr, level="INFO",
-               format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level}</level> | {message}")
-
-    return logger
-
-logger = setup_logging()
-
-def load_config():
-    try:
-        config_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../config/config.yaml'))
-        with open(config_path, 'r') as file:
-            config = yaml.safe_load(file)
-        logger.debug(f"Configuration loaded from {config_path}")
-        return config
-    except Exception as e:
-        logger.error(f"Error loading configuration: {e}")
-        raise
-
-config = load_config()
-
-DATA_DIR_RAW = os.path.abspath(os.path.join(os.path.dirname(__file__), config['data']['raw_dir']))
-DATA_DIR_PROCESSED = os.path.abspath(os.path.join(os.path.dirname(__file__), config['data']['final_dir']))
-
-
-def load_and_prepare_data(filename):
-    try:
-        logger.info(f"Processing file: {filename}")
-        df = pd.read_csv(os.path.join(DATA_DIR_RAW, filename))
-
-        # Ensure 'Open time' is parsed as datetime
-        df['Open time'] = pd.to_datetime(df['Open time'], errors='coerce')
-        df.set_index('Open time', inplace=True)
-        df.sort_index(inplace=True)
-
-        df.columns = [col.lower() for col in df.columns]
-        df.rename(columns={'close time': 'close_time'}, inplace=True)
-
-        columns_to_keep = ['open', 'high', 'low', 'close', 'volume']
-        df = df[columns_to_keep]
-
-        timeframe = '15m' if '15m' in filename else '1h' if '1h' in filename else '4h' if '4h' in filename else '1d'
-        df['timeframe'] = timeframe
-
-        # Convert all columns except 'timeframe' to numeric
-        for col in df.columns:
-            if col != 'timeframe':
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-
-        # Drop rows with NaN values after conversion
-        df.dropna(inplace=True)
-
-        return df
-    except Exception as e:
-        logger.error(f"Error processing file {filename}: {e}")
-        return None
-
-def compute_returns(df):
-    try:
-        for tf in ['15m', '1h', '4h', '1d']:
-            periods = {'15m': 1, '1h': 4, '4h': 16, '1d': 96}
-            df[f'return_{tf}'] = df.groupby('timeframe')['close'].pct_change(periods[tf])
-        return df
-    except Exception as e:
-        logger.error(f"Error computing returns: {e}")
-        return df
-
-def create_targets(df):
-    try:
-        for tf in ['15m', '1h', '4h', '1d']:
-            periods = {'15m': 1, '1h': 4, '4h': 16, '1d': 96}
-            df[f'future_price_{tf}'] = df.groupby('timeframe')['close'].shift(-periods[tf])
-            df[f'target_{tf}'] = (df[f'future_price_{tf}'] > df['close']).astype(int)
-            df.drop(f'future_price_{tf}', axis=1, inplace=True)
-        return df
-    except Exception as e:
-        logger.error(f"Error creating target variables: {e}")
-        return df
-
-def process_data():
-    try:
-        all_files = glob.glob(os.path.join(DATA_DIR_RAW, "*.csv"))
-
-        with ProcessPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
-            dfs = list(executor.map(load_and_prepare_data, [os.path.basename(f) for f in all_files]))
-
-        df = pd.concat([d for d in dfs if d is not None], axis=0)
-        df = df[~df.index.duplicated(keep='first')]
-        df.sort_index(inplace=True)
-
-        df = compute_returns(df)
-        df = add_technical_indicators(df)
-        df = create_targets(df)
-
-        df.dropna(inplace=True)
-
-        scaler = StandardScaler()
-        features = df.columns.drop(['timeframe', 'target_15m', 'target_1h', 'target_4h', 'target_1d'])
-        df[features] = scaler.fit_transform(df[features])
-
-        os.makedirs(DATA_DIR_PROCESSED, exist_ok=True)
-        for tf in df['timeframe'].unique():
-            output_file = os.path.join(DATA_DIR_PROCESSED, f"processed_data_{tf}.csv")
-            df[df['timeframe'] == tf].to_csv(output_file)
-            logger.info(f"Processed data for {tf} timeframe saved to {output_file}")
-
-        return df
-    except Exception as e:
-        logger.error(f"Error in process_data: {e}")
-        raise
-
-def main():
-    try:
-        logger.info("Starting data preprocessing pipeline...")
-        df = process_data()
-        logger.info("Data preprocessing pipeline completed successfully.")
-    except Exception as e:
-        logger.exception(f"Unhandled exception in main pipeline: {e}")
-
-if __name__ == "__main__":
-    main()
-
-
-// File: src\data_preprocessing\utils.py
-import pandas as pd
-from loguru import logger
-
-def categorize_profit(profit):
-    try:
-        if profit > 0.01:
-            return 1
-        elif profit < -0.01:
-            return -1
-        else:
-            return 0
-    except Exception as e:
-        logger.error(f"Error categorizing profit {profit}: {e}")
-        return 0
-
-def categorize_profit_loss(df):
-    try:
-        logger.debug("Categorizing profit/loss into target categories...")
-
-        timeframes = ['15m', '1h', '4h', '1d']
-        for timeframe in timeframes:
-            return_col = f'return_{timeframe}'
-            if return_col in df.columns:
-                df[f'target_category_{timeframe}'] = df[return_col].apply(categorize_profit)
-            else:
-                logger.warning(f"Return column {return_col} not found in DataFrame.")
-
-        logger.debug("Categorized profit/loss successfully.")
-        return df
-    except Exception as e:
-        logger.error(f"Error categorizing profit/loss: {e}")
-        return df
-
-def check_data_integrity(df, filename):
-    try:
-        logger.debug(f"Checking data integrity for file: {filename}")
-
-        if df.index.duplicated().any():
-            duplicates = df.index[df.index.duplicated()]
-            logger.warning(f"Found {duplicates.sum()} duplicate timestamps in {filename}. Dropping duplicates.")
-            df = df[~df.index.duplicated(keep='first')]
-
-        critical_columns = ['open', 'high', 'low', 'close', 'volume']
-        missing = df[critical_columns].isnull().sum()
-        if missing.any():
-            logger.warning(f"Missing values found in {filename}:\n{missing}")
-            df.dropna(subset=critical_columns, inplace=True)
-            logger.info(f"Dropped rows with missing critical values in {filename}.")
-
-        logger.debug(f"Data integrity checks passed for {filename}.")
-        return df
-    except Exception as e:
-        logger.error(f"Error checking data integrity for {filename}: {e}")
-        return df
-
-// File: src\data_preprocessing\__init__.py
-
-
-// File: src\models\liquid_nn.py
-# src/models/liquid_nn.py
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-class LiquidNN(nn.Module):
-    """
-    Enhanced Liquid Neural Network (LNN) with residual connections and normalization.
-    """
-    def __init__(self, input_size, hidden_size, num_classes, sequence_length):
-        super(LiquidNN, self).__init__()
-        self.hidden_size = hidden_size
-        self.sequence_length = sequence_length
-
-        # GRU Layer with bidirectionality for richer feature extraction
-        self.gru = nn.GRU(input_size, hidden_size, batch_first=True, bidirectional=True)
-        
-        # Attention Layer
-        self.attention = nn.Linear(hidden_size * 2, 1)
-        
-        # Fully Connected Layers with Residual Connection
-        self.fc1 = nn.Linear(hidden_size * 2, 128)
-        self.bn1 = nn.BatchNorm1d(128)
-        self.fc2 = nn.Linear(128, num_classes)
-        self.bn2 = nn.BatchNorm1d(num_classes)
-    
-    def forward(self, x):
-        """
-        Forward pass of the Liquid Neural Network.
-
-        Parameters:
-        - x (torch.Tensor): Input tensor of shape [batch_size, sequence_length, input_size]
-
-        Returns:
-        - torch.Tensor: Output logits of shape [batch_size, num_classes]
-        """
-        # GRU outputs
-        gru_out, _ = self.gru(x)  # gru_out: [batch_size, sequence_length, hidden_size*2]
-        
-        # Attention mechanism
-        attn_weights = F.softmax(self.attention(gru_out), dim=1)  # [batch_size, sequence_length, 1]
-        context = torch.sum(attn_weights * gru_out, dim=1)  # [batch_size, hidden_size*2]
-        
-        # Fully Connected Layers with Residual Connection
-        out = F.relu(self.bn1(self.fc1(context)))
-        out = self.bn2(self.fc2(out))
-        return out
-
-
-// File: src\models\__init__.py
-
-
-// File: src\training\train.py
-
-
-// File: src\training\__init__.py
-
 
