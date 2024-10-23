@@ -1,290 +1,210 @@
-# File: preprocess.py
-
 import pandas as pd
 import numpy as np
 import os
 from ta import trend, momentum, volatility, volume
-from multiprocessing import Pool, cpu_count
-from functools import partial
-from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor
+import torch
+import torch.utils.data
+from numba import jit, cuda
+import cupy as cp
+from functools import partial, lru_cache
+from pathlib import Path
+import psutil
+import warnings
+from tqdm.auto import tqdm
+import gc
+from typing import Dict, List, Tuple
+import logging
+import sys
 
-# Define file paths for all timeframes
-RAW_DATA_PATHS = {
-    "15m": r"data\raw\btc_15m_data_2018_to_2024-2024-10-10.csv",
-    "1h": r"data\raw\btc_1h_data_2018_to_2024-2024-10-10.csv",
-    "4h": r"data\raw\btc_4h_data_2018_to_2024-2024-10-10.csv",
-    "1d": r"data\raw\btc_1d_data_2018_to_2024-2024-10-10.csv"
-}
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
-PROCESSED_DATA_DIR = r"data\final"
+class OptimizedGPUPreprocessor:
+    def __init__(self):
+        self.num_cpu_cores = max(1, (psutil.cpu_count(logical=False) or 2) - 1)  # Leave one core free
+        self.num_gpu_devices = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        self.batch_size = self._calculate_optimal_batch_size()
+        self.raw_data_paths = {
+            "15m": Path("data/raw/btc_15m_data_2018_to_2024-2024-10-10.csv"),
+            "1h": Path("data/raw/btc_1h_data_2018_to_2024-2024-10-10.csv"),
+            "4h": Path("data/raw/btc_4h_data_2018_to_2024-2024-10-10.csv"),
+            "1d": Path("data/raw/btc_1d_data_2018_to_2024-2024-10-10.csv")
+        }
+        self.processed_data_dir = Path("data/final")
+        self.processed_data_dir.mkdir(parents=True, exist_ok=True)
+        self._init_cuda_kernels()
+        
+    @property
+    def columns_to_use(self) -> List[str]:
+        return [
+            'Open time',
+            'Open',
+            'High',
+            'Low',
+            'Close',
+            'Volume',
+            'Close time',
+            'Quote asset volume',
+            'Number of trades',
+            'Taker buy base asset volume',
+            'Taker buy quote asset volume'
+        ]
+        
+    @property
+    def column_dtypes(self) -> Dict[str, np.dtype]:
+        return {
+            'Open': np.float32,
+            'High': np.float32,
+            'Low': np.float32,
+            'Close': np.float32,
+            'Volume': np.float32,
+            'Quote asset volume': np.float32,
+            'Number of trades': np.int32,
+            'Taker buy base asset volume': np.float32,
+            'Taker buy quote asset volume': np.float32
+        }
 
-# Parameters
-FEATURE_COLUMNS = [
-    'open', 'high', 'low', 'close', 'volume'
-]
-TARGET_COLUMNS = {
-    '15m': ['target_15m', 'target_1h', 'target_4h', 'target_1d'],
-    '1h': ['target_1h', 'target_4h', 'target_1d'],
-    '4h': ['target_4h', 'target_1d'],
-    '1d': ['target_1d']
-}
-SEQ_LENGTH = 10
-CHUNKSIZE = 500000  # Adjust based on memory constraints
+    def _init_cuda_kernels(self):
+        if self.num_gpu_devices > 0:
+            try:
+                self.device = cp.cuda.Device(0)
+                self.stream = cp.cuda.Stream()
+            except Exception as e:
+                logging.warning(f"Failed to initialize CUDA: {str(e)}")
+                self.num_gpu_devices = 0
 
-def preprocess_chunk(df_chunk, timeframe):
-    """
-    Preprocesses a chunk of the dataframe by calculating technical indicators.
+    @staticmethod
+    def _calculate_optimal_batch_size() -> int:
+        try:
+            total_ram = psutil.virtual_memory().total
+            gpu_memory = (torch.cuda.get_device_properties(0).total_memory 
+                         if torch.cuda.is_available() else 0)
+            available_memory = max(total_ram, gpu_memory)
+            # More conservative batch size
+            return min(int(available_memory * 0.05 / (1024 * 1024)), 100000)
+        except:
+            return 50000  # Safe default
 
-    Parameters:
-    - df_chunk: Pandas DataFrame chunk.
-    - timeframe: Timeframe identifier (e.g., '15m', '1h').
+    def _parallel_process_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        try:
+            with ThreadPoolExecutor(max_workers=self.num_cpu_cores) as executor:
+                futures = []
+                
+                # Calculate basic indicators
+                futures.append(executor.submit(self._calculate_price_indicators, df.copy()))
+                futures.append(executor.submit(self._calculate_volume_indicators, df.copy()))
+                futures.append(executor.submit(self._calculate_momentum_indicators, df.copy()))
+                
+                results = []
+                for future in futures:
+                    try:
+                        result = future.result()
+                        results.append(result)
+                    except Exception as e:
+                        logging.error(f"Error in parallel processing: {str(e)}")
+                        continue
+                
+                # Merge results
+                for result in results:
+                    df = df.join(result)
+                
+            return df
+        except Exception as e:
+            logging.error(f"Error in parallel processing: {str(e)}")
+            return df
 
-    Returns:
-    - df_chunk: Processed DataFrame chunk with technical indicators.
-    """
-    # Ensure column names are lowercase
-    df_chunk.columns = df_chunk.columns.str.lower()
+    def process_file(self, timeframe: str):
+        try:
+            logging.info(f"Starting processing for {timeframe}")
+            
+            if not self.raw_data_paths[timeframe].exists():
+                logging.error(f"Input file not found: {self.raw_data_paths[timeframe]}")
+                return
+            
+            # Process in smaller chunks
+            chunks = []
+            total_rows = sum(1 for _ in open(self.raw_data_paths[timeframe])) - 1
+            chunk_size = min(self.batch_size, total_rows // 10)  # Ensure at least 10 chunks
+            
+            for df_chunk in tqdm(
+                pd.read_csv(
+                    self.raw_data_paths[timeframe],
+                    usecols=self.columns_to_use,
+                    dtype=self.column_dtypes,
+                    parse_dates=['Open time', 'Close time'],
+                    chunksize=chunk_size
+                ),
+                desc=f"Processing {timeframe}",
+                total=(total_rows // chunk_size) + 1
+            ):
+                try:
+                    # Convert column names to lowercase
+                    df_chunk.columns = df_chunk.columns.str.lower()
+                    
+                    # Process chunk
+                    if self.num_gpu_devices > 0:
+                        processed_chunk = self._preprocess_chunk_gpu(df_chunk, timeframe)
+                    else:
+                        processed_chunk = self._preprocess_chunk_cpu(df_chunk, timeframe)
+                    
+                    chunks.append(processed_chunk)
+                    
+                    # Explicit cleanup
+                    del df_chunk
+                    del processed_chunk
+                    gc.collect()
+                    
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        
+                except Exception as e:
+                    logging.error(f"Error processing chunk in {timeframe}: {str(e)}")
+                    continue
+            
+            if not chunks:
+                logging.error(f"No chunks were successfully processed for {timeframe}")
+                return
+            
+            # Combine chunks and save
+            logging.info(f"Combining chunks for {timeframe}")
+            df_processed = pd.concat(chunks, ignore_index=True)
+            self._add_target_variables(df_processed, timeframe)
+            
+            # Save to compressed parquet
+            output_path = self.processed_data_dir / f"processed_data_{timeframe}.parquet"
+            df_processed.to_parquet(output_path, compression='snappy')
+            
+            logging.info(f"Successfully processed {timeframe}")
+            
+            # Final cleanup
+            del df_processed
+            del chunks
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+        except Exception as e:
+            logging.error(f"Error processing file {timeframe}: {str(e)}")
+            raise
 
-    # Sort by time to ensure chronological order
-    df_chunk.sort_values('open time', inplace=True)
-    df_chunk.reset_index(drop=True, inplace=True)
-
-    # Handle missing values using forward and backward fill
-    df_chunk.ffill(inplace=True)
-    df_chunk.bfill(inplace=True)
-
-    # Feature Engineering
-    # Returns
-    df_chunk['return_15m'] = df_chunk['close'].pct_change(periods=1)
-    df_chunk['return_1h'] = df_chunk['close'].pct_change(periods=4)  # 1 hour = 4 * 15m
-    df_chunk['return_4h'] = df_chunk['close'].pct_change(periods=16)  # 4 hours = 16 * 15m
-    df_chunk['return_1d'] = df_chunk['close'].pct_change(periods=96)  # 1 day = 96 * 15m
-
-    # Technical Indicators
-    # EMA and SMA
-    df_chunk['ema_14'] = trend.EMAIndicator(close=df_chunk['close'], window=14).ema_indicator()
-    df_chunk['sma_14'] = trend.SMAIndicator(close=df_chunk['close'], window=14).sma_indicator()
-
-    # RSI
-    df_chunk['rsi_14'] = momentum.RSIIndicator(close=df_chunk['close'], window=14).rsi()
-
-    # Stochastic Oscillator
-    stochastic = momentum.StochasticOscillator(
-        high=df_chunk['high'],
-        low=df_chunk['low'],
-        close=df_chunk['close'],
-        window=14,
-        smooth_window=3
-    )
-    df_chunk['stoch_k'] = stochastic.stoch()
-    df_chunk['stoch_d'] = stochastic.stoch_signal()
-
-    # Bollinger Bands
-    bollinger = volatility.BollingerBands(close=df_chunk['close'], window=20, window_dev=2)
-    df_chunk['bb_mavg'] = bollinger.bollinger_mavg()
-    df_chunk['bb_hband'] = bollinger.bollinger_hband()
-    df_chunk['bb_lband'] = bollinger.bollinger_lband()
-    df_chunk['bb_pband'] = bollinger.bollinger_pband()
-    df_chunk['bb_wband'] = bollinger.bollinger_wband()
-
-    # Keltner Channels
-    keltner = volatility.KeltnerChannel(
-        high=df_chunk['high'],
-        low=df_chunk['low'],
-        close=df_chunk['close'],
-        window=20,
-        window_atr=10,
-        fillna=True
-    )
-    df_chunk['kc_hband'] = keltner.keltner_channel_hband()
-    df_chunk['kc_lband'] = keltner.keltner_channel_lband()
-    df_chunk['kc_mband'] = keltner.keltner_channel_mband()
-    df_chunk['kc_pband'] = keltner.keltner_channel_pband()
-    df_chunk['kc_wband'] = keltner.keltner_channel_wband()
-
-    # ATR
-    df_chunk['atr_14'] = volatility.AverageTrueRange(
-        high=df_chunk['high'],
-        low=df_chunk['low'],
-        close=df_chunk['close'],
-        window=14
-    ).average_true_range()
-
-    # OBV
-    df_chunk['obv'] = volume.OnBalanceVolumeIndicator(
-        close=df_chunk['close'],
-        volume=df_chunk['volume']
-    ).on_balance_volume()
-
-    # MACD
-    macd = trend.MACD(close=df_chunk['close'])
-    df_chunk['macd'] = macd.macd()
-    df_chunk['macd_signal'] = macd.macd_signal()
-    df_chunk['macd_diff'] = macd.macd_diff()
-
-    # ADX
-    adx_indicator = trend.ADXIndicator(
-        high=df_chunk['high'],
-        low=df_chunk['low'],
-        close=df_chunk['close'],
-        window=14
-    )
-    df_chunk['adx'] = adx_indicator.adx()
-    df_chunk['adx_pos'] = adx_indicator.adx_pos()
-    df_chunk['adx_neg'] = adx_indicator.adx_neg()
-
-    # Ulcer Index
-    df_chunk['ulcer_index'] = ulcer_index(df_chunk['close'], window=14)
-
-    # Accumulation/Distribution Indicator (ADI)
-    df_chunk['adi'] = volume.AccDistIndexIndicator(
-        high=df_chunk['high'],
-        low=df_chunk['low'],
-        close=df_chunk['close'],
-        volume=df_chunk['volume']
-    ).acc_dist_index()
-
-    # Chaikin Money Flow (CMF)
-    df_chunk['cmf'] = volume.ChaikinMoneyFlowIndicator(
-        high=df_chunk['high'],
-        low=df_chunk['low'],
-        close=df_chunk['close'],
-        volume=df_chunk['volume'],
-        window=20
-    ).chaikin_money_flow()
-
-    # Ease of Movement (EOM)
-    df_chunk['eom'] = ease_of_movement(
-        high=df_chunk['high'],
-        low=df_chunk['low'],
-        volume=df_chunk['volume'],
-        window=14
-    )
-
-    # Volume Price Trend (VPT)
-    df_chunk['vpt'] = volume.VolumePriceTrendIndicator(
-        close=df_chunk['close'],
-        volume=df_chunk['volume']
-    ).volume_price_trend()
-
-    return df_chunk
-
-def ulcer_index(series, window=14):
-    """
-    Calculates the Ulcer Index for a given series.
-
-    Parameters:
-    - series: Pandas Series of prices.
-    - window: Rolling window size.
-
-    Returns:
-    - ulcer: Pandas Series of Ulcer Index values.
-    """
-    drawdown = series.cummax() - series
-    ulcer = np.sqrt((drawdown**2).rolling(window=window).mean())
-    return ulcer
-
-def ease_of_movement(high, low, volume, window=14):
-    """
-    Calculates the Ease of Movement (EOM) indicator.
-
-    Parameters:
-    - high: Pandas Series of high prices.
-    - low: Pandas Series of low prices.
-    - volume: Pandas Series of volume.
-    - window: Rolling window size.
-
-    Returns:
-    - eom: Pandas Series of EOM values.
-    """
-    box_ratio = ((high + low) / 2 - (high.shift(1) + low.shift(1)) / 2) / volume
-    box_ratio = box_ratio.fillna(0)
-    eom = box_ratio.rolling(window=window).sum()
-    return eom
-
-def add_target_variables(df, timeframe):
-    """
-    Adds target variables based on the timeframe.
-
-    Parameters:
-    - df: Processed DataFrame.
-    - timeframe: Timeframe identifier (e.g., '15m', '1h').
-
-    Returns:
-    - df: DataFrame with added target variables.
-    """
-    if timeframe == '15m':
-        df['target_15m'] = df['return_15m'].shift(-1)
-        df['target_1h'] = df['return_1h'].shift(-4)  # 1 hour ahead
-        df['target_4h'] = df['return_4h'].shift(-16)  # 4 hours ahead
-        df['target_1d'] = df['return_1d'].shift(-96)  # 1 day ahead
-    elif timeframe == '1h':
-        df['target_1h'] = df['return_1h'].shift(-1)
-        df['target_4h'] = df['return_4h'].shift(-4)  # 4 hours ahead
-        df['target_1d'] = df['return_1d'].shift(-16)  # 16 hours ahead
-    elif timeframe == '4h':
-        df['target_4h'] = df['return_4h'].shift(-1)
-        df['target_1d'] = df['return_1d'].shift(-4)  # 4 days ahead
-    elif timeframe == '1d':
-        df['target_1d'] = df['return_1d'].shift(-1)
-    
-    # Drop rows with NaN targets
-    df.dropna(subset=TARGET_COLUMNS[timeframe], inplace=True)
-    df.reset_index(drop=True, inplace=True)
-    
-    return df
-
-def preprocess_file(timeframe, raw_path, processed_path, chunksize=CHUNKSIZE):
-    """
-    Processes a single raw data file and saves the processed data.
-
-    Parameters:
-    - timeframe: Timeframe identifier (e.g., '15m', '1h').
-    - raw_path: Path to the raw CSV file.
-    - processed_path: Path to save the processed CSV file.
-    - chunksize: Number of rows per chunk.
-
-    Returns:
-    - None
-    """
-    processed_chunks = []
-    try:
-        # Read raw data in chunks
-        reader = pd.read_csv(raw_path, chunksize=chunksize, parse_dates=['Open time'])
-
-        for chunk in tqdm(reader, desc=f"Processing {timeframe} data"):
-            processed_chunk = preprocess_chunk(chunk, timeframe)
-            processed_chunks.append(processed_chunk)
-
-        # Concatenate all processed chunks
-        df_processed = pd.concat(processed_chunks, ignore_index=True)
-
-        # Add target variables
-        df_processed = add_target_variables(df_processed, timeframe)
-
-        # Save the processed data with gzip compression
-        df_processed.to_csv(processed_path, index=False, compression='gzip')
-        print(f"Processed data for {timeframe} saved to {processed_path}")
-
-    except Exception as e:
-        print(f"Error processing {timeframe} data: {e}")
-
-def main():
-    """
-    Main function to preprocess all raw data files in parallel.
-    """
-    # Ensure the output directory exists
-    os.makedirs(PROCESSED_DATA_DIR, exist_ok=True)
-
-    tasks = []
-    for timeframe, raw_path in RAW_DATA_PATHS.items():
-        processed_filename = f"processed_data_{timeframe}.csv.gz"
-        processed_path = os.path.join(PROCESSED_DATA_DIR, processed_filename)
-        tasks.append((timeframe, raw_path, processed_path))
-
-    # Use multiprocessing Pool to process files in parallel
-    with Pool(processes=cpu_count()) as pool:
-        pool.starmap(preprocess_file, tasks)
+    def process_all_files(self):
+        """Process all timeframe files sequentially to avoid memory issues"""
+        for timeframe in self.raw_data_paths.keys():
+            try:
+                self.process_file(timeframe)
+            except Exception as e:
+                logging.error(f"Failed to process {timeframe}: {str(e)}")
+                continue
 
 if __name__ == "__main__":
-    main()
+    try:
+        warnings.filterwarnings('ignore')
+        preprocessor = OptimizedGPUPreprocessor()
+        preprocessor.process_all_files()
+    except Exception as e:
+        logging.error(f"Application error: {str(e)}")
+        sys.exit(1)
