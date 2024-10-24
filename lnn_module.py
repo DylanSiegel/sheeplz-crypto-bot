@@ -1,308 +1,266 @@
-# File: lnn_module.py
-
-import pandas as pd
-import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
-from sklearn.preprocessing import StandardScaler
-import joblib
-import os
-from datetime import datetime
 import torch.nn as nn
-import torch.optim as optim
-from tqdm import tqdm
-import multiprocessing
-from multiprocessing import Pool, cpu_count  # Correctly import Pool and cpu_count
-from torch.cuda.amp import GradScaler, autocast
+import torch.nn.functional as F
+import math
+from torch.cuda.amp import autocast, GradScaler
+import numpy as np
+from typing import Tuple, Optional, Dict, List
+from dataclasses import dataclass
 
-# Define file paths for all timeframes
-PROCESSED_DATA_DIR = r"data\final"
-PROCESSED_DATA_PATHS = {
-    "15m": os.path.join(PROCESSED_DATA_DIR, "processed_data_15m.csv.gz"),
-    "1h": os.path.join(PROCESSED_DATA_DIR, "processed_data_1h.csv.gz"),
-    "4h": os.path.join(PROCESSED_DATA_DIR, "processed_data_4h.csv.gz"),
-    "1d": os.path.join(PROCESSED_DATA_DIR, "processed_data_1d.csv.gz")
-}
+@dataclass
+class NLNNConfig:
+    hidden_size: int = 256
+    input_size: int = 128
+    output_size: int = 64
+    num_layers: int = 2
+    dropout: float = 0.1
+    epsilon: float = 1e-8
+    use_mixed_precision: bool = True
+    num_threads: int = 24  
+    batch_size: int = 512
+    sequence_length: int = 128
+    grad_clip: float = 1.0
+    learning_rate: float = 1e-3
 
-# Parameters
-TARGET_COLUMNS = {
-    '15m': ['target_15m', 'target_1h', 'target_4h', 'target_1d'],
-    '1h': ['target_1h', 'target_4h', 'target_1d'],
-    '4h': ['target_4h', 'target_1d'],
-    '1d': ['target_1d']
-}
-FEATURE_COLUMNS = {
-    '15m': [
-        'open', 'high', 'low', 'close', 'volume',
-        'return_15m', 'return_1h', 'return_4h', 'return_1d',
-        'ema_14', 'sma_14', 'rsi_14', 'stoch_k', 'stoch_d',
-        'bb_mavg', 'bb_hband', 'bb_lband', 'bb_pband', 'bb_wband',
-        'kc_hband', 'kc_lband', 'kc_mband', 'kc_pband', 'kc_wband',
-        'atr_14', 'obv', 'macd', 'macd_signal', 'macd_diff',
-        'adx', 'adx_pos', 'adx_neg', 'ulcer_index',
-        'adi', 'cmf', 'eom', 'vpt'
-    ],
-    '1h': [
-        'open', 'high', 'low', 'close', 'volume',
-        'return_15m', 'return_1h', 'return_4h', 'return_1d',
-        'ema_14', 'sma_14', 'rsi_14', 'stoch_k', 'stoch_d',
-        'bb_mavg', 'bb_hband', 'bb_lband', 'bb_pband', 'bb_wband',
-        'kc_hband', 'kc_lband', 'kc_mband', 'kc_pband', 'kc_wband',
-        'atr_14', 'obv', 'macd', 'macd_signal', 'macd_diff',
-        'adx', 'adx_pos', 'adx_neg', 'ulcer_index',
-        'adi', 'cmf', 'eom', 'vpt'
-    ],
-    '4h': [
-        'open', 'high', 'low', 'close', 'volume',
-        'return_15m', 'return_1h', 'return_4h', 'return_1d',
-        'ema_14', 'sma_14', 'rsi_14', 'stoch_k', 'stoch_d',
-        'bb_mavg', 'bb_hband', 'bb_lband', 'bb_pband', 'bb_wband',
-        'kc_hband', 'kc_lband', 'kc_mband', 'kc_pband', 'kc_wband',
-        'atr_14', 'obv', 'macd', 'macd_signal', 'macd_diff',
-        'adx', 'adx_pos', 'adx_neg', 'ulcer_index',
-        'adi', 'cmf', 'eom', 'vpt'
-    ],
-    '1d': [
-        'open', 'high', 'low', 'close', 'volume',
-        'return_15m', 'return_1h', 'return_4h', 'return_1d',
-        'ema_14', 'sma_14', 'rsi_14', 'stoch_k', 'stoch_d',
-        'bb_mavg', 'bb_hband', 'bb_lband', 'bb_pband', 'bb_wband',
-        'kc_hband', 'kc_lband', 'kc_mband', 'kc_pband', 'kc_wband',
-        'atr_14', 'obv', 'macd', 'macd_signal', 'macd_diff',
-        'adx', 'adx_pos', 'adx_neg', 'ulcer_index',
-        'adi', 'cmf', 'eom', 'vpt'
-    ]
-}
-SEQ_LENGTH = 10
-BATCH_SIZE = 256  # Adjust based on GPU memory
-NUM_WORKERS = cpu_count()  # Define NUM_WORKERS using cpu_count()
-SCALER_DIR = 'scalers'
-MODEL_DIR = 'models'
-NUM_EPOCHS = 50
-LEARNING_RATE = 0.0001
+class TextDataset(torch.utils.data.Dataset):
+    def __init__(self, text: str, seq_length: int):
+        chars = sorted(list(set(text)))
+        self.char_to_idx: Dict[str, int] = {ch: i for i, ch in enumerate(chars)}
+        self.idx_to_char: Dict[int, str] = {i: ch for i, ch in enumerate(chars)}
+        self.vocab_size = len(chars)
+        self.seq_length = seq_length
+        self.data = torch.tensor([self.char_to_idx[ch] for ch in text], dtype=torch.long)
 
-# Ensure directories exist
-os.makedirs(SCALER_DIR, exist_ok=True)
-os.makedirs(MODEL_DIR, exist_ok=True)
+    def __len__(self) -> int:
+        return len(self.data) - self.seq_length
 
-# Enable CUDA benchmark for optimized performance on fixed input sizes
-torch.backends.cudnn.benchmark = True
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = self.data[idx:idx + self.seq_length]
+        y = self.data[idx + 1:idx + self.seq_length + 1]
+        return x, y
 
-# Check device
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    def decode(self, indices: torch.Tensor) -> str:
+        return ''.join(self.idx_to_char[idx.item()] for idx in indices)
 
-def load_and_preprocess(processed_path, feature_cols, target_cols, scaler_path):
-    """
-    Loads and preprocesses the data.
+class SphericalOptimizer(torch.optim.Optimizer):
+    def __init__(self, params, defaults):
+        super().__init__(params, defaults)
+        
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
 
-    Parameters:
-    - processed_path: Path to the processed CSV file.
-    - feature_cols: List of feature column names.
-    - target_cols: List of target column names.
-    - scaler_path: Path to save/load the scaler.
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                
+                grad = p.grad
+                state = self.state[p]
 
-    Returns:
-    - df_scaled: DataFrame with scaled features and targets.
-    """
-    # Load processed data
-    df_processed = pd.read_csv(
-        processed_path,
-        parse_dates=['open time'],
-        dtype={col: np.float32 for col in feature_cols},
-        compression='gzip'
-    )
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['exp_avg'] = torch.zeros_like(p)
+                    state['exp_avg_sq'] = torch.zeros_like(p)
 
-    # Handle missing values using forward and backward fill
-    df_processed.ffill(inplace=True)
-    df_processed.bfill(inplace=True)
+                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+                beta1, beta2 = 0.9, 0.999
 
-    # Feature scaling
-    scaler = StandardScaler()
-    scaled_features = scaler.fit_transform(df_processed[feature_cols].astype(np.float32))
-    df_scaled = pd.DataFrame(scaled_features, columns=feature_cols, index=df_processed.index)
-    df_scaled['open time'] = df_processed['open time']
-    for target in target_cols:
-        df_scaled[target] = df_processed[target].astype(np.float32)
+                state['step'] += 1
+                bias_correction1 = 1 - beta1 ** state['step']
+                bias_correction2 = 1 - beta2 ** state['step']
 
-    # Save the scaler
-    joblib.dump(scaler, scaler_path)
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
 
-    return df_scaled
+                denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(group['eps'])
+                step_size = group['lr'] / bias_correction1
 
-def create_sequences(data, seq_length, feature_cols, target_cols):
-    """
-    Creates input sequences and corresponding targets.
+                p.addcdiv_(exp_avg, denom, value=-step_size)
+                p.div_(torch.norm(p) + group['eps'])
 
-    Parameters:
-    - data: DataFrame containing features and targets.
-    - seq_length: Number of time steps in each input sequence.
-    - feature_cols: List of feature column names.
-    - target_cols: List of target column names.
+        return loss
 
-    Returns:
-    - sequences: Numpy array of shape (num_samples, seq_length, num_features)
-    - targets: Dictionary of Numpy arrays for each target
-    """
-    sequences = []
-    targets = {target: [] for target in target_cols}
+class NLNN(nn.Module):
+    def __init__(self, config: NLNNConfig):
+        super().__init__()
+        self.config = config
+        
+        torch.set_num_threads(config.num_threads)
+        
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.scaler = GradScaler(enabled=config.use_mixed_precision)
+        
+        # Enhanced weight initialization with per-neuron scaling
+        self.input_weights = nn.Parameter(torch.randn(config.input_size, config.hidden_size))
+        self.recurrent_weights = nn.Parameter(torch.randn(config.hidden_size, config.hidden_size))
+        self.output_weights = nn.Parameter(torch.randn(config.hidden_size, config.output_size))
+        
+        # Per-neuron scaling factors
+        self.lambda_i = nn.Parameter(torch.randn(config.hidden_size))
+        self.lambda_r = nn.Parameter(torch.randn(config.hidden_size))
+        self.s_z = nn.Parameter(torch.randn(1))
+        
+        # Eigen learning rates (alpha) with raw parameters
+        self.alpha_raw = nn.Parameter(torch.randn(config.hidden_size))
+        
+        # Global learning rate scaling
+        self.eta_scale = nn.Parameter(torch.randn(1))
+        
+        self._normalize_parameters()
+        
+        self.dropout = nn.Dropout(config.dropout)
+        
+        self.register_buffer('epsilon', torch.tensor(config.epsilon))
+        
+    def _normalize_parameters(self):
+        with torch.no_grad():
+            self.input_weights.div_(torch.norm(self.input_weights, dim=0, keepdim=True) + self.epsilon)
+            self.recurrent_weights.div_(torch.norm(self.recurrent_weights, dim=0, keepdim=True) + self.epsilon)
+            self.output_weights.div_(torch.norm(self.output_weights, dim=0, keepdim=True) + self.epsilon)
 
-    for i in range(len(data) - seq_length):
-        seq = data[feature_cols].iloc[i:i+seq_length].values
-        sequences.append(seq)
-        for target in target_cols:
-            targets[target].append(data[target].iloc[i+seq_length])
+    def normalize(self, x: torch.Tensor) -> torch.Tensor:
+        return x / (torch.norm(x, dim=-1, keepdim=True) + self.epsilon)
 
-    sequences = np.array(sequences, dtype=np.float32)
-    for target in target_cols:
-        targets[target] = np.array(targets[target], dtype=np.float32)
+    def slerp(self, h_t: torch.Tensor, h_new: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
+        h_t = self.normalize(h_t)
+        h_new = self.normalize(h_new)
+        
+        dot_product = torch.sum(h_t * h_new, dim=-1, keepdim=True)
+        dot_product = torch.clamp(dot_product, -1 + self.epsilon, 1 - self.epsilon)
+        
+        theta = torch.arccos(dot_product)
+        sin_theta = torch.sin(theta)
+        
+        mask = (sin_theta > self.epsilon).float()
+        
+        h_t_coeff = torch.sin((1 - alpha) * theta) / (sin_theta + self.epsilon)
+        h_new_coeff = torch.sin(alpha * theta) / (sin_theta + self.epsilon)
+        
+        result = mask * (h_t_coeff * h_t + h_new_coeff * h_new) + (1 - mask) * h_new
+        return self.normalize(result)
 
-    return sequences, targets
+    @autocast()
+    def forward(self, x: torch.Tensor, h_init: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        if len(x.shape) == 2:  # Handle both one-hot and index inputs
+            x = F.one_hot(x, num_classes=self.config.input_size).float()
+        
+        batch_size, seq_len = x.shape[:2]
+        
+        if h_init is None:
+            h_t = self.normalize(torch.randn(batch_size, self.config.hidden_size, device=self.device))
+        else:
+            h_t = h_init
+            
+        outputs = []
+        alpha = torch.sigmoid(self.alpha_raw)
+        
+        for t in range(seq_len):
+            x_t = x[:, t]
+            
+            # Apply per-neuron scaling
+            input_proj = self.lambda_i.unsqueeze(0) * F.linear(x_t, self.input_weights.T)
+            recurrent_proj = self.lambda_r.unsqueeze(0) * F.linear(h_t, self.recurrent_weights.T)
+            
+            h_new = self.normalize(input_proj + recurrent_proj)
+            h_t = self.slerp(h_t, h_new, alpha)
+            h_t = self.dropout(h_t)
+            
+            output = self.s_z * F.linear(h_t, self.output_weights.T)
+            outputs.append(output)
+        
+        outputs = torch.stack(outputs, dim=1)
+        return outputs, h_t
 
-class FinancialDataset(Dataset):
-    """
-    Custom Dataset for financial data sequences.
-    """
-    def __init__(self, sequences, targets):
-        self.sequences = torch.tensor(sequences, dtype=torch.float32)
-        self.targets = {key: torch.tensor(val, dtype=torch.float32).unsqueeze(1) for key, val in targets.items()}
+    def init_hidden(self, batch_size: int) -> torch.Tensor:
+        return self.normalize(torch.randn(batch_size, self.config.hidden_size, device=self.device))
 
-    def __len__(self):
-        return len(self.sequences)
+class NLNNTrainer:
+    def __init__(self, model: NLNN, config: NLNNConfig):
+        self.model = model
+        self.config = config
+        self.optimizer = SphericalOptimizer(model.parameters(), {
+            'lr': config.learning_rate, 
+            'eps': config.epsilon
+        })
+        self.criterion = nn.CrossEntropyLoss()
+        
+    @torch.cuda.amp.autocast()
+    def training_step(self, batch: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        x, y = batch
+        outputs, _ = self.model(x)
+        outputs = outputs.view(-1, outputs.size(-1))
+        y = y.view(-1)
+        loss = self.criterion(outputs, y)
+        return loss
+    
+    def train_epoch(self, dataloader: torch.utils.data.DataLoader) -> float:
+        self.model.train()
+        total_loss = 0.0
+        
+        for batch_idx, batch in enumerate(dataloader):
+            batch = [b.to(self.model.device) for b in batch]
+            self.optimizer.zero_grad()
+            
+            with torch.cuda.amp.autocast():
+                loss = self.training_step(batch)
+            
+            self.model.scaler.scale(loss).backward()
+            
+            # Gradient clipping
+            self.model.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+            
+            self.model.scaler.step(self.optimizer)
+            self.model.scaler.update()
+            
+            total_loss += loss.item()
+            
+            if batch_idx % 100 == 0:
+                print(f'Batch {batch_idx}, Loss: {loss.item():.4f}')
+            
+        return total_loss / len(dataloader)
 
-    def __getitem__(self, idx):
-        sequence = self.sequences[idx]
-        target = {key: self.targets[key][idx] for key in self.targets}
-        return sequence, target
+    def generate_text(self, dataset: TextDataset, seed_text: str, length: int = 100, temperature: float = 1.0) -> str:
+        self.model.eval()
+        
+        # Convert seed text to indices
+        indices = torch.tensor([dataset.char_to_idx[c] for c in seed_text], dtype=torch.long)
+        indices = indices.unsqueeze(0).to(self.model.device)  # Add batch dimension
+        
+        # Initialize hidden state
+        h_t = self.model.init_hidden(1)
+        
+        generated_indices = []
+        
+        with torch.no_grad():
+            # Process seed text
+            outputs, h_t = self.model(indices, h_t)
+            
+            # Generate new characters
+            for _ in range(length):
+                output = outputs[:, -1, :] / temperature
+                probs = F.softmax(output, dim=-1)
+                next_char_idx = torch.multinomial(probs, 1)
+                
+                generated_indices.append(next_char_idx.item())
+                
+                # Prepare input for next iteration
+                next_input = F.one_hot(next_char_idx, num_classes=self.config.output_size).float()
+                outputs, h_t = self.model(next_input, h_t)
+        
+        # Convert generated indices back to text
+        generated_text = dataset.decode(torch.tensor(generated_indices))
+        return seed_text + generated_text
 
-class LNNModel(nn.Module):
-    """
-    Optimized Liquid Neural Network Model using LSTM layers with dropout and batch normalization.
-    """
-    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout=0.3):
-        super(LNNModel, self).__init__()
-        self.lstm = nn.LSTM(
-            input_size,
-            hidden_size,
-            num_layers,
-            batch_first=True,
-            dropout=dropout,
-            bidirectional=True
-        )
-        self.batch_norm = nn.BatchNorm1d(hidden_size * 2)
-        self.fc = nn.Sequential(
-            nn.Linear(hidden_size * 2, hidden_size),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size, output_size)
-        )
-
-    def forward(self, x):
-        # Forward propagate LSTM
-        out, _ = self.lstm(x)
-
-        # Apply batch normalization on the last time step
-        out = self.batch_norm(out[:, -1, :])
-
-        # Decode the hidden state of the last time step
-        out = self.fc(out)
-        return out
-
-def train_model(timeframe):
-    """
-    Trains the LNN model for a specific timeframe.
-
-    Parameters:
-    - timeframe: Timeframe identifier (e.g., '15m', '1h').
-
-    Returns:
-    - None
-    """
-    processed_path = PROCESSED_DATA_PATHS[timeframe]
-    feature_cols = FEATURE_COLUMNS[timeframe]
-    target_cols = TARGET_COLUMNS[timeframe]
-    scaler_path = os.path.join(SCALER_DIR, f"scaler_{timeframe}.save")
-    model_save_path = os.path.join(MODEL_DIR, f"lnn_model_{timeframe}.pth")
-
-    # Load and preprocess data
-    df_scaled = load_and_preprocess(processed_path, feature_cols, target_cols, scaler_path)
-
-    # Create sequences and targets
-    sequences, targets = create_sequences(df_scaled, SEQ_LENGTH, feature_cols, target_cols)
-
-    # For simplicity, let's train to predict the first target in target_cols
-    primary_target = target_cols[0]
-    dataset = FinancialDataset(sequences, {primary_target: targets[primary_target]})
-    data_loader = DataLoader(
-        dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=NUM_WORKERS,
-        pin_memory=True
-    )
-
-    # Initialize model, loss function, and optimizer
-    input_size = len(feature_cols)
-    hidden_size = 256
-    num_layers = 3
-    output_size = 1
-
-    model = LNNModel(input_size, hidden_size, num_layers, output_size).to(device)
-    criterion = nn.MSELoss()
-    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5)
-
-    # Initialize GradScaler for mixed precision training
-    scaler = GradScaler()
-
-    # Learning rate scheduler
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
-
-    # Training loop
-    for epoch in range(NUM_EPOCHS):
-        model.train()
-        epoch_loss = 0
-        progress = tqdm(
-            data_loader,
-            desc=f"{timeframe} Epoch {epoch+1}/{NUM_EPOCHS}",
-            leave=False,
-            ncols=100
-        )
-
-        for sequences_batch, targets_batch in progress:
-            sequences_batch = sequences_batch.to(device, non_blocking=True)
-            targets_batch = targets_batch.to(device, non_blocking=True)
-
-            optimizer.zero_grad()
-
-            # Mixed precision forward pass
-            with autocast():
-                outputs = model(sequences_batch)
-                loss = criterion(outputs, targets_batch)
-
-            # Scales loss and backpropagates
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-
-            epoch_loss += loss.item()
-            progress.set_postfix(loss=loss.item())
-
-        avg_loss = epoch_loss / len(data_loader)
-        print(f"{timeframe} Epoch [{epoch+1}/{NUM_EPOCHS}], Loss: {avg_loss:.6f}")
-
-        # Step the scheduler
-        scheduler.step(avg_loss)
-
-    # Save the trained model
-    torch.save(model.state_dict(), model_save_path)
-    print(f"{timeframe} Model training complete and saved to {model_save_path}")
-
-def main():
-    """
-    Main function to train models for all timeframes in parallel.
-    """
-    timeframes = list(PROCESSED_DATA_PATHS.keys())
-    with Pool(processes=cpu_count()) as pool:
-        pool.map(train_model, timeframes)
-
-if __name__ == "__main__":
-    main()
+def create_model(config: NLNNConfig) -> NLNN:
+    model = NLNN(config)
+    model = model.to(model.device)
+    
+    if torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model)
+    
+    return model
