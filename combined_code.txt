@@ -1,927 +1,227 @@
 **File Tree (Relevant Files Only)**
   .
-    - lnn_module.py
-    - preprocess.py
-    - test.py
+    - main.py
+  config
+    - config.py
+    - __init__.py
+  data
+    - process-data.py
+    - __init__.py
   data\raw
     - btc_15m_data_2018_to_2024-2024-10-10.csv
     - btc_1d_data_2018_to_2024-2024-10-10.csv
     - btc_1h_data_2018_to_2024-2024-10-10.csv
     - btc_4h_data_2018_to_2024-2024-10-10.csv
-// File: lnn_module.py
-# File: lnn_module.py
-
-import pandas as pd
-import numpy as np
+  models
+    - components.py
+    - nlnn.py
+    - __init__.py
+  optimizers
+    - modified_adam.py
+    - __init__.py
+  training
+    - metrics.py
+    - trainer.py
+    - __init__.py
+  utils
+    - activations.py
+    - hardware_config.py
+    - logging.py
+    - monitoring.py
+    - __init__.py
+// File: main.py
+import argparse
+from pathlib import Path
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import autocast
+import pandas as pd
 from sklearn.preprocessing import StandardScaler
-import joblib
-import os
-from datetime import datetime
-import torch.nn as nn
-import torch.optim as optim
-from tqdm import tqdm
-import multiprocessing
-from multiprocessing import Pool, cpu_count  # Correctly import Pool and cpu_count
-from torch.cuda.amp import GradScaler, autocast
+from sklearn.model_selection import train_test_split
 
-# Define file paths for all timeframes
-PROCESSED_DATA_DIR = r"data\final"
-PROCESSED_DATA_PATHS = {
-    "15m": os.path.join(PROCESSED_DATA_DIR, "processed_data_15m.csv.gz"),
-    "1h": os.path.join(PROCESSED_DATA_DIR, "processed_data_1h.csv.gz"),
-    "4h": os.path.join(PROCESSED_DATA_DIR, "processed_data_4h.csv.gz"),
-    "1d": os.path.join(PROCESSED_DATA_DIR, "processed_data_1d.csv.gz")
-}
+from config.config import NLNNConfig
+from models.nlnn import NLNN
+from training.trainer import NLNNTrainer
+from utils.logging import get_logger
+from utils.monitoring import ResourceMonitor
+from utils.hardware_config import HardwareConfig, OptimizedDataPipeline, create_optimized_config
 
-# Parameters
-TARGET_COLUMNS = {
-    '15m': ['target_15m', 'target_1h', 'target_4h', 'target_1d'],
-    '1h': ['target_1h', 'target_4h', 'target_1d'],
-    '4h': ['target_4h', 'target_1d'],
-    '1d': ['target_1d']
-}
-FEATURE_COLUMNS = {
-    '15m': [
-        'open', 'high', 'low', 'close', 'volume',
-        'return_15m', 'return_1h', 'return_4h', 'return_1d',
-        'ema_14', 'sma_14', 'rsi_14', 'stoch_k', 'stoch_d',
-        'bb_mavg', 'bb_hband', 'bb_lband', 'bb_pband', 'bb_wband',
-        'kc_hband', 'kc_lband', 'kc_mband', 'kc_pband', 'kc_wband',
-        'atr_14', 'obv', 'macd', 'macd_signal', 'macd_diff',
-        'adx', 'adx_pos', 'adx_neg', 'ulcer_index',
-        'adi', 'cmf', 'eom', 'vpt'
-    ],
-    '1h': [
-        'open', 'high', 'low', 'close', 'volume',
-        'return_15m', 'return_1h', 'return_4h', 'return_1d',
-        'ema_14', 'sma_14', 'rsi_14', 'stoch_k', 'stoch_d',
-        'bb_mavg', 'bb_hband', 'bb_lband', 'bb_pband', 'bb_wband',
-        'kc_hband', 'kc_lband', 'kc_mband', 'kc_pband', 'kc_wband',
-        'atr_14', 'obv', 'macd', 'macd_signal', 'macd_diff',
-        'adx', 'adx_pos', 'adx_neg', 'ulcer_index',
-        'adi', 'cmf', 'eom', 'vpt'
-    ],
-    '4h': [
-        'open', 'high', 'low', 'close', 'volume',
-        'return_15m', 'return_1h', 'return_4h', 'return_1d',
-        'ema_14', 'sma_14', 'rsi_14', 'stoch_k', 'stoch_d',
-        'bb_mavg', 'bb_hband', 'bb_lband', 'bb_pband', 'bb_wband',
-        'kc_hband', 'kc_lband', 'kc_mband', 'kc_pband', 'kc_wband',
-        'atr_14', 'obv', 'macd', 'macd_signal', 'macd_diff',
-        'adx', 'adx_pos', 'adx_neg', 'ulcer_index',
-        'adi', 'cmf', 'eom', 'vpt'
-    ],
-    '1d': [
-        'open', 'high', 'low', 'close', 'volume',
-        'return_15m', 'return_1h', 'return_4h', 'return_1d',
-        'ema_14', 'sma_14', 'rsi_14', 'stoch_k', 'stoch_d',
-        'bb_mavg', 'bb_hband', 'bb_lband', 'bb_pband', 'bb_wband',
-        'kc_hband', 'kc_lband', 'kc_mband', 'kc_pband', 'kc_wband',
-        'atr_14', 'obv', 'macd', 'macd_signal', 'macd_diff',
-        'adx', 'adx_pos', 'adx_neg', 'ulcer_index',
-        'adi', 'cmf', 'eom', 'vpt'
-    ]
-}
-SEQ_LENGTH = 10
-BATCH_SIZE = 256  # Adjust based on GPU memory
-NUM_WORKERS = cpu_count()  # Define NUM_WORKERS using cpu_count()
-SCALER_DIR = 'scalers'
-MODEL_DIR = 'models'
-NUM_EPOCHS = 50
-LEARNING_RATE = 0.0001
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train a Hardware-Optimized Normalized Liquid Neural Network")
+    parser.add_argument('--config', type=str, default='config/config.json', help='Path to the config JSON file')
+    parser.add_argument('--data', type=str, default='data/raw/btc_15m_data_2018_to_2024-2024-10-10.csv', help='Path to the training data CSV file')
+    parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
+    parser.add_argument('--save_dir', type=str, default='checkpoints', help='Directory to save model checkpoints')
+    parser.add_argument('--log_dir', type=str, default='logs', help='Directory to save logs')
+    return parser.parse_args()
 
-# Ensure directories exist
-os.makedirs(SCALER_DIR, exist_ok=True)
-os.makedirs(MODEL_DIR, exist_ok=True)
+def create_datasets(filepath: str, sequence_length: int, hw_config: HardwareConfig):
+    df = pd.read_csv(filepath, parse_dates=['Open time'])
+    df = df.sort_values('Open time')
 
-# Enable CUDA benchmark for optimized performance on fixed input sizes
-torch.backends.cudnn.benchmark = True
+    features = ['Open', 'High', 'Low', 'Close', 'Volume']
+    data = df[features].values
 
-# Check device
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-def load_and_preprocess(processed_path, feature_cols, target_cols, scaler_path):
-    """
-    Loads and preprocesses the data.
-
-    Parameters:
-    - processed_path: Path to the processed CSV file.
-    - feature_cols: List of feature column names.
-    - target_cols: List of target column names.
-    - scaler_path: Path to save/load the scaler.
-
-    Returns:
-    - df_scaled: DataFrame with scaled features and targets.
-    """
-    # Load processed data
-    df_processed = pd.read_csv(
-        processed_path,
-        parse_dates=['open time'],
-        dtype={col: np.float32 for col in feature_cols},
-        compression='gzip'
-    )
-
-    # Handle missing values using forward and backward fill
-    df_processed.ffill(inplace=True)
-    df_processed.bfill(inplace=True)
-
-    # Feature scaling
     scaler = StandardScaler()
-    scaled_features = scaler.fit_transform(df_processed[feature_cols].astype(np.float32))
-    df_scaled = pd.DataFrame(scaled_features, columns=feature_cols, index=df_processed.index)
-    df_scaled['open time'] = df_processed['open time']
-    for target in target_cols:
-        df_scaled[target] = df_processed[target].astype(np.float32)
+    data_scaled = scaler.fit_transform(data)
 
-    # Save the scaler
-    joblib.dump(scaler, scaler_path)
+    X, y = [], []
+    for i in range(len(data_scaled) - sequence_length):
+        X.append(data_scaled[i:i+sequence_length])
+        y.append(data_scaled[i+sequence_length, 3])
 
-    return df_scaled
+    X = torch.tensor(X, dtype=torch.float32)
+    y = torch.tensor(y, dtype=torch.float32)
 
-def create_sequences(data, seq_length, feature_cols, target_cols):
-    """
-    Creates input sequences and corresponding targets.
+    train_X, val_X, train_y, val_y = train_test_split(X, y, test_size=0.2, shuffle=False)
 
-    Parameters:
-    - data: DataFrame containing features and targets.
-    - seq_length: Number of time steps in each input sequence.
-    - feature_cols: List of feature column names.
-    - target_cols: List of target column names.
-
-    Returns:
-    - sequences: Numpy array of shape (num_samples, seq_length, num_features)
-    - targets: Dictionary of Numpy arrays for each target
-    """
-    sequences = []
-    targets = {target: [] for target in target_cols}
-
-    for i in range(len(data) - seq_length):
-        seq = data[feature_cols].iloc[i:i+seq_length].values
-        sequences.append(seq)
-        for target in target_cols:
-            targets[target].append(data[target].iloc[i+seq_length])
-
-    sequences = np.array(sequences, dtype=np.float32)
-    for target in target_cols:
-        targets[target] = np.array(targets[target], dtype=np.float32)
-
-    return sequences, targets
-
-class FinancialDataset(Dataset):
-    """
-    Custom Dataset for financial data sequences.
-    """
-    def __init__(self, sequences, targets):
-        self.sequences = torch.tensor(sequences, dtype=torch.float32)
-        self.targets = {key: torch.tensor(val, dtype=torch.float32).unsqueeze(1) for key, val in targets.items()}
-
-    def __len__(self):
-        return len(self.sequences)
-
-    def __getitem__(self, idx):
-        sequence = self.sequences[idx]
-        target = {key: self.targets[key][idx] for key in self.targets}
-        return sequence, target
-
-class LNNModel(nn.Module):
-    """
-    Optimized Liquid Neural Network Model using LSTM layers with dropout and batch normalization.
-    """
-    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout=0.3):
-        super(LNNModel, self).__init__()
-        self.lstm = nn.LSTM(
-            input_size,
-            hidden_size,
-            num_layers,
-            batch_first=True,
-            dropout=dropout,
-            bidirectional=True
-        )
-        self.batch_norm = nn.BatchNorm1d(hidden_size * 2)
-        self.fc = nn.Sequential(
-            nn.Linear(hidden_size * 2, hidden_size),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size, output_size)
-        )
-
-    def forward(self, x):
-        # Forward propagate LSTM
-        out, _ = self.lstm(x)
-
-        # Apply batch normalization on the last time step
-        out = self.batch_norm(out[:, -1, :])
-
-        # Decode the hidden state of the last time step
-        out = self.fc(out)
-        return out
-
-def train_model(timeframe):
-    """
-    Trains the LNN model for a specific timeframe.
-
-    Parameters:
-    - timeframe: Timeframe identifier (e.g., '15m', '1h').
-
-    Returns:
-    - None
-    """
-    processed_path = PROCESSED_DATA_PATHS[timeframe]
-    feature_cols = FEATURE_COLUMNS[timeframe]
-    target_cols = TARGET_COLUMNS[timeframe]
-    scaler_path = os.path.join(SCALER_DIR, f"scaler_{timeframe}.save")
-    model_save_path = os.path.join(MODEL_DIR, f"lnn_model_{timeframe}.pth")
-
-    # Load and preprocess data
-    df_scaled = load_and_preprocess(processed_path, feature_cols, target_cols, scaler_path)
-
-    # Create sequences and targets
-    sequences, targets = create_sequences(df_scaled, SEQ_LENGTH, feature_cols, target_cols)
-
-    # For simplicity, let's train to predict the first target in target_cols
-    primary_target = target_cols[0]
-    dataset = FinancialDataset(sequences, {primary_target: targets[primary_target]})
-    data_loader = DataLoader(
-        dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=NUM_WORKERS,
-        pin_memory=True
+    train_dataset = torch.utils.data.TensorDataset(
+        hw_config.optimize_tensor(train_X),
+        hw_config.optimize_tensor(train_y)
+    )
+    val_dataset = torch.utils.data.TensorDataset(
+        hw_config.optimize_tensor(val_X),
+        hw_config.optimize_tensor(val_y)
     )
 
-    # Initialize model, loss function, and optimizer
-    input_size = len(feature_cols)
-    hidden_size = 256
-    num_layers = 3
-    output_size = 1
-
-    model = LNNModel(input_size, hidden_size, num_layers, output_size).to(device)
-    criterion = nn.MSELoss()
-    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5)
-
-    # Initialize GradScaler for mixed precision training
-    scaler = GradScaler()
-
-    # Learning rate scheduler
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
-
-    # Training loop
-    for epoch in range(NUM_EPOCHS):
-        model.train()
-        epoch_loss = 0
-        progress = tqdm(
-            data_loader,
-            desc=f"{timeframe} Epoch {epoch+1}/{NUM_EPOCHS}",
-            leave=False,
-            ncols=100
-        )
-
-        for sequences_batch, targets_batch in progress:
-            sequences_batch = sequences_batch.to(device, non_blocking=True)
-            targets_batch = targets_batch.to(device, non_blocking=True)
-
-            optimizer.zero_grad()
-
-            # Mixed precision forward pass
-            with autocast():
-                outputs = model(sequences_batch)
-                loss = criterion(outputs, targets_batch)
-
-            # Scales loss and backpropagates
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-
-            epoch_loss += loss.item()
-            progress.set_postfix(loss=loss.item())
-
-        avg_loss = epoch_loss / len(data_loader)
-        print(f"{timeframe} Epoch [{epoch+1}/{NUM_EPOCHS}], Loss: {avg_loss:.6f}")
-
-        # Step the scheduler
-        scheduler.step(avg_loss)
-
-    # Save the trained model
-    torch.save(model.state_dict(), model_save_path)
-    print(f"{timeframe} Model training complete and saved to {model_save_path}")
+    return train_dataset, val_dataset
 
 def main():
-    """
-    Main function to train models for all timeframes in parallel.
-    """
-    timeframes = list(PROCESSED_DATA_PATHS.keys())
-    with Pool(processes=cpu_count()) as pool:
-        pool.map(train_model, timeframes)
+    args = parse_args()
+    logger = get_logger('n-LNN', log_dir=Path(args.log_dir))
+    
+    hw_config = create_optimized_config()
+    logger.info(f"Using device: {hw_config.device}")
+    logger.info(f"Batch size: {hw_config.batch_size} (effective: {hw_config.effective_batch_size})")
+    
+    config_path = Path(args.config)
+    if config_path.exists():
+        config = NLNNConfig.load(config_path)
+    else:
+        config = NLNNConfig()
+        config.save(config_path)
+    
+    config.batch_size = hw_config.batch_size
+    config.num_threads = hw_config.torch_threads
+    config.use_mixed_precision = True
+    
+    logger.info("Creating datasets...")
+    train_dataset, val_dataset = create_datasets(
+        filepath=args.data,
+        sequence_length=config.sequence_length,
+        hw_config=hw_config
+    )
+    
+    logger.info("Setting up data pipeline...")
+    data_pipeline = OptimizedDataPipeline(hw_config)
+    train_loader, val_loader = data_pipeline.create_dataloaders(
+        train_dataset,
+        val_dataset
+    )
+    
+    logger.info("Initializing model...")
+    model = NLNN(config)
+    model = model.to(
+        device=hw_config.device,
+        memory_format=hw_config.memory_format
+    )
+    
+    logger.info("Initializing trainer...")
+    trainer = NLNNTrainer(
+        model=model,
+        config=config
+    )
+    
+    logger.info(f"Starting training for {args.epochs} epochs...")
+    trainer.train(
+        train_dataloader=train_loader,
+        num_epochs=args.epochs,
+        val_dataloader=val_loader,
+        save_dir=Path(args.save_dir)
+    )
+    
+    logger.info(f"Final GPU memory stats: {hw_config.memory_stats()}")
 
 if __name__ == "__main__":
     main()
 
-
-// File: preprocess.py
-import pandas as pd
-import numpy as np
-import os
-from ta import trend, momentum, volatility, volume
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
-import torch
-import torch.utils.data
-from numba import jit, cuda
-import cupy as cp
-from functools import partial
+// File: config\config.py
+from dataclasses import dataclass, asdict
+from typing import Dict, Optional
 from pathlib import Path
-import psutil
-import warnings
-from tqdm.auto import tqdm
-import gc
+import json
 
-class GPUAcceleratedPreprocessor:
-    def __init__(self):
-        self.num_cpu_cores = psutil.cpu_count(logical=True)
-        self.batch_size = self._calculate_optimal_batch_size()
-        self.raw_data_paths = {
-            "15m": Path("data/raw/btc_15m_data_2018_to_2024-2024-10-10.csv"),
-            "1h": Path("data/raw/btc_1h_data_2018_to_2024-2024-10-10.csv"),
-            "4h": Path("data/raw/btc_4h_data_2018_to_2024-2024-10-10.csv"),
-            "1d": Path("data/raw/btc_1d_data_2018_to_2024-2024-10-10.csv")
+@dataclass
+class NLNNConfig:
+    """Configuration for Normalized Liquid Neural Network"""
+    # Architecture
+    hidden_size: int = 256
+    input_size: int = 128
+    output_size: int = 64
+    num_layers: int = 2
+    
+    # Training
+    batch_size: int = 512
+    sequence_length: int = 128
+    learning_rate: float = 1e-3
+    grad_clip: float = 1.0
+    dropout: float = 0.1
+    
+    # Optimization
+    epsilon: float = 1e-8
+    use_mixed_precision: bool = True
+    num_threads: int = 24
+    
+    # Normalization
+    normalization_strategy: str = 'full'  # 'full', 'group', or 'selective'
+    use_slerp: bool = True  # If False, uses NLERP
+    antipodal_strategy: str = 'random'  # 'random' or 'nlerp'
+    activation_fn: str = 'tanh'  # 'tanh', 'modified_relu'
+    
+    # Paths
+    checkpoint_dir: Optional[Path] = None
+    log_dir: Optional[Path] = None
+    
+    def __post_init__(self):
+        """Set up directories after initialization"""
+        if self.checkpoint_dir is None:
+            self.checkpoint_dir = Path('checkpoints')
+        if self.log_dir is None:
+            self.log_dir = Path('logs')
+            
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+    
+    def to_dict(self) -> Dict:
+        """Convert config to dictionary"""
+        return {
+            key: str(value) if isinstance(value, Path) else value 
+            for key, value in asdict(self).items()
         }
-        self.processed_data_dir = Path("data/final")
-        self.processed_data_dir.mkdir(parents=True, exist_ok=True)
-
-    def _calculate_optimal_batch_size(self):
-        available_ram = psutil.virtual_memory().available
-        return min(int(available_ram * 0.2 / (1024 * 1024)), 1000000)
-
-    @staticmethod
-    @jit(nopython=True)
-    def _calculate_returns(prices, period):
-        returns = np.zeros_like(prices)
-        returns[period:] = (prices[period:] - prices[:-period]) / prices[:-period]
-        returns[:period] = returns[period]
-        return returns
-
-    @staticmethod
-    @jit(nopython=True)
-    def _calculate_ma(data, window):
-        result = np.zeros_like(data)
-        for i in range(len(data)):
-            if i < window:
-                result[i] = np.mean(data[:i+1])
-            else:
-                result[i] = np.mean(data[i-window+1:i+1])
-        return result
-
-    @staticmethod
-    @jit(nopython=True)
-    def _calculate_vwap(high, low, close, volume):
-        typical_price = (high + low + close) / 3
-        cumulative_tp_vol = np.cumsum(typical_price * volume)
-        cumulative_vol = np.cumsum(volume)
-        return np.where(cumulative_vol > 0, cumulative_tp_vol / cumulative_vol, typical_price)
-
-    @staticmethod
-    @jit(nopython=True)
-    def _calculate_price_impact(volume, price_change):
-        return np.where(volume > 0, price_change / volume, 0)
-
-    @staticmethod
-    @jit(nopython=True)
-    def _calculate_orderflow_imbalance(buy_volume, sell_volume, window=14):
-        total_volume = buy_volume + sell_volume
-        imbalance = np.zeros_like(buy_volume)
-        
-        for i in range(len(buy_volume)):
-            start_idx = max(0, i - window + 1)
-            buy_sum = np.sum(buy_volume[start_idx:i+1])
-            total_sum = np.sum(total_volume[start_idx:i+1])
-            imbalance[i] = buy_sum / total_sum if total_sum > 0 else 0.5
-            
-        return imbalance
-
-    def _gpu_preprocess_chunk(self, df_chunk, device):
-        df_chunk.columns = df_chunk.columns.str.lower()
-        df_chunk.sort_values('open time', inplace=True)
-        df_chunk.reset_index(drop=True, inplace=True)
-        
-        price_columns = ['open', 'high', 'low', 'close']
-        periods = {'15m': 1, '1h': 4, '4h': 16, '1d': 96}
-        
-        for col in price_columns:
-            prices = df_chunk[col].values
-            for period_name, period in periods.items():
-                df_chunk[f'return_{col}_{period_name}'] = self._calculate_returns(prices, period)
-
-        df_chunk['vwap'] = self._calculate_vwap(
-            df_chunk['high'].values,
-            df_chunk['low'].values,
-            df_chunk['close'].values,
-            df_chunk['volume'].values
-        )
-        
-        df_chunk['taker_buy_ratio'] = (
-            df_chunk['taker buy base asset volume'] / df_chunk['volume']
-        ).fillna(0.5)
-        
-        df_chunk['quote_volume_ratio'] = (
-            df_chunk['quote asset volume'] / df_chunk['volume']
-        ).fillna(1.0)
-        
-        df_chunk['trades_per_volume'] = (
-            df_chunk['number of trades'] / df_chunk['volume']
-        ).ffill().bfill()
-        
-        df_chunk['avg_trade_size'] = (
-            df_chunk['volume'] / df_chunk['number of trades']
-        ).ffill().bfill()
-        
-        price_changes = df_chunk['close'] - df_chunk['open']
-        df_chunk['price_impact'] = self._calculate_price_impact(
-            df_chunk['volume'].values,
-            price_changes.values
-        )
-        
-        df_chunk['order_flow_imbalance'] = self._calculate_orderflow_imbalance(
-            df_chunk['taker buy base asset volume'].values,
-            df_chunk['volume'].values - df_chunk['taker buy base asset volume'].values
-        )
-        
-        for window in [14, 20]:
-            close_prices = df_chunk['close'].values
-            df_chunk[f'ma_{window}'] = self._calculate_ma(close_prices, window)
-        
-        indicators = {
-            'rsi': momentum.RSIIndicator(close=df_chunk['close'], window=14),
-            'stoch': momentum.StochasticOscillator(
-                high=df_chunk['high'],
-                low=df_chunk['low'],
-                close=df_chunk['close'],
-                window=14,
-                smooth_window=3
-            ),
-            'bb': volatility.BollingerBands(
-                close=df_chunk['close'],
-                window=20,
-                window_dev=2
-            ),
-            'atr': volatility.AverageTrueRange(
-                high=df_chunk['high'],
-                low=df_chunk['low'],
-                close=df_chunk['close'],
-                window=14
-            ),
-            'adi': volume.AccDistIndexIndicator(
-                high=df_chunk['high'],
-                low=df_chunk['low'],
-                close=df_chunk['close'],
-                volume=df_chunk['volume']
-            )
-        }
-        
-        df_chunk['rsi'] = indicators['rsi'].rsi()
-        df_chunk['stoch_k'] = indicators['stoch'].stoch()
-        df_chunk['stoch_d'] = indicators['stoch'].stoch_signal()
-        df_chunk['bb_upper'] = indicators['bb'].bollinger_hband()
-        df_chunk['bb_lower'] = indicators['bb'].bollinger_lband()
-        df_chunk['bb_middle'] = indicators['bb'].bollinger_mavg()
-        df_chunk['atr'] = indicators['atr'].average_true_range()
-        df_chunk['adi'] = indicators['adi'].acc_dist_index()
-        
-        volatility_windows = [14, 30, 60]
-        returns = df_chunk['close'].pct_change()
-        for window in volatility_windows:
-            df_chunk[f'volatility_{window}'] = returns.rolling(
-                window=window, 
-                min_periods=1
-            ).std().bfill()
-        
-        df_chunk['high_low_range'] = (df_chunk['high'] - df_chunk['low']) / df_chunk['low']
-        df_chunk['body_range'] = abs(df_chunk['close'] - df_chunk['open']) / df_chunk['open']
-        df_chunk['upper_wick'] = (df_chunk['high'] - df_chunk[['open', 'close']].max(axis=1)) / df_chunk['close']
-        df_chunk['lower_wick'] = (df_chunk[['open', 'close']].min(axis=1) - df_chunk['low']) / df_chunk['close']
-        
-        time_features = pd.to_datetime(df_chunk['open time'])
-        df_chunk['hour'] = time_features.dt.hour
-        df_chunk['day_of_week'] = time_features.dt.dayofweek
-        df_chunk['day_of_month'] = time_features.dt.day
-        df_chunk['week_of_year'] = time_features.dt.isocalendar().week
-        df_chunk['month'] = time_features.dt.month
-        
-        return df_chunk.ffill().bfill()
-
-    def preprocess_chunk(self, df_chunk, timeframe):
-        try:
-            if torch.cuda.is_available():
-                device = torch.device('cuda')
-                return self._gpu_preprocess_chunk(df_chunk, device)
-            else:
-                return self._gpu_preprocess_chunk(df_chunk, torch.device('cpu'))
-        except Exception as e:
-            print(f"Error processing chunk in {timeframe}: {str(e)}")
-            raise
-
-    def process_file(self, timeframe):
-        try:
-            raw_path = self.raw_data_paths[timeframe]
-            processed_path = self.processed_data_dir / f"processed_data_{timeframe}.csv.gz"
-            
-            chunks = []
-            reader = pd.read_csv(raw_path, 
-                               chunksize=self.batch_size, 
-                               parse_dates=['Open time', 'Close time'])
-            
-            with ThreadPoolExecutor(max_workers=self.num_cpu_cores) as executor:
-                futures = []
-                for chunk in reader:
-                    future = executor.submit(self.preprocess_chunk, chunk, timeframe)
-                    futures.append(future)
-                
-                chunks = []
-                for future in tqdm(futures, desc=f"Processing {timeframe}"):
-                    try:
-                        result = future.result()
-                        chunks.append(result)
-                    except Exception as e:
-                        print(f"Error processing chunk in {timeframe}: {str(e)}")
-                        continue
-            
-            if not chunks:
-                raise ValueError(f"No chunks were successfully processed for {timeframe}")
-            
-            df_processed = pd.concat(chunks, ignore_index=True)
-            self._add_target_variables(df_processed, timeframe)
-            
-            df_processed.to_csv(processed_path, index=False, compression='gzip')
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                
-        except Exception as e:
-            print(f"Error processing file {timeframe}: {str(e)}")
-            raise
-
-    def _add_target_variables(self, df, timeframe):
-        shifts = {
-            '15m': {'15m': 1, '1h': 4, '4h': 16, '1d': 96},
-            '1h': {'1h': 1, '4h': 4, '1d': 16},
-            '4h': {'4h': 1, '1d': 4},
-            '1d': {'1d': 1}
-        }
-        
-        for target, shift in shifts[timeframe].items():
-            df[f'target_{target}'] = df[f'return_close_{target}'].shift(-shift)
-        
-        df.dropna(subset=[f'target_{t}' for t in shifts[timeframe].keys()], 
-                 inplace=True)
-        df.reset_index(drop=True, inplace=True)
-
-    def process_all_files(self):
-        with ProcessPoolExecutor(max_workers=min(len(self.raw_data_paths), 
-                                               self.num_cpu_cores)) as executor:
-            list(executor.map(self.process_file, self.raw_data_paths.keys()))
-
-if __name__ == "__main__":
-    preprocessor = GPUAcceleratedPreprocessor()
-    preprocessor.process_all_files()
-
-// File: test.py
-# File: test.py
-
-import unittest
-import pandas as pd
-import numpy as np
-import torch
-from torch.utils.data import DataLoader
-from sklearn.preprocessing import StandardScaler
-from unittest.mock import patch, MagicMock
-import joblib
-import os
-import shutil
-import multiprocessing  # Import multiprocessing
-from multiprocessing import Pool, cpu_count  # Import Pool and cpu_count
-
-# Import functions and classes from lnn_module.py
-from lnn_module import (
-    load_and_preprocess,
-    FEATURE_COLUMNS,
-    TARGET_COLUMNS,
-    create_sequences,
-    FinancialDataset,
-    LNNModel,
-    SEQ_LENGTH,
-    BATCH_SIZE,
-    SCALER_DIR,
-    MODEL_DIR
-)
-
-# Define constants for testing
-TEST_PROCESSED_DATA_DIR = 'test_data_final'
-TEST_RAW_DATA_DIR = 'test_data_raw'
-TEST_SCALER_DIR = 'test_scalers'
-TEST_MODEL_DIR = 'test_models'
-
-# Define NUM_WORKERS
-NUM_WORKERS = cpu_count()
-
-class TestLNNProgram(unittest.TestCase):
+    
     @classmethod
-    def setUpClass(cls):
-        """
-        Set up synthetic datasets for testing purposes.
-        This method runs once before all tests.
-        """
-        os.makedirs(TEST_PROCESSED_DATA_DIR, exist_ok=True)
-        os.makedirs(TEST_RAW_DATA_DIR, exist_ok=True)
-        os.makedirs(TEST_SCALER_DIR, exist_ok=True)
-        os.makedirs(TEST_MODEL_DIR, exist_ok=True)
-
-        # Create synthetic raw data for each timeframe
-        cls.synthetic_raw_data = {}
-        timeframes = ['15m', '1h', '4h', '1d']
-        for timeframe in timeframes:
-            raw_filename = f"btc_{timeframe}_data_2018_to_2024-2024-10-10.csv"
-            raw_path = os.path.join(TEST_RAW_DATA_DIR, raw_filename)
-            freq = '15T' if timeframe == '15m' else 'H' if timeframe == '1h' else '4H' if timeframe == '4h' else 'D'
-            data = {
-                'Open time': pd.date_range(start='2022-01-01', periods=1000, freq=freq),
-                'Open': np.random.rand(1000).astype(np.float32) * 10000,
-                'High': np.random.rand(1000).astype(np.float32) * 10000,
-                'Low': np.random.rand(1000).astype(np.float32) * 10000,
-                'Close': np.random.rand(1000).astype(np.float32) * 10000,
-                'Volume': np.random.rand(1000).astype(np.float32) * 100,
-                'Close time': pd.date_range(start='2022-01-01', periods=1000, freq=freq),
-                'Quote asset volume': np.random.rand(1000).astype(np.float32) * 1e6,
-                'Number of trades': np.random.randint(100, 1000, size=1000),
-                'Taker buy base asset volume': np.random.rand(1000).astype(np.float32) * 100,
-                'Taker buy quote asset volume': np.random.rand(1000).astype(np.float32) * 1e5,
-                'Ignore': [0]*1000
-            }
-            df_raw = pd.DataFrame(data)
-            df_raw.to_csv(raw_path, index=False)
-            cls.synthetic_raw_data[timeframe] = raw_path
-
-        # Preprocess synthetic raw data
-        from preprocess import preprocess_file  # Import the preprocess_file function
-
-        for timeframe, raw_path in cls.synthetic_raw_data.items():
-            processed_filename = f"processed_data_{timeframe}.csv.gz"
-            processed_path = os.path.join(TEST_PROCESSED_DATA_DIR, processed_filename)
-            preprocess_file(timeframe, raw_path, processed_path)
-
+    def from_dict(cls, config_dict: Dict) -> 'NLNNConfig':
+        """Create config from dictionary"""
+        return cls(**config_dict)
+    
+    def save(self, filepath: str):
+        """Save config to JSON file"""
+        with open(filepath, 'w') as f:
+            json.dump(self.to_dict(), f, indent=2)
+    
     @classmethod
-    def tearDownClass(cls):
-        """
-        Clean up the synthetic datasets after all tests have run.
-        """
-        shutil.rmtree(TEST_PROCESSED_DATA_DIR, ignore_errors=True)
-        shutil.rmtree(TEST_RAW_DATA_DIR, ignore_errors=True)
-        shutil.rmtree(TEST_SCALER_DIR, ignore_errors=True)
-        shutil.rmtree(TEST_MODEL_DIR, ignore_errors=True)
+    def load(cls, filepath: str) -> 'NLNNConfig':
+        """Load config from JSON file"""
+        with open(filepath, 'r') as f:
+            config_dict = json.load(f)
+        return cls.from_dict(config_dict)
 
-    def test_load_and_preprocess(self):
-        """
-        Test the load_and_preprocess function to ensure it correctly loads data,
-        handles missing values, and scales features for all timeframes.
-        """
-        timeframes = ['15m', '1h', '4h', '1d']
-        for timeframe in timeframes:
-            with self.subTest(timeframe=timeframe):
-                processed_path = os.path.join(TEST_PROCESSED_DATA_DIR, f"processed_data_{timeframe}.csv.gz")
-                feature_cols = FEATURE_COLUMNS[timeframe]
-                target_cols = TARGET_COLUMNS[timeframe]
-                scaler_path = os.path.join(TEST_SCALER_DIR, f"scaler_{timeframe}.save")
+// File: config\__init__.py
 
-                df_scaled = load_and_preprocess(processed_path, feature_cols, target_cols, scaler_path)
 
-                # Check for missing values
-                self.assertFalse(df_scaled.isnull().values.any(), f"Missing values in {timeframe} data.")
+// File: data\process-data.py
 
-                # Check if scaler was saved
-                self.assertTrue(os.path.exists(scaler_path), f"Scaler not saved for {timeframe} data.")
 
-                # Load scaler and verify scaling
-                scaler = joblib.load(scaler_path)
-                original_features = pd.read_csv(processed_path, compression='gzip')[feature_cols].astype(np.float32)
-                scaled_features = scaler.transform(original_features)
-                np.testing.assert_array_almost_equal(
-                    df_scaled[feature_cols].values,
-                    scaled_features,
-                    decimal=5,
-                    err_msg=f"Feature scaling incorrect for {timeframe} data."
-                )
-
-    def test_create_sequences(self):
-        """
-        Test the create_sequences function to ensure it correctly creates input sequences and targets for all timeframes.
-        """
-        timeframes = ['15m', '1h', '4h', '1d']
-        for timeframe in timeframes:
-            with self.subTest(timeframe=timeframe):
-                processed_path = os.path.join(TEST_PROCESSED_DATA_DIR, f"processed_data_{timeframe}.csv.gz")
-                feature_cols = FEATURE_COLUMNS[timeframe]
-                target_cols = TARGET_COLUMNS[timeframe]
-                scaler_path = os.path.join(TEST_SCALER_DIR, f"scaler_{timeframe}.save")
-
-                df_scaled = load_and_preprocess(processed_path, feature_cols, target_cols, scaler_path)
-                sequences, targets = create_sequences(df_scaled, SEQ_LENGTH, feature_cols, target_cols)
-
-                # Calculate expected number of sequences
-                expected_num_sequences = len(df_scaled) - SEQ_LENGTH
-                actual_num_sequences = sequences.shape[0]
-
-                self.assertEqual(
-                    actual_num_sequences,
-                    expected_num_sequences,
-                    f"Sequences count mismatch for {timeframe} data. Expected {expected_num_sequences}, got {actual_num_sequences}."
-                )
-
-                # Check shapes
-                self.assertEqual(
-                    sequences.shape[1],
-                    SEQ_LENGTH,
-                    f"Sequence length incorrect for {timeframe} data."
-                )
-                self.assertEqual(
-                    sequences.shape[2],
-                    len(feature_cols),
-                    f"Number of features incorrect for {timeframe} data."
-                )
-
-                for target in target_cols:
-                    self.assertEqual(
-                        len(targets[target]),
-                        expected_num_sequences,
-                        f"Target length mismatch for {timeframe} data."
-                    )
-
-    def test_financial_dataset(self):
-        """
-        Test the FinancialDataset class to ensure it correctly retrieves sequences and targets for all timeframes.
-        """
-        timeframes = ['15m', '1h', '4h', '1d']
-        for timeframe in timeframes:
-            with self.subTest(timeframe=timeframe):
-                processed_path = os.path.join(TEST_PROCESSED_DATA_DIR, f"processed_data_{timeframe}.csv.gz")
-                feature_cols = FEATURE_COLUMNS[timeframe]
-                target_cols = TARGET_COLUMNS[timeframe]
-                scaler_path = os.path.join(TEST_SCALER_DIR, f"scaler_{timeframe}.save")
-
-                df_scaled = load_and_preprocess(processed_path, feature_cols, target_cols, scaler_path)
-                sequences, targets = create_sequences(df_scaled, SEQ_LENGTH, feature_cols, target_cols)
-                dataset = FinancialDataset(sequences, {target_cols[0]: targets[target_cols[0]]})  # Testing first target
-
-                # Test dataset length
-                self.assertEqual(
-                    len(dataset),
-                    len(sequences),
-                    f"Dataset length mismatch for {timeframe} data."
-                )
-
-                # Test getting an item
-                sample_seq, sample_target = dataset[0]
-                np.testing.assert_array_almost_equal(
-                    sample_seq.numpy(),
-                    sequences[0],
-                    decimal=5,
-                    err_msg=f"Sequence data incorrect for {timeframe} data."
-                )
-                self.assertAlmostEqual(
-                    sample_target.item(),
-                    targets[target_cols[0]][0],
-                    places=6,
-                    msg=f"Target value incorrect for {timeframe} data."
-                )
-
-    def test_lnn_model_forward(self):
-        """
-        Test the LNNModel's forward pass to ensure it produces outputs of the correct shape for all timeframes.
-        """
-        timeframes = ['15m', '1h', '4h', '1d']
-        for timeframe in timeframes:
-            with self.subTest(timeframe=timeframe):
-                input_size = len(FEATURE_COLUMNS[timeframe])
-                hidden_size = 128
-                num_layers = 2
-                output_size = 1
-
-                model = LNNModel(input_size, hidden_size, num_layers, output_size)
-                model.eval()  # Set model to evaluation mode
-
-                # Create a dummy input tensor with batch_size=2
-                dummy_input = torch.randn(2, SEQ_LENGTH, input_size)
-                with torch.no_grad():
-                    output = model(dummy_input)
-
-                # Check output shape
-                self.assertEqual(
-                    output.shape,
-                    (2, output_size),
-                    f"Model output shape incorrect for {timeframe} data."
-                )
-
-    def test_full_pipeline(self):
-        """
-        Test the full data loading, preprocessing, dataset creation, and model initialization pipeline for all timeframes.
-        This ensures that all components work together without errors.
-        """
-        timeframes = ['15m', '1h', '4h', '1d']
-        for timeframe in timeframes:
-            with self.subTest(timeframe=timeframe):
-                try:
-                    processed_path = os.path.join(TEST_PROCESSED_DATA_DIR, f"processed_data_{timeframe}.csv.gz")
-                    feature_cols = FEATURE_COLUMNS[timeframe]
-                    target_cols = TARGET_COLUMNS[timeframe]
-                    scaler_path = os.path.join(TEST_SCALER_DIR, f"scaler_{timeframe}.save")
-                    model_save_path = os.path.join(TEST_MODEL_DIR, f"lnn_model_{timeframe}.pth")
-
-                    # Load and preprocess
-                    df_scaled = load_and_preprocess(processed_path, feature_cols, target_cols, scaler_path)
-
-                    # Create sequences and targets
-                    sequences, targets = create_sequences(df_scaled, SEQ_LENGTH, feature_cols, target_cols)
-
-                    # Create Dataset and DataLoader
-                    dataset = FinancialDataset(sequences, {target_cols[0]: targets[target_cols[0]]})  # Using first target
-                    data_loader = DataLoader(
-                        dataset,
-                        batch_size=BATCH_SIZE,
-                        shuffle=True,
-                        num_workers=NUM_WORKERS,
-                        pin_memory=True
-                    )
-
-                    # Initialize model
-                    input_size = len(feature_cols)
-                    hidden_size = 128
-                    num_layers = 2
-                    output_size = 1
-
-                    model = LNNModel(input_size, hidden_size, num_layers, output_size)
-                    criterion = torch.nn.MSELoss()
-                    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-
-                    # Perform a single training step
-                    model.train()
-                    for sequences_batch, targets_batch in data_loader:
-                        # Forward pass
-                        outputs = model(sequences_batch)
-                        loss = criterion(outputs, targets_batch)
-
-                        # Backward pass and optimization
-                        optimizer.zero_grad()
-                        loss.backward()
-                        optimizer.step()
-                        break  # Only one batch for testing
-
-                    # Check if loss is a finite number
-                    self.assertTrue(np.isfinite(loss.item()), f"Loss is not finite for {timeframe} data.")
-
-                except Exception as e:
-                    self.fail(f"Full pipeline test failed for {timeframe} with exception: {e}")
-
-    @patch('joblib.dump')
-    def test_scaler_save(self, mock_joblib_dump):
-        """
-        Test that the scaler is saved correctly during preprocessing for all timeframes.
-        """
-        timeframes = ['15m', '1h', '4h', '1d']
-        for timeframe in timeframes:
-            with self.subTest(timeframe=timeframe):
-                processed_path = os.path.join(TEST_PROCESSED_DATA_DIR, f"processed_data_{timeframe}.csv.gz")
-                feature_cols = FEATURE_COLUMNS[timeframe]
-                target_cols = TARGET_COLUMNS[timeframe]
-                scaler_path = os.path.join(TEST_SCALER_DIR, f"scaler_{timeframe}.save")
-
-                load_and_preprocess(processed_path, feature_cols, target_cols, scaler_path)
-
-                # Check that joblib.dump was called to save the scaler
-                mock_joblib_dump.assert_called_with(
-                    unittest.mock.ANY,  # The scaler object
-                    scaler_path
-                )
-
-    def test_model_save(self):
-        """
-        Test that the model can be saved without errors for all timeframes.
-        """
-        timeframes = ['15m', '1h', '4h', '1d']
-        for timeframe in timeframes:
-            with self.subTest(timeframe=timeframe):
-                model = LNNModel(
-                    input_size=len(FEATURE_COLUMNS[timeframe]),
-                    hidden_size=128,
-                    num_layers=2,
-                    output_size=1
-                )
-                model_save_path = os.path.join(TEST_MODEL_DIR, f"lnn_model_{timeframe}.pth")
-                try:
-                    torch.save(model.state_dict(), model_save_path)
-                    self.assertTrue(os.path.exists(model_save_path), f"Model not saved correctly for {timeframe} data.")
-                except Exception as e:
-                    self.fail(f"Model save test failed for {timeframe} with exception: {e}")
-
-if __name__ == '__main__':
-    unittest.main()
+// File: data\__init__.py
 
 
 // File: data\raw\btc_15m_data_2018_to_2024-2024-10-10.csv
@@ -959,4 +259,1028 @@ if __name__ == '__main__':
 2018-01-01 08:00:00 13569.98 13735.24 13001.13 13220.56 1319.755931 2018-01-01 11:59:59.999        1.765121e+07             17200                   582.668293                  7.792109e+06       0
 2018-01-01 12:00:00 13220.56 13330.00 12750.00 13247.00 1831.933153 2018-01-01 15:59:59.999        2.391259e+07             21357                   830.314747                  1.083304e+07       0
 2018-01-01 16:00:00 13247.00 13290.65 12940.00 13240.37 1092.337234 2018-01-01 19:59:59.999        1.434887e+07             13178                   557.453779                  7.324320e+06       0
+
+// File: models\components.py
+# File: models/components.py
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional, Tuple
+
+class SphericalLayer(nn.Module):
+    """Base layer for spherical operations"""
+    def __init__(self, input_size: int, output_size: int, epsilon: float = 1e-8):
+        super().__init__()
+        self.input_size = input_size
+        self.output_size = output_size
+        self.epsilon = epsilon
+
+        # Initialize weights with modified Xavier/Glorot
+        scale = (6.0 / (input_size + output_size)) ** 0.5
+        self.weight = nn.Parameter(torch.randn(output_size, input_size) * scale)
+        self.scale_factor = nn.Parameter(torch.ones(output_size))
+
+        self._normalize_weights()
+
+    def _normalize_weights(self):
+        """Normalize weights to unit hypersphere"""
+        with torch.no_grad():
+            self.weight.div_(torch.norm(self.weight, dim=1, keepdim=True) + self.epsilon)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass with scaled normalized weights"""
+        self._normalize_weights()
+        return self.scale_factor.unsqueeze(0) * F.linear(x, self.weight)
+
+class SLERPLayer(nn.Module):
+    """Spherical Linear Interpolation Layer"""
+    def __init__(self, size: int, epsilon: float = 1e-8, use_slerp: bool = True):
+        super().__init__()
+        self.size = size
+        self.epsilon = epsilon
+        self.use_slerp = use_slerp
+
+        # Trainable eigen learning rate
+        self.alpha_raw = nn.Parameter(torch.zeros(size))
+
+    def forward(self, h_t: torch.Tensor, h_new: torch.Tensor) -> torch.Tensor:
+        """Apply SLERP or NLERP"""
+        alpha = torch.sigmoid(self.alpha_raw)
+
+        if not self.use_slerp:
+            # NLERP (Normalized Linear Interpolation)
+            return F.normalize(
+                (1 - alpha) * h_t + alpha * h_new,
+                dim=-1,
+                eps=self.epsilon
+            )
+
+        # SLERP implementation
+        h_t = F.normalize(h_t, dim=-1, eps=self.epsilon)
+        h_new = F.normalize(h_new, dim=-1, eps=self.epsilon)
+
+        dot_product = torch.sum(h_t * h_new, dim=-1, keepdim=True)
+        dot_product = torch.clamp(dot_product, -1 + self.epsilon, 1 - self.epsilon)
+
+        theta = torch.arccos(dot_product)
+        sin_theta = torch.sin(theta)
+
+        # Handle the case when sin(theta) is very small
+        sin_theta = sin_theta + self.epsilon
+
+        h_t_coeff = torch.sin((1 - alpha) * theta) / sin_theta
+        h_new_coeff = torch.sin(alpha * theta) / sin_theta
+
+        return F.normalize(
+            h_t_coeff * h_t + h_new_coeff * h_new,
+            dim=-1,
+            eps=self.epsilon
+        )
+
+class RecurrentSphericalLayer(nn.Module):
+    """Recurrent layer with spherical normalization"""
+    def __init__(self, hidden_size: int, epsilon: float = 1e-8):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.epsilon = epsilon
+
+        # Initialize close to identity
+        eye = torch.eye(hidden_size)
+        noise = torch.randn(hidden_size, hidden_size) * 0.01
+        self.weight = nn.Parameter(eye + noise)
+        self.scale_factor = nn.Parameter(torch.ones(hidden_size))
+
+        self._normalize_weights()
+
+    def _normalize_weights(self):
+        """Normalize weights to unit hypersphere"""
+        with torch.no_grad():
+            self.weight.div_(torch.norm(self.weight, dim=1, keepdim=True) + self.epsilon)
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        """Forward pass with scaled normalized weights"""
+        self._normalize_weights()
+        return self.scale_factor.unsqueeze(0) * F.linear(h, self.weight)
+
+
+// File: models\nlnn.py
+# File: models/nlnn.py
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.cuda.amp import autocast, GradScaler
+from typing import Optional, Tuple
+
+from .components import SphericalLayer, SLERPLayer, RecurrentSphericalLayer
+from config.config import NLNNConfig
+from utils.activations import get_activation_fn
+
+class NLNN(nn.Module):
+    """Normalized Liquid Neural Network"""
+    def __init__(self, config: NLNNConfig):
+        super().__init__()
+        self.config = config
+
+        # Initialize layers
+        self.input_layer = SphericalLayer(
+            input_size=config.input_size,
+            output_size=config.hidden_size,
+            epsilon=config.epsilon
+        )
+
+        self.recurrent_layer = RecurrentSphericalLayer(
+            hidden_size=config.hidden_size,
+            epsilon=config.epsilon
+        )
+
+        self.slerp_layer = SLERPLayer(
+            size=config.hidden_size,
+            epsilon=config.epsilon,
+            use_slerp=config.use_slerp
+        )
+
+        self.output_layer = SphericalLayer(
+            input_size=config.hidden_size,
+            output_size=config.output_size,
+            epsilon=config.epsilon
+        )
+
+        # Additional components
+        self.dropout = nn.Dropout(config.dropout)
+        self.activation = get_activation_fn(config.activation_fn)
+        self.scaler = GradScaler(enabled=config.use_mixed_precision)
+
+        # Global learning rate scaling
+        self.eta_scale = nn.Parameter(torch.ones(1))
+
+        # Move to device
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.to(self.device)
+
+    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
+        """Normalize tensor to unit hypersphere"""
+        return F.normalize(x, dim=-1, eps=self.config.epsilon)
+
+    def init_hidden(self, batch_size: int) -> torch.Tensor:
+        """Initialize hidden state"""
+        h = torch.randn(batch_size, self.config.hidden_size, device=self.device)
+        return self._normalize(h)
+
+    @autocast(device_type='cuda')
+    def forward(self, x: torch.Tensor, h_init: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass"""
+        # Handle input
+        if len(x.shape) == 2:
+            x = F.one_hot(x, num_classes=self.config.input_size).float()
+
+        batch_size, seq_len = x.shape[:2]
+        h_t = h_init if h_init is not None else self.init_hidden(batch_size)
+
+        outputs = []
+        for t in range(seq_len):
+            x_t = x[:, t]
+
+            # Input projection
+            input_proj = self.input_layer(x_t)
+
+            # Recurrent projection
+            recurrent_proj = self.recurrent_layer(h_t)
+
+            # Combine and normalize
+            h_new = self._normalize(input_proj + recurrent_proj)
+            h_new = self.activation(h_new)
+
+            # Update state using SLERP/NLERP
+            h_t = self.slerp_layer(h_t, h_new)
+            h_t = self.dropout(h_t)
+
+            # Compute output
+            output = self.output_layer(h_t)
+            outputs.append(output)
+
+        outputs = torch.stack(outputs, dim=1)
+        return outputs, h_t
+
+    def get_effective_learning_rate(self) -> torch.Tensor:
+        """Compute effective learning rate"""
+        return self.config.learning_rate * torch.sigmoid(self.eta_scale)
+
+    def save(self, filepath: str):
+        """Save model state"""
+        torch.save({
+            'model_state': self.state_dict(),
+            'config': self.config.to_dict()
+        }, filepath)
+
+    @classmethod
+    def load(cls, filepath: str) -> 'NLNN':
+        """Load model state"""
+        checkpoint = torch.load(filepath, map_location=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+        config = NLNNConfig.from_dict(checkpoint['config'])
+        model = cls(config)
+        model.load_state_dict(checkpoint['model_state'])
+        return model
+
+
+// File: models\__init__.py
+
+
+// File: optimizers\modified_adam.py
+import torch
+import math
+from typing import Dict, Iterator, Optional
+from torch.optim.optimizer import Optimizer
+
+class ModifiedAdam(Optimizer):
+    """
+    Implementation of Adam optimizer modified for spherical optimization.
+    Implements deformed gradient correction and proper scaling on the hypersphere.
+    """
+    def __init__(
+        self,
+        params: Iterator[torch.nn.Parameter],
+        lr: float = 1e-3,
+        betas: tuple = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0,
+        amsgrad: bool = False
+    ):
+        if not 0.0 <= lr:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if not 0.0 <= eps:
+            raise ValueError(f"Invalid epsilon value: {eps}")
+        if not 0.0 <= betas[0] < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
+        
+        defaults = dict(
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            amsgrad=amsgrad
+        )
+        super().__init__(params, defaults)
+    
+    def _compute_scaled_grad(
+        self,
+        p: torch.Tensor,
+        grad: torch.Tensor,
+        eps: float
+    ) -> torch.Tensor:
+        """Compute gradient scaled properly for spherical optimization"""
+        # Project gradient onto tangent space
+        r = torch.norm(p)
+        u = p / (r + eps)
+        grad_tang = grad - torch.sum(grad * u) * u
+        
+        # Scale gradient by radius
+        scaled_grad = grad_tang / (r + eps)
+        return scaled_grad
+    
+    @torch.no_grad()
+    def step(self, closure: Optional[callable] = None) -> Optional[float]:
+        """Performs a single optimization step"""
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        
+        for group in self.param_groups:
+            for p in group['params']:
+
+// File: optimizers\__init__.py
+
+
+// File: training\metrics.py
+# File: training/metrics.py
+
+import time
+from typing import Dict, List, Optional
+import json
+from pathlib import Path
+import numpy as np
+import matplotlib.pyplot as plt
+from dataclasses import dataclass, field
+
+@dataclass
+class BatchMetrics:
+    """Metrics for a single training batch"""
+    loss: float
+    grad_norm: float
+    forward_time: float
+    backward_time: float
+    total_time: float
+    learning_rate: float
+
+@dataclass
+class EpochMetrics:
+    """Aggregated metrics for a training epoch"""
+    epoch: int
+    avg_loss: float = 0.0
+    avg_grad_norm: float = 0.0
+    avg_forward_time: float = 0.0
+    avg_backward_time: float = 0.0
+    avg_total_time: float = 0.0
+    val_loss: Optional[float] = None
+    epoch_time: float = 0.0
+
+class PerformanceMetrics:
+    """Track and analyze model performance metrics"""
+    def __init__(self):
+        self.metrics: Dict[str, List[float]] = {
+            'loss': [],
+            'grad_norm': [],
+            'learning_rate': [],
+            'forward_time': [],
+            'backward_time': [],
+            'total_time': [],
+            'val_loss': []
+        }
+        self.epoch_metrics: List[EpochMetrics] = []
+        self.current_batch_metrics: List[BatchMetrics] = []
+
+        self.epoch_start_time: Optional[float] = None
+        self.batch_start_time: Optional[float] = None
+
+    def start_epoch(self):
+        """Mark start of epoch"""
+        self.epoch_start_time = time.time()
+        self.current_batch_metrics = []
+
+    def start_batch(self):
+        """Mark start of batch"""
+        self.batch_start_time = time.time()
+
+    def record_batch(
+        self,
+        loss: float,
+        grad_norm: float,
+        learning_rate: float,
+        forward_time: float,
+        backward_time: float,
+        total_time: float
+    ):
+        """Record metrics for a single batch"""
+        metrics = BatchMetrics(
+            loss=loss,
+            grad_norm=grad_norm,
+            learning_rate=learning_rate,
+            forward_time=forward_time,
+            backward_time=backward_time,
+            total_time=total_time
+        )
+
+        self.current_batch_metrics.append(metrics)
+
+        # Update running metrics
+        self.metrics['loss'].append(loss)
+        self.metrics['grad_norm'].append(grad_norm)
+        self.metrics['learning_rate'].append(learning_rate)
+        self.metrics['forward_time'].append(forward_time)
+        self.metrics['backward_time'].append(backward_time)
+        self.metrics['total_time'].append(total_time)
+
+    def get_epoch_stats(self) -> EpochMetrics:
+        """Compute aggregated statistics for the epoch"""
+        if not self.current_batch_metrics:
+            return EpochMetrics(epoch=0)
+
+        metrics = EpochMetrics(
+            epoch=len(self.epoch_metrics) + 1,
+            avg_loss=np.mean([m.loss for m in self.current_batch_metrics]),
+            avg_grad_norm=np.mean([m.grad_norm for m in self.current_batch_metrics]),
+            avg_forward_time=np.mean([m.forward_time for m in self.current_batch_metrics]),
+            avg_backward_time=np.mean([m.backward_time for m in self.current_batch_metrics]),
+            avg_total_time=np.mean([m.total_time for m in self.current_batch_metrics]),
+            epoch_time=time.time() - self.epoch_start_time if self.epoch_start_time else 0.0
+        )
+
+        if any(m.val_loss for m in self.current_batch_metrics):
+            metrics.val_loss = np.mean([m.val_loss for m in self.current_batch_metrics if m.val_loss is not None])
+
+        self.epoch_metrics.append(metrics)
+        return metrics
+
+    def reset_epoch_stats(self):
+        """Reset batch metrics for new epoch"""
+        self.current_batch_metrics = []
+        self.epoch_start_time = None
+
+    def save_metrics(self, path: Path):
+        """Save metrics to JSON file"""
+        metrics_dict = {
+            'batch_metrics': {
+                key: self.metrics[key] for key in self.metrics
+            },
+            'epoch_metrics': [vars(m) for m in self.epoch_metrics]
+        }
+
+        with open(path, 'w') as f:
+            json.dump(metrics_dict, f, indent=2)
+
+    def plot_metrics(self, path: Path):
+        """Create visualization of training metrics"""
+        plt.figure(figsize=(15, 10))
+
+        # Loss plot
+        plt.subplot(2, 2, 1)
+        plt.plot(self.metrics['loss'], label='Training Loss')
+        if self.metrics['val_loss']:
+            plt.plot(self.metrics['val_loss'], label='Validation Loss')
+        plt.title('Loss History')
+        plt.xlabel('Batch')
+        plt.ylabel('Loss')
+        plt.legend()
+
+        # Gradient norm plot
+        plt.subplot(2, 2, 2)
+        plt.plot(self.metrics['grad_norm'], label='Gradient Norm')
+        plt.title('Gradient Norms')
+        plt.xlabel('Batch')
+        plt.ylabel('Norm')
+        plt.legend()
+
+        # Learning rate plot
+        plt.subplot(2, 2, 3)
+        plt.plot(self.metrics['learning_rate'], label='Learning Rate')
+        plt.title('Learning Rate')
+        plt.xlabel('Batch')
+        plt.ylabel('Learning Rate')
+        plt.legend()
+
+        # Timing plot
+        plt.subplot(2, 2, 4)
+        plt.plot(self.metrics['forward_time'], label='Forward Time')
+        plt.plot(self.metrics['backward_time'], label='Backward Time')
+        plt.plot(self.metrics['total_time'], label='Total Time')
+        plt.title('Computation Times')
+        plt.xlabel('Batch')
+        plt.ylabel('Seconds')
+        plt.legend()
+
+        plt.tight_layout()
+        plt.savefig(path)
+        plt.close()
+
+
+// File: training\trainer.py
+import torch
+from torch.utils.data import DataLoader
+from typing import Optional, Dict, Any
+import time
+from pathlib import Path
+
+from ..models.nlnn import NLNN
+from ..config.config import NLNNConfig
+from ..optimizers.modified_adam import ModifiedAdam
+from .metrics import PerformanceMetrics
+from ..utils.monitoring import ResourceMonitor
+from ..utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+class NLNNTrainer:
+    """Trainer class for NLNN model"""
+    def __init__(
+        self,
+        model: NLNN,
+        config: NLNNConfig,
+        optimizer: Optional[ModifiedAdam] = None
+    ):
+        self.model = model
+        self.config = config
+        self.optimizer = optimizer or ModifiedAdam(
+            model.parameters(),
+            lr=config.learning_rate,
+            eps=config.epsilon
+        )
+        
+        self.criterion = torch.nn.CrossEntropyLoss()
+        self.metrics = PerformanceMetrics()
+        self.monitor = ResourceMonitor()
+        
+        self.device = model.device
+        self.best_loss = float('inf')
+        
+        logger.info(f"Initialized trainer with device: {self.device}")
+    
+    def train_step(self, batch: torch.Tensor) -> Dict[str, float]:
+        """Single training step"""
+        self.model.train()
+        self.optimizer.zero_grad()
+        
+        # Record timing
+        start_time = time.time()
+        forward_start = time.time()
+        
+        # Forward pass
+        x, y = [b.to(self.device) for b in batch]
+        with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
+            outputs, _ = self.model(x)
+            outputs = outputs.view(-1, outputs.size(-1))
+            y = y.view(-1)
+            loss = self.criterion(outputs, y)
+        
+        forward_time = time.time() - forward_start
+        
+        # Backward pass
+        backward_start = time.time()
+        self.model.scaler.scale(loss).backward()
+        
+        # Compute gradient norm
+        self.model.scaler.unscale_(self.optimizer)
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.model.parameters(),
+            self.config.grad_clip
+        )
+        
+        # Optimizer step
+        self.model.scaler.step(self.optimizer)
+        self.model.scaler.update()
+        
+        backward_time = time.time() - backward_start
+        total_time = time.time() - start_time
+        
+        metrics = {
+            'loss': loss.item(),
+            'grad_norm': grad_norm.item(),
+            'forward_time': forward_time,
+            'backward_time': backward_time,
+            'total_time': total_time
+        }
+        
+        return metrics
+    
+    def validate(self, dataloader: DataLoader) -> Dict[str, float]:
+        """Validation loop"""
+        self.model.eval()
+        total_loss = 0
+        
+        with torch.no_grad():
+            for batch in dataloader:
+                x, y = [b.to(self.device) for b in batch]
+                with torch.cuda.amp.autocast(enabled=self.config.use_mixed_precision):
+                    outputs, _ = self.model(x)
+                    outputs = outputs.view(-1, outputs.size(-1))
+                    y = y.view(-1)
+                    loss = self.criterion(outputs, y)
+                total_loss += loss.item()
+        
+        avg_loss = total_loss / len(dataloader)
+        return {'val_loss': avg_loss}
+    
+    def train(
+        self,
+        train_dataloader: DataLoader,
+        num_epochs: int,
+        val_dataloader: Optional[DataLoader] = None,
+        save_dir: Optional[Path] = None
+    ):
+        """Full training loop"""
+        save_dir = save_dir or self.config.checkpoint_dir
+        save_dir.mkdir(parents=True, exist_ok=True)
+        
+        logger.info(f"Starting training for {num_epochs} epochs")
+        
+        for epoch in range(num_epochs):
+            self.metrics.start_epoch()
+            epoch_metrics = {'epoch': epoch}
+            
+            # Training loop
+            for batch_idx, batch in enumerate(train_dataloader):
+                self.metrics.start_batch()
+                step_metrics = self.train_step(batch)
+                
+                # Record metrics
+                self.metrics.record_batch(**step_metrics)
+                epoch_metrics.update(step_metrics)
+                
+                # Log progress
+                if batch_idx % 100 == 0:
+                    self.monitor.log_stats(epoch_metrics)
+            
+            # Validation
+            if val_dataloader is not None:
+                val_metrics = self.validate(val_dataloader)
+                epoch_metrics.update(val_metrics)
+                
+                # Save best model
+                if val_metrics['val_loss'] < self.best_loss:
+                    self.best_loss = val_metrics['val_loss']
+                    self.save_checkpoint(save_dir / 'best_model.pt', epoch_metrics)
+            
+            # End of epoch
+            epoch_stats = self.metrics.get_epoch_stats()
+            epoch_metrics.update(epoch_stats)
+            
+            # Save checkpoint
+            if epoch % 5 == 0:
+                self.save_checkpoint(
+                    save_dir / f'checkpoint_epoch_{epoch}.pt',
+                    epoch_metrics
+                )
+            
+            # Log epoch metrics
+            logger.info(f"Epoch {epoch} completed:")
+            for key, value in epoch_metrics.items():
+                logger.info(f"  {key}: {value:.4f}")
+            
+            self.metrics.reset_epoch_stats()
+        
+        # Save final model and metrics
+        self.save_checkpoint(save_dir / 'final_model.pt', epoch_metrics)
+        self.metrics.save_metrics(save_dir / 'training_metrics.json')
+        self.metrics.plot_metrics(save_dir / 'training_plots.png')
+        self.monitor.save_stats(save_dir / 'resource_stats.json')
+        self.monitor.plot_stats(save_dir / 'resource_plots.png')
+        
+        logger.info("Training completed")
+    
+    def save_checkpoint(self, path: Path, metrics: Dict[str, Any]):
+        """Save training checkpoint"""
+        checkpoint = {
+            'epoch': metrics.get('epoch', 0),
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'metrics': metrics,
+            'config': self.config.to_dict()
+        }
+        torch.save(checkpoint, path)
+        logger.info(f"Saved checkpoint to {path}")
+    
+    def load_checkpoint(self, path: Path):
+        """Load training checkpoint"""
+        checkpoint = torch.load(path)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.config = NLNNConfig.from_dict(checkpoint['config'])
+        metrics = checkpoint['metrics']
+        logger.info(f"Loaded checkpoint from epoch {metrics['epoch']}")
+        return metrics
+
+// File: training\__init__.py
+
+
+// File: utils\activations.py
+# File: utils/activations.py
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Callable
+
+class ModifiedReLU(nn.Module):
+    """Modified ReLU that maintains normalization properties"""
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.relu(x) * (1 - torch.exp(-x))
+
+def get_activation_fn(name: str) -> Callable:
+    """Get activation function by name"""
+    activations = {
+        'tanh': torch.tanh,
+        'modified_relu': ModifiedReLU(),
+        'none': lambda x: x,
+    }
+
+    if name not in activations:
+        raise ValueError(f"Unknown activation function: {name}")
+
+    return activations[name]
+
+
+// File: utils\hardware_config.py
+import os
+import torch
+import torch.backends.cudnn as cudnn
+from dataclasses import dataclass, field
+from typing import Dict, Optional, Tuple
+from pathlib import Path
+
+@dataclass
+class HardwareConfig:
+    device: torch.device = field(default_factory=lambda: torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+    num_workers: int = 12
+    pin_memory: bool = True
+    cuda_non_blocking: bool = True
+    torch_threads: int = 24
+    cudnn_benchmark: bool = True
+    amp_dtype: torch.dtype = torch.float16
+    memory_format: torch.memory_format = torch.channels_last
+    vram_allocation: float = 0.85
+    batch_power: int = 9
+    gradient_accumulation_steps: int = 2
+    prefetch_factor: int = 4
+    persistent_workers: bool = True
+    
+    def __post_init__(self):
+        if torch.cuda.is_available():
+            torch.cuda.set_device(self.device)
+            torch.cuda.empty_cache()
+            torch.cuda.memory.set_per_process_memory_fraction(self.vram_allocation)
+            
+        torch.set_float32_matmul_precision('high')
+        torch.set_num_threads(self.torch_threads)
+        cudnn.benchmark = self.cudnn_benchmark
+        cudnn.deterministic = False
+        cudnn.enabled = True
+        
+        os.environ['OMP_NUM_THREADS'] = str(self.torch_threads)
+        os.environ['MKL_NUM_THREADS'] = str(self.torch_threads)
+        
+        self.batch_size = 2 ** self.batch_power
+        
+    def optimize_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.to(
+            device=self.device,
+            dtype=self.amp_dtype if tensor.is_floating_point() else tensor.dtype,
+            memory_format=self.memory_format,
+            non_blocking=self.cuda_non_blocking
+        )
+    
+    def get_dataloader_args(self) -> Dict:
+        return {
+            'num_workers': self.num_workers,
+            'pin_memory': self.pin_memory,
+            'prefetch_factor': self.prefetch_factor,
+            'persistent_workers': self.persistent_workers
+        }
+    
+    @property
+    def effective_batch_size(self) -> int:
+        return self.batch_size * self.gradient_accumulation_steps
+    
+    def memory_stats(self) -> Dict[str, float]:
+        if not torch.cuda.is_available():
+            return {}
+            
+        return {
+            'allocated': torch.cuda.memory_allocated() / 1024**3,
+            'reserved': torch.cuda.memory_reserved() / 1024**3,
+            'max_allocated': torch.cuda.max_memory_allocated() / 1024**3
+        }
+
+class OptimizedDataPipeline:
+    def __init__(self, config: HardwareConfig):
+        self.config = config
+        
+    def create_dataloaders(
+        self,
+        dataset_train,
+        dataset_val,
+        collate_fn=None
+    ) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
+        dataloader_args = self.config.get_dataloader_args()
+        
+        train_loader = torch.utils.data.DataLoader(
+            dataset_train,
+            batch_size=self.config.batch_size,
+            shuffle=True,
+            collate_fn=collate_fn,
+            **dataloader_args
+        )
+        
+        val_loader = torch.utils.data.DataLoader(
+            dataset_val,
+            batch_size=self.config.batch_size * 2,
+            shuffle=False,
+            collate_fn=collate_fn,
+            **dataloader_args
+        )
+        
+        return train_loader, val_loader
+
+def create_optimized_config() -> HardwareConfig:
+    return HardwareConfig(
+        num_workers=12,
+        torch_threads=24,
+        batch_power=9,
+        vram_allocation=0.85
+    )
+
+// File: utils\logging.py
+# File: utils/logging.py
+
+import logging
+import sys
+from pathlib import Path
+from typing import Optional
+from datetime import datetime
+
+def get_logger(
+    name: str,
+    log_dir: Optional[Path] = None,
+    level: int = logging.INFO
+) -> logging.Logger:
+    """
+    Create or get a logger with the specified name and configuration
+
+    Args:
+        name: Logger name (typically __name__)
+        log_dir: Directory to store log files
+        level: Logging level
+
+    Returns:
+        Configured logger instance
+    """
+    logger = logging.getLogger(name)
+
+    # Only configure if logger hasn't been configured before
+    if not logger.handlers:
+        logger.setLevel(level)
+
+        # Create formatters
+        console_formatter = logging.Formatter(
+            '%(asctime)s | %(levelname)-8s | %(name)s:%(funcName)s:%(lineno)d - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+
+        file_formatter = logging.Formatter(
+            '%(asctime)s | %(levelname)-8s | %(name)s:%(funcName)s:%(lineno)d - %(message)s'
+        )
+
+        # Console handler
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(console_formatter)
+        logger.addHandler(console_handler)
+
+        # File handler if log_dir is provided
+        if log_dir is not None:
+            log_dir = Path(log_dir)
+            log_dir.mkdir(parents=True, exist_ok=True)
+
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            log_file = log_dir / f'nlnn_{timestamp}.log'
+
+            file_handler = logging.FileHandler(log_file)
+            file_handler.setFormatter(file_formatter)
+            logger.addHandler(file_handler)
+
+    return logger
+
+
+// File: utils\monitoring.py
+# File: utils/monitoring.py
+
+import psutil
+import GPUtil
+import time
+from datetime import datetime
+from pathlib import Path
+import json
+from typing import Dict, List, Optional
+import matplotlib.pyplot as plt
+from dataclasses import dataclass
+from utils.logging import get_logger
+
+logger = get_logger('Monitoring')
+
+@dataclass
+class SystemStats:
+    """System resource statistics"""
+    timestamp: str
+    cpu_percent: float
+    memory_percent: float
+    memory_used: float
+    memory_total: float
+    process_cpu_percent: float
+    process_memory: float
+    gpu_load: Optional[float] = None
+    gpu_memory_used: Optional[float] = None
+    gpu_memory_total: Optional[float] = None
+    gpu_temperature: Optional[float] = None
+
+class ResourceMonitor:
+    """Monitor system resources during training"""
+    def __init__(self):
+        self.process = psutil.Process()
+        self.start_time = time.time()
+        self.stats_history: List[SystemStats] = []
+
+    def get_gpu_stats(self) -> Dict[str, float]:
+        """Get GPU statistics if available"""
+        try:
+            gpus = GPUtil.getGPUs()
+            if gpus:
+                gpu = gpus[0]  # Get primary GPU
+                return {
+                    'gpu_load': gpu.load * 100,
+                    'gpu_memory_used': gpu.memoryUsed,
+                    'gpu_memory_total': gpu.memoryTotal,
+                    'gpu_temperature': gpu.temperature
+                }
+        except Exception as e:
+            logger.warning(f"Could not get GPU stats: {e}")
+        return {}
+
+    def get_system_stats(self) -> Dict[str, float]:
+        """Get system statistics"""
+        cpu_percent = psutil.cpu_percent(interval=1)
+        memory = psutil.virtual_memory()
+        return {
+            'cpu_percent': cpu_percent,
+            'memory_percent': memory.percent,
+            'memory_used': memory.used / (1024 ** 3),  # Convert to GB
+            'memory_total': memory.total / (1024 ** 3)  # Convert to GB
+        }
+
+    def get_process_stats(self) -> Dict[str, float]:
+        """Get statistics for current process"""
+        return {
+            'process_cpu_percent': self.process.cpu_percent(),
+            'process_memory': self.process.memory_info().rss / (1024 ** 3),  # Convert to GB
+            'elapsed_time': time.time() - self.start_time
+        }
+
+    def log_stats(self, extra_info: Optional[Dict] = None):
+        """Log current system statistics"""
+        stats = {
+            'timestamp': datetime.now().isoformat(),
+            **self.get_system_stats(),
+            **self.get_gpu_stats(),
+            **self.get_process_stats()
+        }
+
+        # Create SystemStats object and store
+        system_stats = SystemStats(**stats)
+        self.stats_history.append(system_stats)
+
+        # Log information
+        logger.info("\nResource Usage:")
+        logger.info(f"CPU Usage: {stats['cpu_percent']:.1f}%")
+        logger.info(f"Memory Usage: {stats['memory_used']:.1f}GB/{stats['memory_total']:.1f}GB "
+                    f"({stats['memory_percent']:.1f}%)")
+
+        if 'gpu_load' in stats and stats['gpu_load'] is not None:
+            logger.info(f"GPU Usage: {stats['gpu_load']:.1f}%")
+            logger.info(f"GPU Memory: {stats['gpu_memory_used']:.1f}MB/{stats['gpu_memory_total']:.1f}MB")
+            logger.info(f"GPU Temperature: {stats['gpu_temperature']:.1f}°C")
+
+        logger.info(f"Process Memory: {stats['process_memory']:.2f}GB")
+        logger.info(f"Elapsed Time: {stats['elapsed_time']:.1f}s")
+
+        if extra_info:
+            logger.info("\nTraining Stats:")
+            for key, value in extra_info.items():
+                logger.info(f"{key}: {value}")
+
+    def save_stats(self, path: Path):
+        """Save resource statistics to file"""
+        stats_dict = [vars(stats) for stats in self.stats_history]
+        with open(path, 'w') as f:
+            json.dump(stats_dict, f, indent=2)
+
+    def plot_stats(self, path: Path):
+        """Create visualization of resource usage"""
+        if not self.stats_history:
+            logger.warning("No stats to plot")
+            return
+
+        plt.figure(figsize=(15, 10))
+
+        # CPU and Memory Usage
+        plt.subplot(2, 2, 1)
+        plt.plot([s.cpu_percent for s in self.stats_history], label='CPU Usage %')
+        plt.plot([s.memory_percent for s in self.stats_history], label='Memory Usage %')
+        plt.title('CPU and Memory Usage')
+        plt.xlabel('Time')
+        plt.ylabel('Percentage')
+        plt.legend()
+
+        # GPU Usage if available
+        if any(s.gpu_load is not None for s in self.stats_history):
+            plt.subplot(2, 2, 2)
+            plt.plot([s.gpu_load for s in self.stats_history], label='GPU Usage %')
+            plt.plot([s.gpu_temperature for s in self.stats_history if s.gpu_temperature is not None], label='GPU Temp °C')
+            plt.title('GPU Usage and Temperature')
+            plt.xlabel('Time')
+            plt.ylabel('Value')
+            plt.legend()
+
+        # Process Memory
+        plt.subplot(2, 2, 3)
+        plt.plot([s.process_memory for s in self.stats_history], label='Process Memory (GB)')
+        plt.title('Process Memory Usage')
+        plt.xlabel('Time')
+        plt.ylabel('GB')
+        plt.legend()
+
+        # Elapsed Time
+        plt.subplot(2, 2, 4)
+        plt.plot([s.elapsed_time for s in self.stats_history], label='Elapsed Time (s)')
+        plt.title('Elapsed Time')
+        plt.xlabel('Time')
+        plt.ylabel('Seconds')
+        plt.legend()
+
+        plt.tight_layout()
+        plt.savefig(path)
+        plt.close()
+
+
+// File: utils\__init__.py
+
 
