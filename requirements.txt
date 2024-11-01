@@ -11,12 +11,14 @@ cycler==0.12.1
 dask==2024.10.0
 dask-expr==1.1.16
 distributed==2024.10.0
+Farama-Notifications==0.0.4
 fastrlock==0.8.2
 filelock==3.13.1
 fonttools==4.54.1
 frozenlist==1.4.1
 fsspec==2024.2.0
 GPUtil==1.4.0
+gymnasium==1.0.0
 idna==3.10
 imbalanced-learn==0.12.4
 imblearn==0.0
@@ -58,6 +60,7 @@ seaborn==0.13.2
 setuptools==75.2.0
 six==1.16.0
 sortedcontainers==2.4.0
+swig==4.2.1.post0
 sympy==1.13.1
 ta==0.11.0
 tblib==3.0.0

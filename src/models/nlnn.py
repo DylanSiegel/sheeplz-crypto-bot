@@ -1,232 +1,341 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import autocast, GradScaler
-from typing import Optional, Tuple, List
+import torch.optim as optim
+import gymnasium as gym
+import numpy as np
 from dataclasses import dataclass
+from typing import Tuple, Dict, List
+import logging
+import time
+from collections import deque
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
 @dataclass
-class LN2Config:
-    """Enhanced configuration for LN² model with hardware optimization settings"""
-    feature_dim: int
-    hidden_dim: int
-    output_dim: int
-    num_layers: int
-    sequence_length: int
-    batch_size: int
-    dropout: float = 0.1
-    learning_rate: float = 1e-3
-    epsilon: float = 1e-8
-    eigen_adaptation_rate: float = 0.01
-    slerp_rate: float = 0.1
-    use_mixed_precision: bool = True
-    use_slerp: bool = True
+class TradingConfig:
+    """Configuration for trading parameters and risk management"""
+    max_position_size: float = 0.1  # Maximum position size as fraction of capital
+    stop_loss_pct: float = 0.02     # Stop loss percentage
+    take_profit_pct: float = 0.04   # Take profit percentage
+    max_leverage: float = 5.0       # Maximum allowed leverage
+    min_trade_interval: int = 5     # Minimum intervals between trades
+    rolling_window_size: int = 100  # Size of rolling window for feature calculation
 
-class SphericalLinear(nn.Module):
-    """Optimized linear layer with weight normalization on hypersphere"""
-    def __init__(self, input_size: int, output_size: int, epsilon: float = 1e-8):
-        super().__init__()
-        scale = (6.0 / (input_size + output_size)) ** 0.5
-        self.weight = nn.Parameter(torch.randn(output_size, input_size) * scale)
-        self.scale = nn.Parameter(torch.ones(output_size))
-        self.epsilon = epsilon
-        self._normalize_weights()
-
-    def _normalize_weights(self):
-        with torch.no_grad():
-            norm = torch.norm(self.weight, dim=1, keepdim=True)
-            self.weight.div_(norm + self.epsilon)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        self._normalize_weights()
-        return self.scale.unsqueeze(0) * F.linear(x, self.weight)
-
-class OptimizedSLERP(nn.Module):
-    """Enhanced SLERP implementation with numerical stability"""
-    def __init__(self, size: int, epsilon: float = 1e-8):
-        super().__init__()
-        self.alpha = nn.Parameter(torch.zeros(size))
-        self.epsilon = epsilon
-
-    def forward(self, h_t: torch.Tensor, h_new: torch.Tensor) -> torch.Tensor:
-        alpha = torch.sigmoid(self.alpha)
-        h_t = F.normalize(h_t, dim=-1, eps=self.epsilon)
-        h_new = F.normalize(h_new, dim=-1, eps=self.epsilon)
-        
-        dot_product = torch.sum(h_t * h_new, dim=-1, keepdim=True)
-        dot_product = torch.clamp(dot_product, -1 + self.epsilon, 1 - self.epsilon)
-        
-        theta = torch.arccos(dot_product)
-        sin_theta = torch.sin(theta) + self.epsilon
-        
-        h_t_coeff = torch.sin((1 - alpha) * theta) / sin_theta
-        h_new_coeff = torch.sin(alpha * theta) / sin_theta
-        
-        return F.normalize(h_t_coeff * h_t + h_new_coeff * h_new, dim=-1, eps=self.epsilon)
-
-class OptimizedLiquidCell(nn.Module):
-    """Hardware-optimized liquid neural network cell"""
-    def __init__(self, input_dim: int, hidden_dim: int, config: LN2Config):
-        super().__init__()
+class FeatureExtractor:
+    """Extracts and normalizes trading features"""
+    
+    def __init__(self, config: TradingConfig):
         self.config = config
+        self.price_history = deque(maxlen=config.rolling_window_size)
+        self.volume_history = deque(maxlen=config.rolling_window_size)
         
-        self.input_proj = SphericalLinear(input_dim, hidden_dim)
-        self.state_proj = SphericalLinear(hidden_dim, hidden_dim)
-        self.slerp = OptimizedSLERP(hidden_dim, config.epsilon)
-        self.norm = nn.LayerNorm(hidden_dim)
+    def calculate_features(self, market_data: Dict) -> np.ndarray:
+        """Calculate normalized feature vector from market data"""
+        # Add new data points
+        self.price_history.append(market_data['close_price'])
+        self.volume_history.append(market_data['volume'])
         
-    def forward(self, x: torch.Tensor, h: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        batch_size = x.size(0)
-        
-        if h is None:
-            h = F.normalize(
-                torch.zeros(batch_size, self.state_proj.weight.size(0), 
-                          device=x.device),
-                dim=-1,
-                eps=self.config.epsilon
-            )
-        
-        input_proj = self.input_proj(x)
-        state_proj = self.state_proj(h)
-        
-        h_new = F.normalize(input_proj + state_proj, dim=-1, eps=self.config.epsilon)
-        
-        if self.config.use_slerp:
-            h_next = self.slerp(h, h_new)
-        else:
-            h_next = h_new
+        if len(self.price_history) < 2:
+            return np.zeros(10)  # Return zero features if insufficient history
             
-        return self.norm(h_next), h_next
-
-class OptimizedLN2Model(nn.Module):
-    """Hardware-optimized Liquid Normalized Neural Network model"""
-    def __init__(self, config: LN2Config):
-        super().__init__()
-        self.config = config
+        # Calculate technical features
+        returns = np.diff(self.price_history) / np.array(list(self.price_history)[:-1])
+        volatility = np.std(returns[-20:]) if len(returns) >= 20 else 0
+        rsi = self._calculate_rsi(list(self.price_history))
         
-        # Hardware optimization
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.scaler = GradScaler(enabled=config.use_mixed_precision)
-        
-        # Network layers
-        self.input_norm = nn.LayerNorm(config.feature_dim)
-        self.embedding = SphericalLinear(config.feature_dim, config.hidden_dim)
-        
-        self.liquid_cells = nn.ModuleList([
-            OptimizedLiquidCell(config.hidden_dim, config.hidden_dim, config)
-            for _ in range(config.num_layers)
+        # Normalize and combine features
+        features = np.array([
+            self._normalize(market_data['close_price'], self.price_history),
+            self._normalize(market_data['volume'], self.volume_history),
+            volatility,
+            rsi / 100.0,  # RSI is already 0-100
+            market_data['bid_ask_spread'] / market_data['close_price'],
+            market_data['funding_rate'],
+            market_data['open_interest'] / np.mean(self.volume_history),
+            market_data['leverage_ratio'] / self.config.max_leverage,
+            market_data['market_depth_ratio'],
+            market_data['taker_buy_ratio']
         ])
         
-        self.dropout = nn.Dropout(config.dropout)
-        self.output_layer = SphericalLinear(config.hidden_dim, config.output_dim)
-        
-        # Adaptive learning rate
-        self.eta = nn.Parameter(torch.ones(1))
-        
-        self.to(self.device)
-        self._optimize_memory_format()
-
-    def _optimize_memory_format(self):
-        """Optimize memory layout for better performance"""
-        self.to(memory_format=torch.channels_last)
-        for param in self.parameters():
-            if param.dim() == 4:
-                param.data = param.data.to(memory_format=torch.channels_last)
-
-    def init_states(self, batch_size: int) -> List[torch.Tensor]:
-        return [F.normalize(
-            torch.randn(batch_size, self.config.hidden_dim, device=self.device),
-            dim=-1,
-            eps=self.config.epsilon
-        ) for _ in range(self.config.num_layers)]
-
-    @autocast(device_type='cuda')
-    def forward(self, x: torch.Tensor, states: Optional[List[torch.Tensor]] = None) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        batch_size, seq_len = x.shape[:2]
-        
-        if states is None:
-            states = self.init_states(batch_size)
-        
-        outputs = []
-        for t in range(seq_len):
-            x_t = self.input_norm(x[:, t])
-            h = self.embedding(x_t)
+        return np.clip(features, -1, 1)  # Ensure all features are in [-1, 1]
+    
+    def _normalize(self, value: float, history: deque) -> float:
+        """Min-max normalization using recent history"""
+        if len(history) < 2:
+            return 0
+        min_val = min(history)
+        max_val = max(history)
+        if min_val == max_val:
+            return 0
+        return (value - min_val) / (max_val - min_val) * 2 - 1
+    
+    def _calculate_rsi(self, prices: List[float], periods: int = 14) -> float:
+        """Calculate Relative Strength Index"""
+        if len(prices) < periods + 1:
+            return 50.0
             
-            new_states = []
-            for i, cell in enumerate(self.liquid_cells):
-                h, new_state = cell(h, states[i])
-                h = self.dropout(h)
-                new_states.append(new_state)
-            
-            states = new_states
-            output = self.output_layer(h)
-            outputs.append(output)
+        deltas = np.diff(prices)
+        gains = np.clip(deltas, 0, None)
+        losses = -np.clip(deltas, None, 0)
         
-        outputs = torch.stack(outputs, dim=1)
-        return outputs, states
+        avg_gain = np.mean(gains[-periods:])
+        avg_loss = np.mean(losses[-periods:])
+        
+        if avg_loss == 0:
+            return 100.0
+            
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
 
-    def configure_optimizers(self) -> torch.optim.Optimizer:
-        """Configure optimizer with adaptive learning rate"""
-        return torch.optim.AdamW(
-            self.parameters(),
-            lr=self.config.learning_rate * torch.sigmoid(self.eta),
-            eps=self.config.epsilon,
-            betas=(0.9, 0.999),
-            weight_decay=0.01
-        )
+class RiskManager:
+    """Handles position sizing and risk management"""
+    
+    def __init__(self, config: TradingConfig):
+        self.config = config
+        self.current_position = 0
+        self.last_trade_time = 0
+        
+    def validate_action(self, action: int, current_price: float, 
+                       account_balance: float) -> Tuple[bool, str]:
+        """Validate if an action can be executed based on risk parameters"""
+        current_time = time.time()
+        
+        # Check trading frequency
+        if current_time - self.last_trade_time < self.config.min_trade_interval:
+            return False, "Trading too frequently"
+            
+        # Check position sizes
+        new_position = self._calculate_position_size(action, current_price, account_balance)
+        if abs(new_position) > self.config.max_position_size * account_balance:
+            return False, "Position size exceeds maximum"
+            
+        return True, ""
+        
+    def _calculate_position_size(self, action: int, current_price: float,
+                               account_balance: float) -> float:
+        """Calculate appropriate position size based on risk parameters"""
+        base_size = account_balance * self.config.max_position_size
+        
+        # Scale position size based on market volatility (simplified)
+        # In practice, you'd want more sophisticated volatility adjustment
+        volatility_scalar = 0.5  # Could be dynamically calculated
+        position_size = base_size * volatility_scalar
+        
+        # Adjust for action type (0: Buy, 1: Sell, 2: Hold)
+        if action == 2:  # Hold
+            return self.current_position
+        elif action == 1:  # Sell
+            return -position_size
+        else:  # Buy
+            return position_size
 
-class LN2Loss(nn.Module):
-    """Loss function for LN² model with regularization"""
-    def __init__(self):
+class N_LNN(nn.Module):
+    """Enhanced n-LNN implementation with additional features"""
+    
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int = 1):
         super().__init__()
-        self.criterion = nn.MSELoss()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
         
-    def forward(self, pred: torch.Tensor, target: torch.Tensor, states: List[torch.Tensor]) -> torch.Tensor:
-        pred_loss = self.criterion(pred, target)
+        # Input transformation
+        self.input_transform = nn.Linear(input_size, hidden_size)
         
-        # State transition regularization
-        state_reg = sum(
-            torch.norm(s[1:] - s[:-1], dim=-1).mean() 
-            for s in states
-        ) / len(states)
+        # Learnable parameters
+        self.W_i = nn.ParameterList([
+            nn.Parameter(torch.randn(hidden_size, hidden_size)) 
+            for _ in range(num_layers)
+        ])
+        self.W_r = nn.ParameterList([
+            nn.Parameter(torch.randn(hidden_size, hidden_size))
+            for _ in range(num_layers)
+        ])
         
-        return pred_loss + 0.1 * state_reg
+        # Eigen learning rates and scaling factors
+        self.lambda_i = nn.ParameterList([
+            nn.Parameter(torch.ones(hidden_size))
+            for _ in range(num_layers)
+        ])
+        self.lambda_r = nn.ParameterList([
+            nn.Parameter(torch.ones(hidden_size))
+            for _ in range(num_layers)
+        ])
+        
+        self.scaling_i = nn.Parameter(torch.ones(1))
+        self.scaling_r = nn.Parameter(torch.ones(1))
+        
+        self.dropout = nn.Dropout(0.1)
+        self.layer_norm = nn.LayerNorm(hidden_size)
+        
+    def normalize(self, v: torch.Tensor, epsilon: float = 1e-8) -> torch.Tensor:
+        """Hypersphere normalization with numerical stability"""
+        norm = torch.norm(v, dim=-1, keepdim=True)
+        return v / (norm + epsilon)
+    
+    def slerp(self, h_t: torch.Tensor, h_new: torch.Tensor,
+              alpha: float = 0.5) -> torch.Tensor:
+        """Spherical linear interpolation with safety checks"""
+        # Ensure inputs are normalized
+        h_t = self.normalize(h_t)
+        h_new = self.normalize(h_new)
+        
+        # Calculate cos_theta with numerical stability
+        cos_theta = torch.sum(h_t * h_new, dim=-1, keepdim=True).clamp(-1 + 1e-7, 1 - 1e-7)
+        theta = torch.acos(cos_theta)
+        
+        # Handle edge cases
+        sin_theta = torch.sin(theta)
+        mask = sin_theta.abs() > 1e-7
+        
+        result = torch.where(
+            mask,
+            ((torch.sin((1 - alpha) * theta) / sin_theta) * h_t) + 
+            ((torch.sin(alpha * theta) / sin_theta) * h_new),
+            h_t
+        )
+        
+        return self.normalize(result)
+    
+    def forward(self, inputs: torch.Tensor, 
+                hidden_states: List[torch.Tensor]) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """Forward pass with multi-layer support and residual connections"""
+        # Input projection
+        x = self.input_transform(inputs)
+        x = self.layer_norm(x)
+        
+        new_hidden_states = []
+        for layer in range(self.num_layers):
+            h_t = hidden_states[layer]
+            
+            # Apply transformations
+            i_transform = torch.matmul(x, self.W_i[layer]) * self.lambda_i[layer]
+            r_transform = torch.matmul(h_t, self.W_r[layer]) * self.lambda_r[layer]
+            
+            # Combine transformations
+            h_new = self.normalize(
+                self.scaling_i * i_transform + 
+                self.scaling_r * r_transform
+            )
+            
+            # Apply SLERP
+            h_new = self.slerp(h_t, h_new)
+            
+            # Residual connection if dimensions match
+            if x.shape == h_new.shape:
+                h_new = h_new + x
+                
+            h_new = self.layer_norm(h_new)
+            h_new = self.dropout(h_new)
+            
+            new_hidden_states.append(h_new)
+            x = h_new  # Use as input for next layer
+            
+        return x, new_hidden_states
 
-def optimize_hardware():
-    """Optimize hardware settings for maximum performance"""
-    if torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cudnn.deterministic = False
-        torch.set_float32_matmul_precision('high')
-        torch.cuda.empty_cache()
+class Agent(nn.Module):
+    """Trading agent with actor-critic architecture"""
     
-    torch.set_num_threads(24)  # Optimize for modern CPUs
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int = 1):
+        super().__init__()
+        self.n_lnn = N_LNN(input_size, hidden_size, num_layers)
+        
+        # Actor network (policy)
+        self.actor = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_size // 2, 3),  # 3 actions: Buy, Sell, Hold
+        )
+        
+        # Critic network (value function)
+        self.critic = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_size // 2, 1)
+        )
+        
+        # Initialize weights
+        self.apply(self._init_weights)
+        
+    def _init_weights(self, module):
+        """Initialize network weights"""
+        if isinstance(module, nn.Linear):
+            nn.init.orthogonal_(module.weight.data, gain=np.sqrt(2))
+            module.bias.data.zero_()
+            
+    def forward(self, state: torch.Tensor, hidden_states: List[torch.Tensor]
+                ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+        """Forward pass returning action probabilities and value estimate"""
+        features, new_hidden = self.n_lnn(state, hidden_states)
+        
+        # Get action probabilities and value estimate
+        action_logits = self.actor(features)
+        value = self.critic(features)
+        
+        # Apply action masking if needed (e.g., prevent buying when already long)
+        # action_mask = self._get_action_mask(state)
+        # action_logits = action_logits.masked_fill(~action_mask, float('-inf'))
+        
+        return F.softmax(action_logits, dim=-1), value, new_hidden
+    
+    def act(self, state: torch.Tensor, hidden_states: List[torch.Tensor]
+            ) -> Tuple[int, float, List[torch.Tensor]]:
+        """Select action based on current policy"""
+        with torch.no_grad():
+            action_probs, value, new_hidden = self(state, hidden_states)
+            action = torch.multinomial(action_probs, 1).item()
+            
+        return action, value.item(), new_hidden
 
-def create_dataloaders(config: LN2Config, train_data: torch.Tensor, val_data: torch.Tensor):
-    """Create optimized dataloaders for training"""
-    train_dataset = torch.utils.data.TensorDataset(
-        train_data[:, :-1], train_data[:, 1:]
-    )
-    val_dataset = torch.utils.data.TensorDataset(
-        val_data[:, :-1], val_data[:, 1:]
+# Example usage:
+if __name__ == "__main__":
+    # Configuration
+    config = TradingConfig()
+    feature_extractor = FeatureExtractor(config)
+    risk_manager = RiskManager(config)
+    
+    # Initialize agent
+    input_size = 10  # Number of features
+    hidden_size = 64
+    num_layers = 2
+    agent = Agent(input_size, hidden_size, num_layers)
+    optimizer = optim.Adam(agent.parameters(), lr=3e-4)
+    
+    # Initialize hidden states
+    hidden_states = [
+        torch.zeros(1, hidden_size) for _ in range(num_layers)
+    ]
+    
+    # Example market data
+    market_data = {
+        'close_price': 50000.0,
+        'volume': 100.0,
+        'bid_ask_spread': 1.0,
+        'funding_rate': 0.0001,
+        'open_interest': 1000.0,
+        'leverage_ratio': 2.0,
+        'market_depth_ratio': 0.5,
+        'taker_buy_ratio': 0.6
+    }
+    
+    # Extract features
+    features = feature_extractor.calculate_features(market_data)
+    state = torch.FloatTensor(features).unsqueeze(0)
+    
+    # Get action
+    action, value, new_hidden = agent.act(state, hidden_states)
+    
+    # Validate action
+    is_valid, message = risk_manager.validate_action(
+        action, market_data['close_price'], account_balance=10000.0
     )
     
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
-        pin_memory=True,
-        num_workers=12,
-        persistent_workers=True
-    )
-    
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset,
-        batch_size=config.batch_size * 2,
-        shuffle=False,
-        pin_memory=True,
-        num_workers=12,
-        persistent_workers=True
-    )
-    
-    return train_loader, val_loader
+    if is_valid:
+        logging.info(f"Taking action {action} with value estimate {value}")
+    else:
+        logging.warning(f"Action rejected: {message}")
