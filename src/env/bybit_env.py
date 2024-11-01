@@ -1,341 +1,142 @@
-import numpy as np
-import pandas as pd
-from datetime import datetime, timedelta
-import pytest
-from typing import Dict, List, Tuple
-import matplotlib.pyplot as plt
-from dataclasses import dataclass
+import asyncio
+import aiowebsocket
+import json
+import hmac
+import hashlib
+import time
+from loguru import logger
+from src.data.features import EnhancedFeatureExtractor
+# ... other imports ...
 
-@dataclass
-class RewardConfig:
-    """Configuration for multi-factor reward calculation"""
-    # PnL Factors
-    pnl_scale: float = 1.0
-    realized_weight: float = 0.7
-    unrealized_weight: float = 0.3
-    
-    # Risk Factors
-    max_drawdown_penalty: float = -2.0
-    overexposure_penalty: float = -1.0
-    volatility_scale: float = 0.2
-    
-    # Trading Factors
-    entry_reward: float = 0.1
-    exit_reward: float = 0.1
-    holding_cost: float = -0.01
-    spread_penalty: float = -0.1
-    
-    # Market Factors
-    trend_alignment: float = 0.2
-    volume_scale: float = 0.1
-    funding_penalty: float = -0.5
+BYBIT_WEBSOCKET_URL = "wss://stream-testnet.bybit.com/v5/public/linear" #Change to mainnet if needed
 
-class EnhancedReward:
-    """Multi-factor reward calculation system"""
-    
-    def __init__(self, config: RewardConfig):
+class BybitFuturesEnv(gym.Env):
+    def __init__(self, config, api_key=None, api_secret=None):
+        # ... other initializations ...
         self.config = config
-        self.price_history = []
-        self.position_history = []
-        self.pnl_history = []
-        self.peak_equity = 0
-        
-    def calculate_reward(self, 
-                        current_state: Dict,
-                        previous_state: Dict,
-                        action: float,
-                        trade_result: Dict) -> Tuple[float, Dict]:
-        """Calculate comprehensive reward based on multiple factors"""
-        
-        # Update histories
-        self.price_history.append(current_state['market_data']['last_price'])
-        self.position_history.append(current_state['account_data']['position_size'])
-        self.pnl_history.append(current_state['account_data']['wallet_balance'])
-        
-        # Calculate individual reward components
-        pnl_reward = self._calculate_pnl_reward(current_state, previous_state)
-        risk_reward = self._calculate_risk_reward(current_state)
-        trading_reward = self._calculate_trading_reward(current_state, action, trade_result)
-        market_reward = self._calculate_market_reward(current_state)
-        
-        # Combine rewards
-        total_reward = (
-            pnl_reward +
-            risk_reward +
-            trading_reward +
-            market_reward
-        )
-        
-        # Update peak equity
-        self.peak_equity = max(self.peak_equity, current_state['account_data']['wallet_balance'])
-        
-        # Return reward and components for logging
-        components = {
-            'pnl_reward': pnl_reward,
-            'risk_reward': risk_reward,
-            'trading_reward': trading_reward,
-            'market_reward': market_reward,
-            'total_reward': total_reward
-        }
-        
-        return total_reward, components
-    
-    def _calculate_pnl_reward(self, current_state: Dict, previous_state: Dict) -> float:
-        """Calculate PnL-based reward component"""
-        realized_pnl = (
-            current_state['account_data']['wallet_balance'] -
-            previous_state['account_data']['wallet_balance']
-        )
-        unrealized_pnl = current_state['account_data']['unrealized_pnl']
-        
-        return self.config.pnl_scale * (
-            self.config.realized_weight * realized_pnl +
-            self.config.unrealized_weight * unrealized_pnl
-        )
-    
-    def _calculate_risk_reward(self, current_state: Dict) -> float:
-        """Calculate risk-based reward component"""
-        # Drawdown penalty
-        current_drawdown = (self.peak_equity - current_state['account_data']['wallet_balance']) / self.peak_equity
-        drawdown_penalty = self.config.max_drawdown_penalty * current_drawdown
-        
-        # Position overexposure penalty
-        position_size = abs(current_state['account_data']['position_size'])
-        max_position = current_state['account_data']['wallet_balance'] * 0.1  # 10% max position
-        overexposure_penalty = self.config.overexposure_penalty * max(0, position_size - max_position)
-        
-        # Volatility adjustment
-        if len(self.price_history) > 20:
-            returns = np.diff(self.price_history[-20:]) / self.price_history[-21:-1]
-            volatility = np.std(returns)
-            volatility_adjustment = -self.config.volatility_scale * volatility
-        else:
-            volatility_adjustment = 0
-            
-        return drawdown_penalty + overexposure_penalty + volatility_adjustment
-    
-    def _calculate_trading_reward(self, current_state: Dict, action: float, trade_result: Dict) -> float:
-        """Calculate trading behavior-based reward component"""
-        # Entry/exit rewards
-        position_change = abs(action) > 0.01
-        if position_change:
-            trading_reward = self.config.entry_reward if abs(action) > 0 else self.config.exit_reward
-        else:
-            trading_reward = 0
-            
-        # Holding cost for existing positions
-        position_size = abs(current_state['account_data']['position_size'])
-        holding_cost = self.config.holding_cost * position_size
-        
-        # Spread penalty
-        spread = (
-            current_state['market_data']['best_ask'] -
-            current_state['market_data']['best_bid']
-        ) / current_state['market_data']['last_price']
-        spread_penalty = self.config.spread_penalty * spread * abs(action)
-        
-        return trading_reward + holding_cost + spread_penalty
-    
-    def _calculate_market_reward(self, current_state: Dict) -> float:
-        """Calculate market condition-based reward component"""
-        # Trend alignment reward
-        if len(self.price_history) > 20:
-            trend = (self.price_history[-1] - self.price_history[-20]) / self.price_history[-20]
-            position = current_state['account_data']['position_size']
-            trend_reward = self.config.trend_alignment * trend * np.sign(position)
-        else:
-            trend_reward = 0
-            
-        # Volume-based reward
-        volume_ratio = current_state['market_data']['24h_volume'] / np.mean(self.price_history)
-        volume_reward = self.config.volume_scale * np.log1p(volume_ratio)
-        
-        # Funding rate penalty
-        funding_rate = current_state['market_data']['funding_rate']
-        position = current_state['account_data']['position_size']
-        funding_penalty = self.config.funding_penalty * funding_rate * position
-        
-        return trend_reward + volume_reward + funding_penalty
+        self.feature_extractor = EnhancedFeatureExtractor(config.feature)
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.websocket = None
+        self.market_data_queue = asyncio.Queue()
+        self.last_ping_time = 0
 
-class TestBybitEnvironment:
-    """Test suite for Bybit trading environment"""
-    
-    @pytest.fixture
-    def env(self):
-        """Create test environment"""
-        return BybitBTCEnvironment(
-            api_key="test_key",
-            api_secret="test_secret",
-            initial_balance=10000,
-            max_position=0.1
-        )
-    
-    @pytest.fixture
-    def reward_calculator(self):
-        """Create reward calculator"""
-        return EnhancedReward(RewardConfig())
-    
-    def test_environment_initialization(self, env):
-        """Test environment initialization"""
-        assert env.symbol == "BTCUSDT"
-        assert env.initial_balance == 10000
-        assert env.current_position == 0
-        assert env.entry_price == 0
-    
-    def test_market_data_fetching(self, env):
-        """Test market data fetching"""
-        market_data = env._get_market_data()
-        required_fields = [
-            'last_price', 'mark_price', 'index_price', '24h_volume',
-            'funding_rate', 'best_bid', 'best_ask'
-        ]
-        for field in required_fields:
-            assert field in market_data
-            assert isinstance(market_data[field], float)
-    
-    def test_account_data_fetching(self, env):
-        """Test account data fetching"""
-        account_data = env._get_account_data()
-        required_fields = [
-            'wallet_balance', 'available_balance', 'position_size',
-            'position_value', 'unrealized_pnl'
-        ]
-        for field in required_fields:
-            assert field in account_data
-            assert isinstance(account_data[field], float)
-    
-    def test_trade_execution(self, env):
-        """Test trade execution"""
-        action = 0.5  # 50% of max position
-        trade_result = env._execute_trade(action)
-        assert 'orderId' in trade_result
-        assert env.current_position > 0
-    
-    def test_environment_reset(self, env):
-        """Test environment reset"""
-        observation, info = env.reset()
-        assert 'market_data' in observation
-        assert 'account_data' in observation
-        assert env.current_position == 0
-        assert env.account_balance == env.initial_balance
-    
-    def test_full_episode(self, env, reward_calculator):
-        """Test full trading episode"""
-        observation, info = env.reset()
-        total_rewards = 0
-        
-        for _ in range(10):  # Run 10 steps
-            action = np.random.uniform(-1, 1)  # Random actions
-            next_observation, reward, done, truncated, info = env.step(action)
-            
-            # Calculate enhanced reward
-            enhanced_reward, components = reward_calculator.calculate_reward(
-                next_observation,
-                observation,
-                action,
-                info['trade_result']
-            )
-            
-            total_rewards += enhanced_reward
-            observation = next_observation
-            
-            if done:
+    async def connect_websocket(self):
+        """Establishes a websocket connection to Bybit, handling authentication if needed."""
+        if self.api_key and self.api_secret:
+            auth_data = self._generate_auth_data()
+            url = f"{BYBIT_WEBSOCKET_URL}?max_active_time=1m" # Customize alive time
+            async with aiowebsocket.connect(url) as ws:
+                self.websocket = ws
+                await self.websocket.send(json.dumps(auth_data))
+                auth_response = await self.websocket.receive()
+                if not self._check_auth_success(json.loads(auth_response)):
+                    logger.error("Authentication failed!")
+                    return
+                await self.subscribe_to_channels()
+                await self._websocket_loop()
+
+        else:
+            async with aiowebsocket.connect(BYBIT_WEBSOCKET_URL) as ws:
+                self.websocket = ws
+                await self.subscribe_to_channels()
+                await self._websocket_loop()
+
+
+    def _generate_auth_data(self):
+      """Generates authentication data for private channels."""
+      expires = int((time.time() + 60) * 1000)  # Expires in 60 seconds
+      message = f"GET/realtime{expires}".encode('utf-8')
+      signature = hmac.new(self.api_secret.encode('utf-8'), message, hashlib.sha256).hexdigest()
+      return {
+          "op": "auth",
+          "args": [self.api_key, expires, signature]
+      }
+
+    def _check_auth_success(self, response):
+        """Checks the authentication response from Bybit."""
+        return response.get('retCode') == 0
+
+    async def subscribe_to_channels(self):
+        """Subscribes to the necessary Bybit websocket channels."""
+        await self.websocket.send(json.dumps({"op": "subscribe", "args": ["instrument_info.100ms.BTCUSDT"]})) #Subscribe to BTCUSDT
+        # Add other subscriptions as needed (e.g., trades, klines)
+
+    async def _websocket_loop(self):
+        """Main loop for receiving and processing websocket messages."""
+        while True:
+            try:
+                message = await self.websocket.receive()
+                await self.process_websocket_message(message)
+                if time.time() - self.last_ping_time > 20:  #Send ping every 20 seconds
+                  self.last_ping_time = time.time()
+                  await self.websocket.send(json.dumps({"op": "ping"}))
+                  pong_response = await asyncio.wait_for(self.websocket.receive(), timeout=5) #wait for pong
+                  if pong_response != '"pong"': #check for successful pong
+                    logger.warning("Ping timeout, attempting reconnect...")
+                    await self.websocket.close()
+                    await self.connect_websocket() #Attempt to reconnect
+                    break
+
+            except asyncio.TimeoutError:
+                logger.warning("Websocket receive timeout")
+                await self.websocket.close()
+                await self.connect_websocket()
                 break
-                
-        assert isinstance(total_rewards, float)
-        env.close()
-    
-    def test_position_limits(self, env):
-        """Test position size limits"""
-        # Try to open position larger than max_position
-        action = 2.0  # Should be clipped to 1.0
-        observation, reward, done, truncated, info = env.step(action)
-        assert abs(env.current_position) <= env.max_position * env.account_balance
-    
-    def test_drawdown_termination(self, env):
-        """Test drawdown-based termination"""
-        # Simulate large loss
-        env.account_balance = env.initial_balance * 0.4  # 60% loss
-        observation, reward, done, truncated, info = env.step(0)
-        assert done == True
 
-def plot_trading_session(env_history: Dict):
-    """Plot trading session results"""
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(15, 10))
-    
-    # Plot price and positions
-    ax1.plot(env_history['prices'], label='Price')
-    ax1.set_title('Price and Positions')
-    ax1.set_ylabel('Price')
-    
-    # Add position markers
-    for i, pos in enumerate(env_history['positions']):
-        if pos > 0:
-            ax1.scatter(i, env_history['prices'][i], color='green', marker='^')
-        elif pos < 0:
-            ax1.scatter(i, env_history['prices'][i], color='red', marker='v')
-    
-    # Plot PnL
-    ax2.plot(env_history['pnl'], label='PnL')
-    ax2.set_title('Profit and Loss')
-    ax2.set_ylabel('USDT')
-    
-    # Plot rewards
-    ax3.plot(env_history['rewards'], label='Reward')
-    ax3.set_title('Rewards')
-    ax3.set_ylabel('Reward')
-    
-    plt.tight_layout()
-    plt.show()
-
-if __name__ == "__main__":
-    # Run basic validation
-    env = BybitBTCEnvironment(
-        api_key="your_testnet_api_key",
-        api_secret="your_testnet_api_secret"
-    )
-    reward_calculator = EnhancedReward(RewardConfig())
-    
-    # Run test trading session
-    observation, info = env.reset()
-    history = {
-        'prices': [],
-        'positions': [],
-        'pnl': [],
-        'rewards': []
-    }
-    
-    try:
-        for _ in range(100):  # Run 100 steps
-            # Simple momentum strategy for testing
-            returns = np.diff(history['prices'][-20:]) if len(history['prices']) >= 20 else [0]
-            action = np.sign(np.mean(returns)) * 0.5  # 50% of max position
-            
-            # Take action
-            next_observation, reward, done, truncated, info = env.step(action)
-            
-            # Calculate enhanced reward
-            enhanced_reward, components = reward_calculator.calculate_reward(
-                next_observation,
-                observation,
-                action,
-                info['trade_result']
-            )
-            
-            # Update history
-            history['prices'].append(next_observation['market_data'][0])  # Last price
-            history['positions'].append(next_observation['account_data'][1])  # Position size
-            history['pnl'].append(next_observation['account_data'][0] - env.initial_balance)  # PnL
-            history['rewards'].append(enhanced_reward)
-            
-            observation = next_observation
-            
-            if done:
-                print("Episode finished due to termination condition")
+            except aiowebsocket.exceptions.WebSocketError as e:
+                logger.error(f"Websocket error: {e}")
+                await asyncio.sleep(5)
+                await self.websocket.close()
+                await self.connect_websocket()
                 break
-                
-    finally:
-        env.close()
-        
-    # Plot results
-    plot_trading_session(history)
+            except Exception as e:
+                logger.exception(f"An unexpected error occurred: {e}")
+                await asyncio.sleep(5)
+                await self.websocket.close()
+                await self.connect_websocket()
+                break
+
+
+
+    async def process_websocket_message(self, message):
+        """Processes a single message received from the Bybit websocket."""
+        try:
+            data = json.loads(message)
+            if data['topic'] == 'instrument_info.100ms.BTCUSDT':
+                await self.market_data_queue.put(self._parse_market_data(data['data']))
+
+        except json.JSONDecodeError:
+            logger.error("Invalid JSON received from websocket")
+        except KeyError as e:
+            logger.error(f"Missing key in websocket message: {e}")
+        except Exception as e:
+            logger.exception(f"Error processing websocket message: {e}")
+
+
+    def _parse_market_data(self, raw_data):
+        """Parses and processes a single market data point from Bybit's websocket.
+
+        Args:
+          raw_data (dict): A dictionary containing raw market data from Bybit's websocket.
+
+        Returns:
+          dict: A dictionary containing processed market data ready for feature extraction. Returns an empty dictionary if parsing fails.
+        """
+        try:
+            processed_data = {
+                'close_price': float(raw_data['last_price']),
+                'volume': float(raw_data['volume']),
+                'bid_ask_spread': float(raw_data['best_ask_price']) - float(raw_data['best_bid_price']),
+                'funding_rate': float(raw_data['funding_rate']),
+                'market_depth_ratio': self._calculate_depth_ratio(raw_data),  # Implement this function
+                'taker_buy_ratio': float(raw_data.get('taker_buy_sell_ratio', 0.5)) # Handle missing data gracefully
+            }
+            return processed_data
+        except (KeyError, ValueError, TypeError) as e:
+            logger.warning(f"Error parsing market data: {e}, Raw Data: {raw_data}")
+            return {}
+
+    # ... rest of your BybitFuturesEnv class ...
+
+    # ... (rest of your code) ...
