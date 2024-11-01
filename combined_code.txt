@@ -1,6 +1,7 @@
 **File Tree (Relevant Files Only)**
   .
     - main.py
+    - setup.py
   src\config
     - config.py
     - __init__.py
@@ -9,593 +10,486 @@
     - processor.py
     - __init__.py
   src\env
+    - bybit_env.py
     - __init__.py
   src\models
+    - agent.py
+    - appo.py
     - nlnn.py
+    - reward.py
     - __init__.py
   src\tests
     - __init__.py
+  src\training
+    - trainer.py
   src\utils
+    - indicators.py
     - logging.py
+    - risk_manager.py
+    - system_monitor.py
     - __init__.py
 // File: main.py
-
-
-// File: src\config\config.py
-import argparse
-import sys
-from pathlib import Path
-from loguru import logger
-import torch
-from typing import Dict, List, Optional, Tuple
-import json
-
-class ProcessorConfig:
-    """Configuration for data processing"""
-    def __init__(
-        self,
-        raw_dir: Path = Path("data/raw"),
-        processed_dir: Path = Path("data/processed"),
-        timeframes: List[str] = ['15m', '1h', '4h', '1d'],
-        sequence_length: int = 128,
-        batch_size: int = 512,
-        train_ratio: float = 0.8,
-        num_threads: int = 12,
-        use_cuda: bool = torch.cuda.is_available()
-    ):
-        self.raw_dir = raw_dir
-        self.processed_dir = processed_dir
-        self.timeframes = timeframes
-        self.sequence_length = sequence_length
-        self.batch_size = batch_size
-        self.train_ratio = train_ratio
-        self.num_threads = num_threads
-        self.use_cuda = use_cuda
-
-def setup_logger():
-    """Configure logging"""
-    logger.remove()  # Remove default handler
-    logger.add(
-        sys.stdout,
-        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
-    )
-    logger.add(
-        "logs/data_processor.log",
-        rotation="500 MB",
-        retention="10 days"
-    )
-
-def process_single_timeframe(processor, timeframe: str, config: ProcessorConfig) -> Dict:
-    """Process a single timeframe and return stats"""
-    try:
-        logger.info(f"Processing timeframe: {timeframe}")
-        
-        start_time = time.time()
-        X_train, y_train, X_val, y_val = processor.process_timeframe_distributed(timeframe)
-        processing_time = time.time() - start_time
-        
-        stats = {
-            'timeframe': timeframe,
-            'train_samples': len(X_train),
-            'val_samples': len(X_val),
-            'feature_dim': X_train.shape[-1],
-            'sequence_length': X_train.shape[1],
-            'processing_time': processing_time,
-            'memory_used': processor.get_memory_stats()
-        }
-        
-        logger.info(f"Processed {timeframe} in {processing_time:.2f}s")
-        logger.info(f"Train samples: {stats['train_samples']}, Val samples: {stats['val_samples']}")
-        
-        return stats
-        
-    except Exception as e:
-        logger.error(f"Error processing {timeframe}: {str(e)}")
-        raise
-
-def process_all_timeframes(processor, config: ProcessorConfig) -> List[Dict]:
-    """Process all timeframes and return stats"""
-    stats = []
-    
-    for timeframe in config.timeframes:
-        try:
-            timeframe_stats = process_single_timeframe(processor, timeframe, config)
-            stats.append(timeframe_stats)
-        except Exception as e:
-            logger.error(f"Skipping {timeframe} due to error: {str(e)}")
-            continue
-            
-    return stats
-
-def save_stats(stats: List[Dict], output_dir: Path):
-    """Save processing statistics"""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_file = output_dir / "processing_stats.json"
-    
-    with open(output_file, 'w') as f:
-        json.dump(stats, f, indent=2)
-    
-    logger.info(f"Saved processing stats to {output_file}")
-
-def create_data_visualizations(stats: List[Dict], output_dir: Path):
-    """Create visualizations of the processed data"""
-    try:
-        import matplotlib.pyplot as plt
-        import seaborn as sns
-        
-        # Set up the plotting style
-        plt.style.use('seaborn')
-        
-        # Processing time comparison
-        plt.figure(figsize=(10, 6))
-        times = [stat['processing_time'] for stat in stats]
-        timeframes = [stat['timeframe'] for stat in stats]
-        plt.bar(timeframes, times)
-        plt.title('Processing Time by Timeframe')
-        plt.xlabel('Timeframe')
-        plt.ylabel('Time (seconds)')
-        plt.savefig(output_dir / 'processing_times.png')
-        plt.close()
-        
-        # Sample distribution
-        plt.figure(figsize=(10, 6))
-        train_samples = [stat['train_samples'] for stat in stats]
-        val_samples = [stat['val_samples'] for stat in stats]
-        x = np.arange(len(timeframes))
-        width = 0.35
-        
-        plt.bar(x - width/2, train_samples, width, label='Train')
-        plt.bar(x + width/2, val_samples, width, label='Validation')
-        plt.xticks(x, timeframes)
-        plt.title('Sample Distribution by Timeframe')
-        plt.xlabel('Timeframe')
-        plt.ylabel('Number of Samples')
-        plt.legend()
-        plt.savefig(output_dir / 'sample_distribution.png')
-        plt.close()
-        
-        logger.info(f"Saved visualizations to {output_dir}")
-        
-    except Exception as e:
-        logger.warning(f"Could not create visualizations: {str(e)}")
+import logging
+from src.config import TradingConfig
+from src.models.agent import Agent
+from src.data.features import FeatureExtractor
+from src.env.bybit_env import BybitFuturesEnv
+from src.utils.risk_manager import RiskManager
 
 def main():
-    """Main entry point"""
-    parser = argparse.ArgumentParser(description='Process cryptocurrency data across multiple timeframes')
-    parser.add_argument('--raw-dir', type=str, default='data/raw', help='Directory containing raw data files')
-    parser.add_argument('--processed-dir', type=str, default='data/processed', help='Directory for processed data')
-    parser.add_argument('--timeframes', type=str, nargs='+', default=['15m', '1h', '4h', '1d'], help='Timeframes to process')
-    parser.add_argument('--sequence-length', type=int, default=128, help='Sequence length for time series')
-    parser.add_argument('--batch-size', type=int, default=512, help='Batch size for data loading')
-    parser.add_argument('--train-ratio', type=float, default=0.8, help='Train/validation split ratio')
-    parser.add_argument('--num-threads', type=int, default=12, help='Number of processing threads')
-    parser.add_argument('--output-dir', type=str, default='outputs', help='Directory for outputs and visualizations')
-    parser.add_argument('--debug', action='store_true', help='Enable debug mode')
+    # Initialize logging
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
     
-    args = parser.parse_args()
+    # Load configuration
+    config = TradingConfig()
     
-    # Setup logging
-    setup_logger()
-    if args.debug:
-        logger.level("DEBUG")
+    # Initialize components
+    feature_extractor = FeatureExtractor(config)
+    risk_manager = RiskManager(config)
+    env = BybitFuturesEnv(config)
     
-    # Create configuration
-    config = ProcessorConfig(
-        raw_dir=Path(args.raw_dir),
-        processed_dir=Path(args.processed_dir),
-        timeframes=args.timeframes,
-        sequence_length=args.sequence_length,
-        batch_size=args.batch_size,
-        train_ratio=args.train_ratio,
-        num_threads=args.num_threads
+    # Initialize agent
+    agent = Agent(
+        input_size=config.feature_dim,
+        hidden_size=config.hidden_size,
+        num_layers=config.num_layers
     )
     
-    # Initialize processor
-    try:
-        logger.info("Initializing data processor...")
-        from enhanced_processor import EnhancedDataProcessor  # Import your processor class
-        processor = EnhancedDataProcessor(config)
+    logger.info("Starting training...")
+    
+    # Training loop
+    for episode in range(config.num_episodes):
+        state, info = env.reset()
+        hidden_states = agent.init_hidden()
+        episode_reward = 0
         
-        # Process timeframes
-        logger.info("Starting data processing...")
-        stats = process_all_timeframes(processor, config)
-        
-        # Save results
-        output_dir = Path(args.output_dir)
-        save_stats(stats, output_dir)
-        create_data_visualizations(stats, output_dir)
-        
-        logger.info("Data processing completed successfully")
-        
-    except Exception as e:
-        logger.error(f"Error during processing: {str(e)}")
-        if args.debug:
-            import traceback
-            logger.debug(traceback.format_exc())
-        sys.exit(1)
-    finally:
-        if 'processor' in locals():
-            processor.cleanup()
+        while True:
+            # Get action from agent
+            action, value, hidden_states = agent.act(state, hidden_states)
+            
+            # Validate action with risk manager
+            is_valid, message = risk_manager.validate_action(
+                action, env.current_price, env.account_balance
+            )
+            
+            if not is_valid:
+                logger.warning(f"Action rejected: {message}")
+                action = 2  # Default to HOLD
+            
+            # Take action in environment
+            next_state, reward, done, truncated, info = env.step(action)
+            episode_reward += reward
+            
+            if done or truncated:
+                break
+            
+            state = next_state
+            
+        logger.info(f"Episode {episode} completed with reward {episode_reward}")
 
 if __name__ == "__main__":
     main()
+
+// File: setup.py
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+def setup_environment():
+    """Setup the development environment with optimized configurations."""
+    # Create virtual environment
+    subprocess.run([sys.executable, "-m", "venv", ".venv"], check=True)
+    
+    # Get the path to the virtual environment's Python interpreter
+    if os.name == "nt":  # Windows
+        python_path = Path(".venv/Scripts/python.exe")
+        pip_path = Path(".venv/Scripts/pip.exe")
+    else:  # Unix-like
+        python_path = Path(".venv/bin/python")
+        pip_path = Path(".venv/bin/pip")
+    
+    # Upgrade pip
+    subprocess.run([str(pip_path), "install", "--upgrade", "pip"], check=True)
+    
+    # Install PyTorch with CUDA 11.8 support (optimized for NVIDIA 3070)
+    subprocess.run([
+        str(pip_path),
+        "install",
+        "torch",
+        "torchvision",
+        "torchaudio",
+        "--index-url",
+        "https://download.pytorch.org/whl/cu118"
+    ], check=True)
+    
+    # Install other requirements
+    subprocess.run([
+        str(pip_path),
+        "install",
+        "-r",
+        "requirements.txt"
+    ], check=True)
+    
+    # Create necessary directories
+    directories = [
+        "logs",
+        "data",
+        "models",
+        "configs",
+        "tests"
+    ]
+    for directory in directories:
+        Path(directory).mkdir(exist_ok=True)
+    
+    print("Environment setup completed successfully!")
+    print("\nActivate your virtual environment:")
+    if os.name == "nt":
+        print(".venv\\Scripts\\activate")
+    else:
+        print("source .venv/bin/activate")
+
+if __name__ == "__main__":
+    setup_environment()
+
+// File: src\config\config.py
+from dataclasses import dataclass
+from typing import List, Optional
+from pydantic import BaseModel, Field
+import torch
+import psutil
+
+class HardwareConfig(BaseModel):
+    """Hardware-specific configuration"""
+    num_cpu_threads: int = Field(
+        default_factory=lambda: psutil.cpu_count(logical=True),
+        description="Number of CPU threads to use"
+    )
+    cuda_available: bool = Field(
+        default_factory=lambda: torch.cuda.is_available(),
+        description="Whether CUDA is available"
+    )
+    gpu_memory_limit: int = Field(
+        default=7168,  # 7GB for NVIDIA 3070, leaving 1GB for system
+        description="GPU memory limit in MB"
+    )
+    torch_num_threads: int = Field(
+        default=12,  # Optimized for Ryzen 9 7900X
+        description="Number of threads for PyTorch"
+    )
+    pin_memory: bool = Field(
+        default=True,
+        description="Use pinned memory for faster GPU transfer"
+    )
+
+class ModelConfig(BaseModel):
+    """Neural network configuration"""
+    feature_dim: int = Field(64, description="Input feature dimension")
+    hidden_size: int = Field(256, description="Hidden layer size")
+    num_layers: int = Field(4, description="Number of n-LNN layers")
+    dropout: float = Field(0.1, description="Dropout rate")
+    learning_rate: float = Field(3e-4, description="Learning rate")
+    batch_size: int = Field(512, description="Training batch size")
+    sequence_length: int = Field(100, description="Sequence length for training")
+    gradient_clip: float = Field(1.0, description="Gradient clipping value")
+
+class RiskConfig(BaseModel):
+    """Risk management configuration"""
+    max_position_size: float = Field(0.1, description="Maximum position size as fraction of capital")
+    stop_loss_pct: float = Field(0.02, description="Stop loss percentage")
+    take_profit_pct: float = Field(0.04, description="Take profit percentage")
+    max_leverage: float = Field(5.0, description="Maximum allowed leverage")
+    min_trade_interval: int = Field(5, description="Minimum intervals between trades")
+    max_drawdown: float = Field(0.2, description="Maximum allowed drawdown")
+    position_sizing_method: str = Field("kelly", description="Position sizing method")
+
+class FeatureConfig(BaseModel):
+    """Feature extraction configuration"""
+    rolling_window_size: int = Field(100, description="Size of rolling window for features")
+    technical_indicators: List[str] = Field(
+        default=["rsi", "macd", "bbands", "volatility"],
+        description="List of technical indicators to use"
+    )
+    market_features: List[str] = Field(
+        default=[
+            "price",
+            "volume",
+            "spread",
+            "depth",
+            "funding_rate"
+        ],
+        description="List of market features to use"
+    )
+    normalization_method: str = Field(
+        "standard",
+        description="Feature normalization method"
+    )
+
+class TrainingConfig(BaseModel):
+    """Training configuration"""
+    num_episodes: int = Field(10000, description="Number of training episodes")
+    gamma: float = Field(0.99, description="Discount factor")
+    gae_lambda: float = Field(0.95, description="GAE lambda parameter")
+    entropy_coef: float = Field(0.01, description="Entropy coefficient")
+    value_loss_coef: float = Field(0.5, description="Value loss coefficient")
+    max_grad_norm: float = Field(0.5, description="Maximum gradient norm")
+    update_interval: int = Field(2048, description="Steps between policy updates")
+    num_minibatches: int = Field(4, description="Number of minibatches per update")
+    warmup_steps: int = Field(1000, description="Number of warmup steps")
+
+class TradingConfig(BaseModel):
+    """Master configuration class"""
+    hardware: HardwareConfig = Field(default_factory=HardwareConfig)
+    model: ModelConfig = Field(default_factory=ModelConfig)
+    risk: RiskConfig = Field(default_factory=RiskConfig)
+    feature: FeatureConfig = Field(default_factory=FeatureConfig)
+    training: TrainingConfig = Field(default_factory=TrainingConfig)
+    
+    def optimize_for_hardware(self):
+        """Optimize configuration for current hardware"""
+        # Optimize batch size based on GPU memory
+        if self.hardware.cuda_available:
+            gpu_mem = torch.cuda.get_device_properties(0).total_memory
+            self.model.batch_size = min(
+                self.model.batch_size,
+                int(gpu_mem * 0.7 / (self.model.feature_dim * 4))  # 4 bytes per float
+            )
+        
+        # Optimize number of threads
+        torch.set_num_threads(self.hardware.torch_num_threads)
+        
+        # Enable TF32 for faster training on Ampere GPUs
+        if self.hardware.cuda_available:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        
+        return self
+
+def create_default_config() -> TradingConfig:
+    """Create and return a default configuration"""
+    config = TradingConfig()
+    return config.optimize_for_hardware()
 
 // File: src\config\__init__.py
 
 
 // File: src\data\features.py
+import torch
 import numpy as np
-import pandas as pd
-from typing import Dict, List, Optional
-import ta
+from typing import Dict, List, Optional, Tuple
+from collections import deque
 from dataclasses import dataclass
-from numba import jit
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from joblib import Parallel, delayed
+import talib
+from loguru import logger
 
 @dataclass
 class FeatureConfig:
-    """Configuration for feature calculation"""
-    window_sizes: List[int] = (5, 10, 20, 50, 100)
+    rolling_window_size: int = 100
     rsi_period: int = 14
-    bb_period: int = 20
-    epsilon: float = 1e-8
-    use_ta_lib: bool = True
+    volatility_window: int = 20
+    num_threads: int = 24  # Optimized for Ryzen 9 7900X
+    use_cuda: bool = True
+    batch_size: int = 512
+    feature_dim: int = 10
 
-@jit(nopython=True)
-def calculate_returns(prices: np.ndarray, epsilon: float = 1e-8) -> np.ndarray:
-    """Calculate log returns with Numba acceleration"""
-    return np.log(np.maximum(prices[1:] / prices[:-1], epsilon))
-
-class FeatureCalculator:
-    """Unified feature calculator for price data"""
+class EnhancedFeatureExtractor:
+    """Hardware-optimized feature extractor for high-frequency trading"""
     
     def __init__(self, config: FeatureConfig):
         self.config = config
-    
-    def calculate_price_features(self, df: pd.DataFrame) -> Dict[str, np.ndarray]:
-        """Calculate basic price-based features"""
-        features = {}
+        self.device = torch.device("cuda" if torch.cuda.is_available() and config.use_cuda else "cpu")
         
-        # Returns and volatility
-        closes = df['Close'].values
-        features['log_returns'] = np.pad(calculate_returns(closes), (1, 0))
-        features['volatility'] = pd.Series(features['log_returns']).rolling(20).std().fillna(0).values
+        # Initialize circular buffers on GPU if available
+        self.price_history = torch.zeros(config.rolling_window_size, device=self.device)
+        self.volume_history = torch.zeros(config.rolling_window_size, device=self.device)
+        self.current_idx = 0
         
-        # Price ratios
-        features['high_low_ratio'] = (df['High'] / df['Low']).values
-        features['close_open_ratio'] = (df['Close'] / df['Open']).values
+        # Initialize thread pool for CPU calculations
+        self.thread_pool = ThreadPoolExecutor(max_workers=config.num_threads)
         
-        # Price position
-        range_denominator = (df['High'] - df['Low']).values + self.config.epsilon
-        features['price_position'] = ((df['Close'] - df['Low']) / range_denominator).values
+        # Pre-allocate buffers for technical indicators
+        self.rsi_buffer = torch.zeros(config.rolling_window_size, device=self.device)
+        self.volatility_buffer = torch.zeros(config.rolling_window_size, device=self.device)
         
-        return features
-    
-    def calculate_volume_features(self, df: pd.DataFrame) -> Dict[str, np.ndarray]:
-        """Calculate volume-based features"""
-        features = {}
-        
-        # Volume momentum
-        volumes = df['Volume'].values
-        features['volume_momentum'] = np.pad(np.diff(volumes), (1, 0))
-        
-        # Volume intensity
-        price_range = (df['High'] - df['Low']).values
-        features['volume_intensity'] = volumes * price_range
-        
-        # Volume moving averages
-        volume_series = pd.Series(volumes)
-        for window in self.config.window_sizes:
-            features[f'volume_ma_{window}'] = volume_series.rolling(window).mean().fillna(0).values
-            features[f'volume_std_{window}'] = volume_series.rolling(window).std().fillna(0).values
-        
-        return features
-    
-    def calculate_technical_features(self, df: pd.DataFrame) -> Dict[str, np.ndarray]:
-        """Calculate technical indicators"""
-        features = {}
-        
-        if self.config.use_ta_lib:
-            # Momentum indicators
-            features['rsi'] = ta.momentum.rsi(df['Close'], window=self.config.rsi_period).fillna(0).values
+        # CUDA streams for parallel computation
+        self.streams = None
+        if self.device.type == 'cuda':
+            self.streams = [torch.cuda.Stream() for _ in range(3)]
             
-            # Trend indicators
-            for window in self.config.window_sizes:
-                features[f'sma_{window}'] = ta.trend.sma_indicator(df['Close'], window=window).fillna(0).values
-                features[f'ema_{window}'] = ta.trend.ema_indicator(df['Close'], window=window).fillna(0).values
+    def update_history(self, price: float, volume: float):
+        """Update price and volume history with new data"""
+        self.price_history[self.current_idx] = price
+        self.volume_history[self.current_idx] = volume
+        self.current_idx = (self.current_idx + 1) % self.config.rolling_window_size
+
+    @torch.compile
+    def calculate_features_gpu(self, market_data: Dict[str, float]) -> torch.Tensor:
+        """Calculate features using GPU acceleration"""
+        with torch.cuda.amp.autocast():
+            # Update histories
+            self.update_history(market_data['close_price'], market_data['volume'])
             
-            # Volatility indicators
-            bb_high = ta.volatility.bollinger_hband(df['Close'], window=self.config.bb_period)
-            bb_low = ta.volatility.bollinger_lband(df['Close'], window=self.config.bb_period)
-            features['bb_width'] = ((bb_high - bb_low) / df['Close']).fillna(0).values
+            # Calculate basic features in parallel streams
+            if self.streams:
+                # Stream 1: Price-based features
+                with torch.cuda.stream(self.streams[0]):
+                    price_features = self._calculate_price_features(market_data)
+                
+                # Stream 2: Volume-based features
+                with torch.cuda.stream(self.streams[1]):
+                    volume_features = self._calculate_volume_features(market_data)
+                
+                # Stream 3: Technical indicators
+                with torch.cuda.stream(self.streams[2]):
+                    technical_features = self._calculate_technical_features()
+                
+                # Synchronize streams
+                torch.cuda.synchronize()
+                
+                # Combine features
+                features = torch.cat([price_features, volume_features, technical_features])
+            else:
+                features = self._calculate_features_sequential(market_data)
             
-            features['atr'] = ta.volatility.average_true_range(
-                df['High'], df['Low'], df['Close']
-            ).fillna(0).values
+            return torch.clamp(features, -1, 1)
+
+    @torch.compile
+    def _calculate_price_features(self, market_data: Dict[str, float]) -> torch.Tensor:
+        """Calculate price-related features"""
+        normalized_price = self._normalize_tensor(
+            torch.tensor([market_data['close_price']], device=self.device),
+            self.price_history
+        )
+        spread_feature = torch.tensor(
+            [market_data['bid_ask_spread'] / market_data['close_price']],
+            device=self.device
+        )
+        funding_feature = torch.tensor(
+            [market_data['funding_rate']],
+            device=self.device
+        )
+        return torch.cat([normalized_price, spread_feature, funding_feature])
+
+    @torch.compile
+    def _calculate_volume_features(self, market_data: Dict[str, float]) -> torch.Tensor:
+        """Calculate volume-related features"""
+        normalized_volume = self._normalize_tensor(
+            torch.tensor([market_data['volume']], device=self.device),
+            self.volume_history
+        )
+        depth_feature = torch.tensor(
+            [market_data['market_depth_ratio']],
+            device=self.device
+        )
+        taker_feature = torch.tensor(
+            [market_data['taker_buy_ratio']],
+            device=self.device
+        )
+        return torch.cat([normalized_volume, depth_feature, taker_feature])
+
+    @torch.compile
+    def _calculate_technical_features(self) -> torch.Tensor:
+        """Calculate technical indicators using GPU"""
+        # Calculate RSI
+        delta = self.price_history.diff()
+        gains = torch.where(delta > 0, delta, torch.zeros_like(delta))
+        losses = torch.where(delta < 0, -delta, torch.zeros_like(delta))
         
-        return features
-    
-    def calculate_all_features(self, df: pd.DataFrame) -> Dict[str, np.ndarray]:
-        """Calculate all features"""
-        features = {}
+        avg_gains = gains.rolling(window=self.config.rsi_period).mean()
+        avg_losses = losses.rolling(window=self.config.rsi_period).mean()
         
-        # Calculate each feature group
-        features.update(self.calculate_price_features(df))
-        features.update(self.calculate_volume_features(df))
-        features.update(self.calculate_technical_features(df))
+        rs = avg_gains / (avg_losses + 1e-8)
+        rsi = 100 - (100 / (1 + rs))
         
-        # Ensure all features are numpy arrays
-        for key, value in features.items():
-            if isinstance(value, pd.Series):
-                features[key] = value.values
+        # Calculate volatility
+        returns = self.price_history.diff() / self.price_history[:-1]
+        volatility = returns.std()
         
-        return features
-    
-    def get_feature_names(self) -> List[str]:
-        """Get list of all feature names"""
-        # Create a small sample dataframe to get feature names
-        sample_df = pd.DataFrame({
-            'Open': [1] * 10,
-            'High': [1] * 10,
-            'Low': [1] * 10,
-            'Close': [1] * 10,
-            'Volume': [1] * 10
-        })
+        # Combine technical features
+        technical_features = torch.stack([
+            rsi[-1] / 100.0,  # Normalize RSI to [0, 1]
+            volatility,
+            returns[-1]  # Most recent return
+        ])
         
-        return list(self.calculate_all_features(sample_df).keys())
+        return technical_features
+
+    @torch.compile
+    def _normalize_tensor(self, value: torch.Tensor, history: torch.Tensor) -> torch.Tensor:
+        """Normalize values using tensor operations"""
+        min_val = history.min()
+        max_val = history.max()
+        range_val = max_val - min_val
+        
+        # Handle edge case where range is 0
+        mask = range_val > 0
+        normalized = torch.where(
+            mask,
+            (value - min_val) / (range_val + 1e-8) * 2 - 1,
+            torch.zeros_like(value)
+        )
+        return normalized
+
+    def calculate_features(self, market_data: Dict[str, float]) -> np.ndarray:
+        """Main feature calculation method with hardware optimization"""
+        if self.device.type == 'cuda':
+            features = self.calculate_features_gpu(market_data)
+            return features.cpu().numpy()
+        else:
+            # Fallback to CPU implementation with parallel processing
+            return self._calculate_features_cpu(market_data)
+
+    def _calculate_features_cpu(self, market_data: Dict[str, float]) -> np.ndarray:
+        """CPU-based feature calculation with parallel processing"""
+        with Parallel(n_jobs=self.config.num_threads) as parallel:
+            # Split calculations across threads
+            features = parallel(
+                delayed(self._calculate_feature_group)(market_data, group_id)
+                for group_id in range(3)
+            )
+        
+        return np.concatenate(features)
+
+    def _calculate_feature_group(self, market_data: Dict[str, float], group_id: int) -> np.ndarray:
+        """Calculate a group of features in parallel"""
+        if group_id == 0:
+            # Price-based features
+            return self._calculate_price_features_cpu(market_data)
+        elif group_id == 1:
+            # Volume-based features
+            return self._calculate_volume_features_cpu(market_data)
+        else:
+            # Technical indicators
+            return self._calculate_technical_features_cpu()
 
 // File: src\data\processor.py
-import modin.pandas as mpd
-import cupy as cp
-import dask.array as da
+from typing import Dict, List
+import pandas as pd
 import numpy as np
-import torch
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-from sklearn.preprocessing import RobustScaler
-import ray
-from loguru import logger
-from numba import jit, cuda
-import psutil
-from functools import partial
-from concurrent.futures import ThreadPoolExecutor
 
-@ray.remote
-class DistributedFeatureCalculator:
-    """Distributed feature calculation using Ray"""
+class DataProcessor:
     def __init__(self, config):
         self.config = config
         
-    def calculate_features(self, chunk):
-        return self.calculate_all_features(chunk)
-
-class EnhancedDataProcessor:
-    """Enhanced data processor with distributed computing and GPU acceleration"""
-    
-    def __init__(self, config):
-        self.config = config
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
-        # Initialize Ray for distributed processing
-        if not ray.is_initialized():
-            ray.init(num_cpus=psutil.cpu_count())
-        
-        # Configure logging
-        logger.add(
-            f"logs/data_processor_{self.config.timeframes[0]}.log",
-            rotation="500 MB"
-        )
-        
-        # Initialize caches and buffers
-        self._data_cache = {}
-        self._feature_cache = {}
-        self._scaler_cache = {}
-        
-        # Initialize GPU memory pool if available
-        if torch.cuda.is_available():
-            self.gpu_memory_pool = cp.cuda.MemoryPool()
-            cp.cuda.set_allocator(self.gpu_memory_pool.malloc)
-    
-    def _load_timeframe_optimized(self, timeframe: str) -> mpd.DataFrame:
-        """Load timeframe data using Modin for parallel processing"""
-        if timeframe not in self._data_cache:
-            file_path = self.config.raw_dir / f"btc_{timeframe}_data_2018_to_2024-2024-10-10.csv"
-            
-            # Define dtypes for efficient memory usage
-            dtypes = {
-                'Open': np.float32,
-                'High': np.float32,
-                'Low': np.float32,
-                'Close': np.float32,
-                'Volume': np.float32,
-                'Quote asset volume': np.float32,
-                'Number of trades': np.int32,
-                'Taker buy base asset volume': np.float32,
-                'Taker buy quote asset volume': np.float32
-            }
-            
-            # Use Modin's parallel read_csv
-            df = mpd.read_csv(
-                file_path,
-                parse_dates=['Open time'],
-                dtype=dtypes,
-                engine='pyarrow'  # Use PyArrow engine for better performance
-            )
-            
-            df.set_index('Open time', inplace=True)
-            self._data_cache[timeframe] = df.sort_index()
-            
-            logger.info(f"Loaded {timeframe} data: {len(df)} rows")
-            
-        return self._data_cache[timeframe]
-    
-    @staticmethod
-    @jit(nopython=True, parallel=True)
-    def _prepare_sequences_numba(feature_array: np.ndarray, sequence_length: int) -> Tuple[np.ndarray, np.ndarray]:
-        """Prepare sequences using Numba acceleration"""
-        n_sequences = len(feature_array) - sequence_length
-        X = np.empty((n_sequences, sequence_length, feature_array.shape[1]), dtype=np.float32)
-        y = np.empty(n_sequences, dtype=np.float32)
-        
-        for i in range(n_sequences):
-            X[i] = feature_array[i:i + sequence_length]
-            y[i] = feature_array[i + sequence_length, 0]
-            
-        return X, y
-    
-    def _normalize_features_gpu(
-        self,
-        features: Dict[str, np.ndarray],
-        scaler: Optional[RobustScaler] = None,
-        fit: bool = True
-    ) -> Tuple[Dict[str, np.ndarray], RobustScaler]:
-        """Normalize features using GPU acceleration"""
-        # Convert features to CuPy array
-        feature_array = cp.array(np.column_stack(list(features.values())), dtype=cp.float32)
-        
-        if scaler is None and fit:
-            scaler = RobustScaler()
-            normalized = cp.array(scaler.fit_transform(feature_array.get()))
-        else:
-            normalized = cp.array(scaler.transform(feature_array.get()))
-        
-        # Convert back to dictionary
-        normalized_features = {}
-        for i, key in enumerate(features.keys()):
-            normalized_features[key] = normalized[:, i].get()
-            
-        return normalized_features, scaler
-    
-    def process_timeframe_distributed(
-        self,
-        timeframe: str,
-        save: bool = True
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Process timeframe data using distributed computing"""
-        logger.info(f"Processing {timeframe} timeframe...")
-        
-        # Load data using Modin
-        df = self._load_timeframe_optimized(timeframe)
-        
-        # Distribute feature calculation using Ray
-        num_partitions = psutil.cpu_count()
-        df_splits = np.array_split(df, num_partitions)
-        
-        # Create remote feature calculators
-        calculators = [DistributedFeatureCalculator.remote(self.config) for _ in range(num_partitions)]
-        
-        # Calculate features in parallel
-        feature_futures = [calculator.calculate_features.remote(split) for calculator, split in zip(calculators, df_splits)]
-        feature_results = ray.get(feature_futures)
-        
-        # Merge feature results
-        features = {}
-        for key in feature_results[0].keys():
-            features[key] = np.concatenate([result[key] for result in feature_results])
-        
-        # Normalize features using GPU
-        if timeframe not in self._scaler_cache:
-            features, scaler = self._normalize_features_gpu(features, fit=True)
-            self._scaler_cache[timeframe] = scaler
-        else:
-            features, _ = self._normalize_features_gpu(features, self._scaler_cache[timeframe], fit=False)
-        
-        # Prepare sequences using Numba
-        X, y = self._prepare_sequences_numba(
-            np.column_stack(list(features.values())),
-            self.config.sequence_length
-        )
-        
-        # Convert to torch tensors with optimal memory format
-        X = torch.from_numpy(X).to(
-            device=self.device,
-            memory_format=torch.channels_last
-        )
-        y = torch.from_numpy(y).to(self.device)
-        
-        # Split into train and validation
-        split_idx = int(len(X) * self.config.train_ratio)
-        X_train, X_val = X[:split_idx], X[split_idx:]
-        y_train, y_val = y[:split_idx], y[split_idx:]
-        
-        if save:
-            self._save_processed_data(timeframe, (X_train, y_train, X_val, y_val))
-        
-        return X_train, y_train, X_val, y_val
-    
-    def create_optimized_dataloaders(
-        self,
-        X_train: torch.Tensor,
-        y_train: torch.Tensor,
-        X_val: torch.Tensor,
-        y_val: torch.Tensor
-    ) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
-        """Create optimized dataloaders with prefetching and pinned memory"""
-        
-        class OptimizedDataset(torch.utils.data.Dataset):
-            def __init__(self, X, y):
-                self.X = X
-                self.y = y
-                
-            def __len__(self):
-                return len(self.X)
-                
-            def __getitem__(self, idx):
-                return self.X[idx], self.y[idx]
-        
-        # Calculate optimal batch size based on available memory
-        gpu_mem = torch.cuda.get_device_properties(0).total_memory if torch.cuda.is_available() else 0
-        system_mem = psutil.virtual_memory().total
-        
-        optimal_batch_size = min(
-            self.config.batch_size,
-            int(min(gpu_mem, system_mem) * 0.1 / (X_train[0].numel() * X_train[0].element_size()))
-        )
-        
-        logger.info(f"Using optimal batch size: {optimal_batch_size}")
-        
-        train_dataset = OptimizedDataset(X_train, y_train)
-        val_dataset = OptimizedDataset(X_val, y_val)
-        
-        train_loader = torch.utils.data.DataLoader(
-            train_dataset,
-            batch_size=optimal_batch_size,
-            shuffle=True,
-            num_workers=psutil.cpu_count() // 2,
-            pin_memory=True,
-            persistent_workers=True,
-            prefetch_factor=2,
-            generator=torch.Generator(device=self.device)
-        )
-        
-        val_loader = torch.utils.data.DataLoader(
-            val_dataset,
-            batch_size=optimal_batch_size * 2,
-            shuffle=False,
-            num_workers=psutil.cpu_count() // 4,
-            pin_memory=True,
-            persistent_workers=True,
-            prefetch_factor=2
-        )
-        
-        return train_loader, val_loader
-    
-    def cleanup(self):
-        """Clean up resources"""
-        # Clear caches
-        self._data_cache.clear()
-        self._feature_cache.clear()
-        self._scaler_cache.clear()
-        
-        # Clean up GPU memory
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            self.gpu_memory_pool.free_all_blocks()
-        
-        # Shutdown Ray
-        if ray.is_initialized():
-            ray.shutdown()
-            
-        logger.info("Cleaned up all resources")
+    def preprocess_market_data(self, raw_data: Dict) -> Dict:
+        """Process raw market data into standardized format"""
+        processed_data = {
+            'close_price': float(raw_data['last_price']),
+            'volume': float(raw_data['volume_24h']),
+            'bid_ask_spread': float(raw_data['best_ask']) - float(raw_data['best_bid']),
+            'funding_rate': float(raw_data['funding_rate']),
+            'open_interest': float(raw_data['open_interest']),
+            'leverage_ratio': float(raw_data['leverage_ratio']),
+            'market_depth_ratio': self._calculate_depth_ratio(raw_data),
+            'taker_buy_ratio': float(raw_data['taker_buy_volume']) / 
+                              (float(raw_data['taker_buy_volume']) + 
+                               float(raw_data['taker_sell_volume']))
+        }
+        return processed_data
 
 // File: src\data\__init__.py
 from .processor import DataProcessor
@@ -603,242 +497,1253 @@ from .features import FeatureCalculator
 
 __all__ = ['DataProcessor', 'FeatureCalculator']
 
+// File: src\env\bybit_env.py
+import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
+import pytest
+from typing import Dict, List, Tuple
+import matplotlib.pyplot as plt
+from dataclasses import dataclass
+
+@dataclass
+class RewardConfig:
+    """Configuration for multi-factor reward calculation"""
+    # PnL Factors
+    pnl_scale: float = 1.0
+    realized_weight: float = 0.7
+    unrealized_weight: float = 0.3
+    
+    # Risk Factors
+    max_drawdown_penalty: float = -2.0
+    overexposure_penalty: float = -1.0
+    volatility_scale: float = 0.2
+    
+    # Trading Factors
+    entry_reward: float = 0.1
+    exit_reward: float = 0.1
+    holding_cost: float = -0.01
+    spread_penalty: float = -0.1
+    
+    # Market Factors
+    trend_alignment: float = 0.2
+    volume_scale: float = 0.1
+    funding_penalty: float = -0.5
+
+class EnhancedReward:
+    """Multi-factor reward calculation system"""
+    
+    def __init__(self, config: RewardConfig):
+        self.config = config
+        self.price_history = []
+        self.position_history = []
+        self.pnl_history = []
+        self.peak_equity = 0
+        
+    def calculate_reward(self, 
+                        current_state: Dict,
+                        previous_state: Dict,
+                        action: float,
+                        trade_result: Dict) -> Tuple[float, Dict]:
+        """Calculate comprehensive reward based on multiple factors"""
+        
+        # Update histories
+        self.price_history.append(current_state['market_data']['last_price'])
+        self.position_history.append(current_state['account_data']['position_size'])
+        self.pnl_history.append(current_state['account_data']['wallet_balance'])
+        
+        # Calculate individual reward components
+        pnl_reward = self._calculate_pnl_reward(current_state, previous_state)
+        risk_reward = self._calculate_risk_reward(current_state)
+        trading_reward = self._calculate_trading_reward(current_state, action, trade_result)
+        market_reward = self._calculate_market_reward(current_state)
+        
+        # Combine rewards
+        total_reward = (
+            pnl_reward +
+            risk_reward +
+            trading_reward +
+            market_reward
+        )
+        
+        # Update peak equity
+        self.peak_equity = max(self.peak_equity, current_state['account_data']['wallet_balance'])
+        
+        # Return reward and components for logging
+        components = {
+            'pnl_reward': pnl_reward,
+            'risk_reward': risk_reward,
+            'trading_reward': trading_reward,
+            'market_reward': market_reward,
+            'total_reward': total_reward
+        }
+        
+        return total_reward, components
+    
+    def _calculate_pnl_reward(self, current_state: Dict, previous_state: Dict) -> float:
+        """Calculate PnL-based reward component"""
+        realized_pnl = (
+            current_state['account_data']['wallet_balance'] -
+            previous_state['account_data']['wallet_balance']
+        )
+        unrealized_pnl = current_state['account_data']['unrealized_pnl']
+        
+        return self.config.pnl_scale * (
+            self.config.realized_weight * realized_pnl +
+            self.config.unrealized_weight * unrealized_pnl
+        )
+    
+    def _calculate_risk_reward(self, current_state: Dict) -> float:
+        """Calculate risk-based reward component"""
+        # Drawdown penalty
+        current_drawdown = (self.peak_equity - current_state['account_data']['wallet_balance']) / self.peak_equity
+        drawdown_penalty = self.config.max_drawdown_penalty * current_drawdown
+        
+        # Position overexposure penalty
+        position_size = abs(current_state['account_data']['position_size'])
+        max_position = current_state['account_data']['wallet_balance'] * 0.1  # 10% max position
+        overexposure_penalty = self.config.overexposure_penalty * max(0, position_size - max_position)
+        
+        # Volatility adjustment
+        if len(self.price_history) > 20:
+            returns = np.diff(self.price_history[-20:]) / self.price_history[-21:-1]
+            volatility = np.std(returns)
+            volatility_adjustment = -self.config.volatility_scale * volatility
+        else:
+            volatility_adjustment = 0
+            
+        return drawdown_penalty + overexposure_penalty + volatility_adjustment
+    
+    def _calculate_trading_reward(self, current_state: Dict, action: float, trade_result: Dict) -> float:
+        """Calculate trading behavior-based reward component"""
+        # Entry/exit rewards
+        position_change = abs(action) > 0.01
+        if position_change:
+            trading_reward = self.config.entry_reward if abs(action) > 0 else self.config.exit_reward
+        else:
+            trading_reward = 0
+            
+        # Holding cost for existing positions
+        position_size = abs(current_state['account_data']['position_size'])
+        holding_cost = self.config.holding_cost * position_size
+        
+        # Spread penalty
+        spread = (
+            current_state['market_data']['best_ask'] -
+            current_state['market_data']['best_bid']
+        ) / current_state['market_data']['last_price']
+        spread_penalty = self.config.spread_penalty * spread * abs(action)
+        
+        return trading_reward + holding_cost + spread_penalty
+    
+    def _calculate_market_reward(self, current_state: Dict) -> float:
+        """Calculate market condition-based reward component"""
+        # Trend alignment reward
+        if len(self.price_history) > 20:
+            trend = (self.price_history[-1] - self.price_history[-20]) / self.price_history[-20]
+            position = current_state['account_data']['position_size']
+            trend_reward = self.config.trend_alignment * trend * np.sign(position)
+        else:
+            trend_reward = 0
+            
+        # Volume-based reward
+        volume_ratio = current_state['market_data']['24h_volume'] / np.mean(self.price_history)
+        volume_reward = self.config.volume_scale * np.log1p(volume_ratio)
+        
+        # Funding rate penalty
+        funding_rate = current_state['market_data']['funding_rate']
+        position = current_state['account_data']['position_size']
+        funding_penalty = self.config.funding_penalty * funding_rate * position
+        
+        return trend_reward + volume_reward + funding_penalty
+
+class TestBybitEnvironment:
+    """Test suite for Bybit trading environment"""
+    
+    @pytest.fixture
+    def env(self):
+        """Create test environment"""
+        return BybitBTCEnvironment(
+            api_key="test_key",
+            api_secret="test_secret",
+            initial_balance=10000,
+            max_position=0.1
+        )
+    
+    @pytest.fixture
+    def reward_calculator(self):
+        """Create reward calculator"""
+        return EnhancedReward(RewardConfig())
+    
+    def test_environment_initialization(self, env):
+        """Test environment initialization"""
+        assert env.symbol == "BTCUSDT"
+        assert env.initial_balance == 10000
+        assert env.current_position == 0
+        assert env.entry_price == 0
+    
+    def test_market_data_fetching(self, env):
+        """Test market data fetching"""
+        market_data = env._get_market_data()
+        required_fields = [
+            'last_price', 'mark_price', 'index_price', '24h_volume',
+            'funding_rate', 'best_bid', 'best_ask'
+        ]
+        for field in required_fields:
+            assert field in market_data
+            assert isinstance(market_data[field], float)
+    
+    def test_account_data_fetching(self, env):
+        """Test account data fetching"""
+        account_data = env._get_account_data()
+        required_fields = [
+            'wallet_balance', 'available_balance', 'position_size',
+            'position_value', 'unrealized_pnl'
+        ]
+        for field in required_fields:
+            assert field in account_data
+            assert isinstance(account_data[field], float)
+    
+    def test_trade_execution(self, env):
+        """Test trade execution"""
+        action = 0.5  # 50% of max position
+        trade_result = env._execute_trade(action)
+        assert 'orderId' in trade_result
+        assert env.current_position > 0
+    
+    def test_environment_reset(self, env):
+        """Test environment reset"""
+        observation, info = env.reset()
+        assert 'market_data' in observation
+        assert 'account_data' in observation
+        assert env.current_position == 0
+        assert env.account_balance == env.initial_balance
+    
+    def test_full_episode(self, env, reward_calculator):
+        """Test full trading episode"""
+        observation, info = env.reset()
+        total_rewards = 0
+        
+        for _ in range(10):  # Run 10 steps
+            action = np.random.uniform(-1, 1)  # Random actions
+            next_observation, reward, done, truncated, info = env.step(action)
+            
+            # Calculate enhanced reward
+            enhanced_reward, components = reward_calculator.calculate_reward(
+                next_observation,
+                observation,
+                action,
+                info['trade_result']
+            )
+            
+            total_rewards += enhanced_reward
+            observation = next_observation
+            
+            if done:
+                break
+                
+        assert isinstance(total_rewards, float)
+        env.close()
+    
+    def test_position_limits(self, env):
+        """Test position size limits"""
+        # Try to open position larger than max_position
+        action = 2.0  # Should be clipped to 1.0
+        observation, reward, done, truncated, info = env.step(action)
+        assert abs(env.current_position) <= env.max_position * env.account_balance
+    
+    def test_drawdown_termination(self, env):
+        """Test drawdown-based termination"""
+        # Simulate large loss
+        env.account_balance = env.initial_balance * 0.4  # 60% loss
+        observation, reward, done, truncated, info = env.step(0)
+        assert done == True
+
+def plot_trading_session(env_history: Dict):
+    """Plot trading session results"""
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(15, 10))
+    
+    # Plot price and positions
+    ax1.plot(env_history['prices'], label='Price')
+    ax1.set_title('Price and Positions')
+    ax1.set_ylabel('Price')
+    
+    # Add position markers
+    for i, pos in enumerate(env_history['positions']):
+        if pos > 0:
+            ax1.scatter(i, env_history['prices'][i], color='green', marker='^')
+        elif pos < 0:
+            ax1.scatter(i, env_history['prices'][i], color='red', marker='v')
+    
+    # Plot PnL
+    ax2.plot(env_history['pnl'], label='PnL')
+    ax2.set_title('Profit and Loss')
+    ax2.set_ylabel('USDT')
+    
+    # Plot rewards
+    ax3.plot(env_history['rewards'], label='Reward')
+    ax3.set_title('Rewards')
+    ax3.set_ylabel('Reward')
+    
+    plt.tight_layout()
+    plt.show()
+
+if __name__ == "__main__":
+    # Run basic validation
+    env = BybitBTCEnvironment(
+        api_key="your_testnet_api_key",
+        api_secret="your_testnet_api_secret"
+    )
+    reward_calculator = EnhancedReward(RewardConfig())
+    
+    # Run test trading session
+    observation, info = env.reset()
+    history = {
+        'prices': [],
+        'positions': [],
+        'pnl': [],
+        'rewards': []
+    }
+    
+    try:
+        for _ in range(100):  # Run 100 steps
+            # Simple momentum strategy for testing
+            returns = np.diff(history['prices'][-20:]) if len(history['prices']) >= 20 else [0]
+            action = np.sign(np.mean(returns)) * 0.5  # 50% of max position
+            
+            # Take action
+            next_observation, reward, done, truncated, info = env.step(action)
+            
+            # Calculate enhanced reward
+            enhanced_reward, components = reward_calculator.calculate_reward(
+                next_observation,
+                observation,
+                action,
+                info['trade_result']
+            )
+            
+            # Update history
+            history['prices'].append(next_observation['market_data'][0])  # Last price
+            history['positions'].append(next_observation['account_data'][1])  # Position size
+            history['pnl'].append(next_observation['account_data'][0] - env.initial_balance)  # PnL
+            history['rewards'].append(enhanced_reward)
+            
+            observation = next_observation
+            
+            if done:
+                print("Episode finished due to termination condition")
+                break
+                
+    finally:
+        env.close()
+        
+    # Plot results
+    plot_trading_session(history)
+
 // File: src\env\__init__.py
+
+
+// File: src\models\agent.py
+
+
+// File: src\models\appo.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.cuda.amp import autocast, GradScaler
+from typing import Dict, List, Optional, Tuple
+import numpy as np
+from dataclasses import dataclass
+from .nlnn import NLNN
+from .reward import CompositeReward, RewardConfig
+import threading
+from queue import Queue
+import time
+
+@dataclass
+class APPOConfig:
+    """Configuration for APPO algorithm"""
+    # Network architecture
+    input_dim: int = 64
+    hidden_dim: int = 256
+    num_layers: int = 4
+    
+    # APPO parameters
+    num_workers: int = 12  # Optimized for Ryzen 9 7900X
+    batch_size: int = 512  # Optimized for RTX 3070
+    clip_ratio: float = 0.2
+    value_loss_coef: float = 0.5
+    entropy_coef: float = 0.01
+    max_grad_norm: float = 0.5
+    
+    # Learning rates
+    actor_lr: float = 3e-4
+    critic_lr: float = 1e-3
+    
+    # Optimization
+    gamma: float = 0.99
+    gae_lambda: float = 0.95
+    update_epochs: int = 4
+    mini_batch_size: int = 64
+    
+    # Experience replay
+    buffer_size: int = 10000
+    priority_alpha: float = 0.6
+    priority_beta: float = 0.4
+    
+    # Auxiliary tasks
+    use_auxiliary: bool = True
+    aux_weight: float = 0.1
+
+class AsyncPPOAgent(nn.Module):
+    """Asynchronous Proximal Policy Optimization with hardware optimizations"""
+    
+    def __init__(self, config: APPOConfig):
+        super().__init__()
+        self.config = config
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Initialize networks
+        self.backbone = NLNN(
+            input_size=config.input_dim,
+            hidden_size=config.hidden_dim,
+            num_layers=config.num_layers
+        ).to(self.device)
+        
+        self.actor = nn.Sequential(
+            nn.Linear(config.hidden_dim, config.hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(config.hidden_dim // 2, 3)  # Buy, Sell, Hold
+        ).to(self.device)
+        
+        self.critic = nn.Sequential(
+            nn.Linear(config.hidden_dim, config.hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(config.hidden_dim // 2, 1)
+        ).to(self.device)
+        
+        if config.use_auxiliary:
+            self.auxiliary_head = nn.Sequential(
+                nn.Linear(config.hidden_dim, config.hidden_dim // 2),
+                nn.ReLU(),
+                nn.Linear(config.hidden_dim // 2, config.input_dim)
+            ).to(self.device)
+        
+        # Initialize optimizers
+        self.actor_optimizer = torch.optim.Adam(
+            list(self.backbone.parameters()) + list(self.actor.parameters()),
+            lr=config.actor_lr
+        )
+        self.critic_optimizer = torch.optim.Adam(
+            list(self.backbone.parameters()) + list(self.critic.parameters()),
+            lr=config.critic_lr
+        )
+        
+        # Initialize mixed precision training
+        self.scaler = GradScaler()
+        
+        # Initialize experience replay
+        self.replay_buffer = PrioritizedReplayBuffer(
+            config.buffer_size,
+            config.priority_alpha,
+            config.priority_beta
+        )
+        
+        # Initialize worker threads
+        self.workers = [
+            PPOWorker(i, self, Queue())
+            for i in range(config.num_workers)
+        ]
+        
+        # Compile model for faster execution
+        self.trace_model()
+    
+    def trace_model(self):
+        """JIT compile the model for faster execution"""
+        self.backbone = torch.compile(self.backbone)
+        self.actor = torch.compile(self.actor)
+        self.critic = torch.compile(self.critic)
+        if self.config.use_auxiliary:
+            self.auxiliary_head = torch.compile(self.auxiliary_head)
+    
+    @torch.compile
+    def forward(self, state: torch.Tensor,
+                hidden_states: Optional[List[torch.Tensor]] = None
+                ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+        """Forward pass with mixed precision"""
+        with autocast():
+            # Get features from backbone
+            features, new_hidden = self.backbone(state, hidden_states)
+            
+            # Get action logits and value estimate
+            action_logits = self.actor(features)
+            value = self.critic(features)
+            
+            # Get auxiliary prediction if enabled
+            if self.config.use_auxiliary:
+                aux_pred = self.auxiliary_head(features)
+            else:
+                aux_pred = None
+            
+            return action_logits, value, new_hidden, aux_pred
+    
+    def select_action(self, state: torch.Tensor,
+                     hidden_states: List[torch.Tensor],
+                     deterministic: bool = False) -> Tuple[torch.Tensor, float, List[torch.Tensor]]:
+        """Select action using the current policy"""
+        with torch.no_grad():
+            action_logits, value, new_hidden, _ = self(state, hidden_states)
+            
+            if deterministic:
+                action = torch.argmax(action_logits, dim=-1)
+            else:
+                action_probs = F.softmax(action_logits, dim=-1)
+                action = torch
+
+    def update_minibatch(self, states: torch.Tensor,
+                        actions: torch.Tensor,
+                        returns: torch.Tensor,
+                        advantages: torch.Tensor):
+        """Update policy and value function on a single minibatch"""
+        with autocast(enabled=self.config.use_amp):
+            # Get current policy and value predictions
+            new_log_probs, new_values, entropy = self.evaluate_actions(states, actions)
+            
+            # Calculate policy loss with clipping
+            ratio = torch.exp(new_log_probs)
+            surr1 = ratio * advantages
+            surr2 = torch.clamp(ratio, 1 - self.config.clip_ratio, 1 + self.config.clip_ratio) * advantages
+            policy_loss = -torch.min(surr1, surr2).mean()
+            
+            # Calculate value loss with clipping
+            value_pred_clipped = values + torch.clamp(
+                new_values - values,
+                -self.config.clip_ratio,
+                self.config.clip_ratio
+            )
+            value_losses = (new_values - returns).pow(2)
+            value_losses_clipped = (value_pred_clipped - returns).pow(2)
+            value_loss = torch.max(value_losses, value_losses_clipped).mean()
+            
+            # Calculate auxiliary loss if enabled
+            if self.config.use_auxiliary:
+                aux_pred = self.auxiliary_head(features)
+                aux_loss = F.mse_loss(aux_pred, next_states)
+            else:
+                aux_loss = 0
+            
+            # Combine losses
+            total_loss = (
+                policy_loss
+                - self.config.entropy_coef * entropy
+                + self.config.value_loss_coef * value_loss
+                + self.config.aux_weight * aux_loss
+            )
+            
+            # Optimize using mixed precision
+            if self.config.use_amp:
+                self.scaler.scale(total_loss).backward()
+                
+                # Clip gradients
+                if self.config.max_grad_norm > 0:
+                    for param_group in [
+                        list(self.backbone.parameters()),
+                        list(self.actor.parameters()),
+                        list(self.critic.parameters())
+                    ]:
+                        self.scaler.unscale_(self.actor_optimizer)
+                        torch.nn.utils.clip_grad_norm_(param_group, self.config.max_grad_norm)
+                
+                self.scaler.step(self.actor_optimizer)
+                self.scaler.step(self.critic_optimizer)
+                self.scaler.update()
+            else:
+                total_loss.backward()
+                if self.config.max_grad_norm > 0:
+                    for param_group in [
+                        list(self.backbone.parameters()),
+                        list(self.actor.parameters()),
+                        list(self.critic.parameters())
+                    ]:
+                        torch.nn.utils.clip_grad_norm_(param_group, self.config.max_grad_norm)
+                
+                self.actor_optimizer.step()
+                self.critic_optimizer.step()
+            
+            self.actor_optimizer.zero_grad()
+            self.critic_optimizer.zero_grad()
+            
+            return {
+                'policy_loss': policy_loss.item(),
+                'value_loss': value_loss.item(),
+                'entropy': entropy.item(),
+                'aux_loss': aux_loss.item() if isinstance(aux_loss, torch.Tensor) else aux_loss
+            }
+    
+    def train(self, num_steps: int):
+        """Main training loop"""
+        # Start worker threads
+        for worker in self.workers:
+            worker.start()
+        
+        total_steps = 0
+        episode_rewards = []
+        metrics_history = []
+        
+        try:
+            while total_steps < num_steps:
+                # Collect experiences from workers
+                experiences = []
+                while len(experiences) < self.config.batch_size:
+                    if not self.experience_queue.empty():
+                        exp = self.experience_queue.get()
+                        experiences.append(exp)
+                        total_steps += 1
+                
+                # Update policy
+                metrics = self.update(experiences)
+                metrics_history.append(metrics)
+                
+                # Log progress
+                if total_steps % 1000 == 0:
+                    avg_metrics = {
+                        k: np.mean([m[k] for m in metrics_history[-1000:]])
+                        for k in metrics_history[0].keys()
+                    }
+                    logger.info(f"Step {total_steps}/{num_steps} - Metrics: {avg_metrics}")
+        
+        finally:
+            # Clean up workers
+            for worker in self.workers:
+                worker.join()
+    
+    def save_checkpoint(self, path: str):
+        """Save model checkpoint"""
+        torch.save({
+            'backbone_state_dict': self.backbone.state_dict(),
+            'actor_state_dict': self.actor.state_dict(),
+            'critic_state_dict': self.critic.state_dict(),
+            'auxiliary_state_dict': self.auxiliary_head.state_dict() if self.config.use_auxiliary else None,
+            'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
+            'critic_optimizer_state_dict': self.critic_optimizer.state_dict(),
+            'config': self.config,
+            'scaler_state_dict': self.scaler.state_dict() if self.scaler else None
+        }, path)
+    
+    def load_checkpoint(self, path: str):
+        """Load model checkpoint"""
+        checkpoint = torch.load(path, map_location=self.device)
+        
+        self.backbone.load_state_dict(checkpoint['backbone_state_dict'])
+        self.actor.load_state_dict(checkpoint['actor_state_dict'])
+        self.critic.load_state_dict(checkpoint['critic_state_dict'])
+        
+        if self.config.use_auxiliary and checkpoint['auxiliary_state_dict']:
+            self.auxiliary_head.load_state_dict(checkpoint['auxiliary_state_dict'])
+        
+        self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
+        self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
+        
+        if self.scaler and checkpoint['scaler_state_dict']:
+            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+
+if __name__ == "__main__":
+    # Example usage
+    config = APPOConfig(
+        input_dim=64,
+        hidden_dim=256,
+        num_layers=4,
+        num_workers=12,  # Using all cores of Ryzen 9 7900X
+        batch_size=512,  # Optimized for RTX 3070 8GB VRAM
+        use_amp=True,    # Enable automatic mixed precision
+        tensor_parallel=True  # Enable tensor parallelization
+    )
+    
+    agent = AsyncPPOAgent(config)
+    
+    # Train the agent
+    agent.train(num_steps=1000000)
+    
+    # Save checkpoint
+    agent.save_checkpoint("appo_checkpoint.pt")
 
 
 // File: src\models\nlnn.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import autocast, GradScaler
-from typing import Optional, Tuple, List
+import torch.optim as optim
+import gymnasium as gym
+import numpy as np
 from dataclasses import dataclass
+from typing import Tuple, Dict, List
+import logging
+import time
+from collections import deque
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
 @dataclass
-class LN2Config:
-    """Enhanced configuration for LN² model with hardware optimization settings"""
-    feature_dim: int
-    hidden_dim: int
-    output_dim: int
-    num_layers: int
-    sequence_length: int
-    batch_size: int
-    dropout: float = 0.1
-    learning_rate: float = 1e-3
-    epsilon: float = 1e-8
-    eigen_adaptation_rate: float = 0.01
-    slerp_rate: float = 0.1
-    use_mixed_precision: bool = True
-    use_slerp: bool = True
+class TradingConfig:
+    """Configuration for trading parameters and risk management"""
+    max_position_size: float = 0.1  # Maximum position size as fraction of capital
+    stop_loss_pct: float = 0.02     # Stop loss percentage
+    take_profit_pct: float = 0.04   # Take profit percentage
+    max_leverage: float = 5.0       # Maximum allowed leverage
+    min_trade_interval: int = 5     # Minimum intervals between trades
+    rolling_window_size: int = 100  # Size of rolling window for feature calculation
 
-class SphericalLinear(nn.Module):
-    """Optimized linear layer with weight normalization on hypersphere"""
-    def __init__(self, input_size: int, output_size: int, epsilon: float = 1e-8):
-        super().__init__()
-        scale = (6.0 / (input_size + output_size)) ** 0.5
-        self.weight = nn.Parameter(torch.randn(output_size, input_size) * scale)
-        self.scale = nn.Parameter(torch.ones(output_size))
-        self.epsilon = epsilon
-        self._normalize_weights()
-
-    def _normalize_weights(self):
-        with torch.no_grad():
-            norm = torch.norm(self.weight, dim=1, keepdim=True)
-            self.weight.div_(norm + self.epsilon)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        self._normalize_weights()
-        return self.scale.unsqueeze(0) * F.linear(x, self.weight)
-
-class OptimizedSLERP(nn.Module):
-    """Enhanced SLERP implementation with numerical stability"""
-    def __init__(self, size: int, epsilon: float = 1e-8):
-        super().__init__()
-        self.alpha = nn.Parameter(torch.zeros(size))
-        self.epsilon = epsilon
-
-    def forward(self, h_t: torch.Tensor, h_new: torch.Tensor) -> torch.Tensor:
-        alpha = torch.sigmoid(self.alpha)
-        h_t = F.normalize(h_t, dim=-1, eps=self.epsilon)
-        h_new = F.normalize(h_new, dim=-1, eps=self.epsilon)
-        
-        dot_product = torch.sum(h_t * h_new, dim=-1, keepdim=True)
-        dot_product = torch.clamp(dot_product, -1 + self.epsilon, 1 - self.epsilon)
-        
-        theta = torch.arccos(dot_product)
-        sin_theta = torch.sin(theta) + self.epsilon
-        
-        h_t_coeff = torch.sin((1 - alpha) * theta) / sin_theta
-        h_new_coeff = torch.sin(alpha * theta) / sin_theta
-        
-        return F.normalize(h_t_coeff * h_t + h_new_coeff * h_new, dim=-1, eps=self.epsilon)
-
-class OptimizedLiquidCell(nn.Module):
-    """Hardware-optimized liquid neural network cell"""
-    def __init__(self, input_dim: int, hidden_dim: int, config: LN2Config):
-        super().__init__()
+class FeatureExtractor:
+    """Extracts and normalizes trading features"""
+    
+    def __init__(self, config: TradingConfig):
         self.config = config
+        self.price_history = deque(maxlen=config.rolling_window_size)
+        self.volume_history = deque(maxlen=config.rolling_window_size)
         
-        self.input_proj = SphericalLinear(input_dim, hidden_dim)
-        self.state_proj = SphericalLinear(hidden_dim, hidden_dim)
-        self.slerp = OptimizedSLERP(hidden_dim, config.epsilon)
-        self.norm = nn.LayerNorm(hidden_dim)
+    def calculate_features(self, market_data: Dict) -> np.ndarray:
+        """Calculate normalized feature vector from market data"""
+        # Add new data points
+        self.price_history.append(market_data['close_price'])
+        self.volume_history.append(market_data['volume'])
         
-    def forward(self, x: torch.Tensor, h: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        batch_size = x.size(0)
-        
-        if h is None:
-            h = F.normalize(
-                torch.zeros(batch_size, self.state_proj.weight.size(0), 
-                          device=x.device),
-                dim=-1,
-                eps=self.config.epsilon
-            )
-        
-        input_proj = self.input_proj(x)
-        state_proj = self.state_proj(h)
-        
-        h_new = F.normalize(input_proj + state_proj, dim=-1, eps=self.config.epsilon)
-        
-        if self.config.use_slerp:
-            h_next = self.slerp(h, h_new)
-        else:
-            h_next = h_new
+        if len(self.price_history) < 2:
+            return np.zeros(10)  # Return zero features if insufficient history
             
-        return self.norm(h_next), h_next
-
-class OptimizedLN2Model(nn.Module):
-    """Hardware-optimized Liquid Normalized Neural Network model"""
-    def __init__(self, config: LN2Config):
-        super().__init__()
-        self.config = config
+        # Calculate technical features
+        returns = np.diff(self.price_history) / np.array(list(self.price_history)[:-1])
+        volatility = np.std(returns[-20:]) if len(returns) >= 20 else 0
+        rsi = self._calculate_rsi(list(self.price_history))
         
-        # Hardware optimization
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.scaler = GradScaler(enabled=config.use_mixed_precision)
-        
-        # Network layers
-        self.input_norm = nn.LayerNorm(config.feature_dim)
-        self.embedding = SphericalLinear(config.feature_dim, config.hidden_dim)
-        
-        self.liquid_cells = nn.ModuleList([
-            OptimizedLiquidCell(config.hidden_dim, config.hidden_dim, config)
-            for _ in range(config.num_layers)
+        # Normalize and combine features
+        features = np.array([
+            self._normalize(market_data['close_price'], self.price_history),
+            self._normalize(market_data['volume'], self.volume_history),
+            volatility,
+            rsi / 100.0,  # RSI is already 0-100
+            market_data['bid_ask_spread'] / market_data['close_price'],
+            market_data['funding_rate'],
+            market_data['open_interest'] / np.mean(self.volume_history),
+            market_data['leverage_ratio'] / self.config.max_leverage,
+            market_data['market_depth_ratio'],
+            market_data['taker_buy_ratio']
         ])
         
-        self.dropout = nn.Dropout(config.dropout)
-        self.output_layer = SphericalLinear(config.hidden_dim, config.output_dim)
-        
-        # Adaptive learning rate
-        self.eta = nn.Parameter(torch.ones(1))
-        
-        self.to(self.device)
-        self._optimize_memory_format()
-
-    def _optimize_memory_format(self):
-        """Optimize memory layout for better performance"""
-        self.to(memory_format=torch.channels_last)
-        for param in self.parameters():
-            if param.dim() == 4:
-                param.data = param.data.to(memory_format=torch.channels_last)
-
-    def init_states(self, batch_size: int) -> List[torch.Tensor]:
-        return [F.normalize(
-            torch.randn(batch_size, self.config.hidden_dim, device=self.device),
-            dim=-1,
-            eps=self.config.epsilon
-        ) for _ in range(self.config.num_layers)]
-
-    @autocast(device_type='cuda')
-    def forward(self, x: torch.Tensor, states: Optional[List[torch.Tensor]] = None) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        batch_size, seq_len = x.shape[:2]
-        
-        if states is None:
-            states = self.init_states(batch_size)
-        
-        outputs = []
-        for t in range(seq_len):
-            x_t = self.input_norm(x[:, t])
-            h = self.embedding(x_t)
+        return np.clip(features, -1, 1)  # Ensure all features are in [-1, 1]
+    
+    def _normalize(self, value: float, history: deque) -> float:
+        """Min-max normalization using recent history"""
+        if len(history) < 2:
+            return 0
+        min_val = min(history)
+        max_val = max(history)
+        if min_val == max_val:
+            return 0
+        return (value - min_val) / (max_val - min_val) * 2 - 1
+    
+    def _calculate_rsi(self, prices: List[float], periods: int = 14) -> float:
+        """Calculate Relative Strength Index"""
+        if len(prices) < periods + 1:
+            return 50.0
             
-            new_states = []
-            for i, cell in enumerate(self.liquid_cells):
-                h, new_state = cell(h, states[i])
-                h = self.dropout(h)
-                new_states.append(new_state)
-            
-            states = new_states
-            output = self.output_layer(h)
-            outputs.append(output)
+        deltas = np.diff(prices)
+        gains = np.clip(deltas, 0, None)
+        losses = -np.clip(deltas, None, 0)
         
-        outputs = torch.stack(outputs, dim=1)
-        return outputs, states
+        avg_gain = np.mean(gains[-periods:])
+        avg_loss = np.mean(losses[-periods:])
+        
+        if avg_loss == 0:
+            return 100.0
+            
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
 
-    def configure_optimizers(self) -> torch.optim.Optimizer:
-        """Configure optimizer with adaptive learning rate"""
-        return torch.optim.AdamW(
-            self.parameters(),
-            lr=self.config.learning_rate * torch.sigmoid(self.eta),
-            eps=self.config.epsilon,
-            betas=(0.9, 0.999),
-            weight_decay=0.01
-        )
+class RiskManager:
+    """Handles position sizing and risk management"""
+    
+    def __init__(self, config: TradingConfig):
+        self.config = config
+        self.current_position = 0
+        self.last_trade_time = 0
+        
+    def validate_action(self, action: int, current_price: float, 
+                       account_balance: float) -> Tuple[bool, str]:
+        """Validate if an action can be executed based on risk parameters"""
+        current_time = time.time()
+        
+        # Check trading frequency
+        if current_time - self.last_trade_time < self.config.min_trade_interval:
+            return False, "Trading too frequently"
+            
+        # Check position sizes
+        new_position = self._calculate_position_size(action, current_price, account_balance)
+        if abs(new_position) > self.config.max_position_size * account_balance:
+            return False, "Position size exceeds maximum"
+            
+        return True, ""
+        
+    def _calculate_position_size(self, action: int, current_price: float,
+                               account_balance: float) -> float:
+        """Calculate appropriate position size based on risk parameters"""
+        base_size = account_balance * self.config.max_position_size
+        
+        # Scale position size based on market volatility (simplified)
+        # In practice, you'd want more sophisticated volatility adjustment
+        volatility_scalar = 0.5  # Could be dynamically calculated
+        position_size = base_size * volatility_scalar
+        
+        # Adjust for action type (0: Buy, 1: Sell, 2: Hold)
+        if action == 2:  # Hold
+            return self.current_position
+        elif action == 1:  # Sell
+            return -position_size
+        else:  # Buy
+            return position_size
 
-class LN2Loss(nn.Module):
-    """Loss function for LN² model with regularization"""
-    def __init__(self):
+class N_LNN(nn.Module):
+    """Enhanced n-LNN implementation with additional features"""
+    
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int = 1):
         super().__init__()
-        self.criterion = nn.MSELoss()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
         
-    def forward(self, pred: torch.Tensor, target: torch.Tensor, states: List[torch.Tensor]) -> torch.Tensor:
-        pred_loss = self.criterion(pred, target)
+        # Input transformation
+        self.input_transform = nn.Linear(input_size, hidden_size)
         
-        # State transition regularization
-        state_reg = sum(
-            torch.norm(s[1:] - s[:-1], dim=-1).mean() 
-            for s in states
-        ) / len(states)
+        # Learnable parameters
+        self.W_i = nn.ParameterList([
+            nn.Parameter(torch.randn(hidden_size, hidden_size)) 
+            for _ in range(num_layers)
+        ])
+        self.W_r = nn.ParameterList([
+            nn.Parameter(torch.randn(hidden_size, hidden_size))
+            for _ in range(num_layers)
+        ])
         
-        return pred_loss + 0.1 * state_reg
+        # Eigen learning rates and scaling factors
+        self.lambda_i = nn.ParameterList([
+            nn.Parameter(torch.ones(hidden_size))
+            for _ in range(num_layers)
+        ])
+        self.lambda_r = nn.ParameterList([
+            nn.Parameter(torch.ones(hidden_size))
+            for _ in range(num_layers)
+        ])
+        
+        self.scaling_i = nn.Parameter(torch.ones(1))
+        self.scaling_r = nn.Parameter(torch.ones(1))
+        
+        self.dropout = nn.Dropout(0.1)
+        self.layer_norm = nn.LayerNorm(hidden_size)
+        
+    def normalize(self, v: torch.Tensor, epsilon: float = 1e-8) -> torch.Tensor:
+        """Hypersphere normalization with numerical stability"""
+        norm = torch.norm(v, dim=-1, keepdim=True)
+        return v / (norm + epsilon)
+    
+    def slerp(self, h_t: torch.Tensor, h_new: torch.Tensor,
+              alpha: float = 0.5) -> torch.Tensor:
+        """Spherical linear interpolation with safety checks"""
+        # Ensure inputs are normalized
+        h_t = self.normalize(h_t)
+        h_new = self.normalize(h_new)
+        
+        # Calculate cos_theta with numerical stability
+        cos_theta = torch.sum(h_t * h_new, dim=-1, keepdim=True).clamp(-1 + 1e-7, 1 - 1e-7)
+        theta = torch.acos(cos_theta)
+        
+        # Handle edge cases
+        sin_theta = torch.sin(theta)
+        mask = sin_theta.abs() > 1e-7
+        
+        result = torch.where(
+            mask,
+            ((torch.sin((1 - alpha) * theta) / sin_theta) * h_t) + 
+            ((torch.sin(alpha * theta) / sin_theta) * h_new),
+            h_t
+        )
+        
+        return self.normalize(result)
+    
+    def forward(self, inputs: torch.Tensor, 
+                hidden_states: List[torch.Tensor]) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """Forward pass with multi-layer support and residual connections"""
+        # Input projection
+        x = self.input_transform(inputs)
+        x = self.layer_norm(x)
+        
+        new_hidden_states = []
+        for layer in range(self.num_layers):
+            h_t = hidden_states[layer]
+            
+            # Apply transformations
+            i_transform = torch.matmul(x, self.W_i[layer]) * self.lambda_i[layer]
+            r_transform = torch.matmul(h_t, self.W_r[layer]) * self.lambda_r[layer]
+            
+            # Combine transformations
+            h_new = self.normalize(
+                self.scaling_i * i_transform + 
+                self.scaling_r * r_transform
+            )
+            
+            # Apply SLERP
+            h_new = self.slerp(h_t, h_new)
+            
+            # Residual connection if dimensions match
+            if x.shape == h_new.shape:
+                h_new = h_new + x
+                
+            h_new = self.layer_norm(h_new)
+            h_new = self.dropout(h_new)
+            
+            new_hidden_states.append(h_new)
+            x = h_new  # Use as input for next layer
+            
+        return x, new_hidden_states
 
-def optimize_hardware():
-    """Optimize hardware settings for maximum performance"""
-    if torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cudnn.deterministic = False
-        torch.set_float32_matmul_precision('high')
-        torch.cuda.empty_cache()
+class Agent(nn.Module):
+    """Trading agent with actor-critic architecture"""
     
-    torch.set_num_threads(24)  # Optimize for modern CPUs
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int = 1):
+        super().__init__()
+        self.n_lnn = N_LNN(input_size, hidden_size, num_layers)
+        
+        # Actor network (policy)
+        self.actor = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_size // 2, 3),  # 3 actions: Buy, Sell, Hold
+        )
+        
+        # Critic network (value function)
+        self.critic = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_size // 2, 1)
+        )
+        
+        # Initialize weights
+        self.apply(self._init_weights)
+        
+    def _init_weights(self, module):
+        """Initialize network weights"""
+        if isinstance(module, nn.Linear):
+            nn.init.orthogonal_(module.weight.data, gain=np.sqrt(2))
+            module.bias.data.zero_()
+            
+    def forward(self, state: torch.Tensor, hidden_states: List[torch.Tensor]
+                ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+        """Forward pass returning action probabilities and value estimate"""
+        features, new_hidden = self.n_lnn(state, hidden_states)
+        
+        # Get action probabilities and value estimate
+        action_logits = self.actor(features)
+        value = self.critic(features)
+        
+        # Apply action masking if needed (e.g., prevent buying when already long)
+        # action_mask = self._get_action_mask(state)
+        # action_logits = action_logits.masked_fill(~action_mask, float('-inf'))
+        
+        return F.softmax(action_logits, dim=-1), value, new_hidden
+    
+    def act(self, state: torch.Tensor, hidden_states: List[torch.Tensor]
+            ) -> Tuple[int, float, List[torch.Tensor]]:
+        """Select action based on current policy"""
+        with torch.no_grad():
+            action_probs, value, new_hidden = self(state, hidden_states)
+            action = torch.multinomial(action_probs, 1).item()
+            
+        return action, value.item(), new_hidden
 
-def create_dataloaders(config: LN2Config, train_data: torch.Tensor, val_data: torch.Tensor):
-    """Create optimized dataloaders for training"""
-    train_dataset = torch.utils.data.TensorDataset(
-        train_data[:, :-1], train_data[:, 1:]
-    )
-    val_dataset = torch.utils.data.TensorDataset(
-        val_data[:, :-1], val_data[:, 1:]
+# Example usage:
+if __name__ == "__main__":
+    # Configuration
+    config = TradingConfig()
+    feature_extractor = FeatureExtractor(config)
+    risk_manager = RiskManager(config)
+    
+    # Initialize agent
+    input_size = 10  # Number of features
+    hidden_size = 64
+    num_layers = 2
+    agent = Agent(input_size, hidden_size, num_layers)
+    optimizer = optim.Adam(agent.parameters(), lr=3e-4)
+    
+    # Initialize hidden states
+    hidden_states = [
+        torch.zeros(1, hidden_size) for _ in range(num_layers)
+    ]
+    
+    # Example market data
+    market_data = {
+        'close_price': 50000.0,
+        'volume': 100.0,
+        'bid_ask_spread': 1.0,
+        'funding_rate': 0.0001,
+        'open_interest': 1000.0,
+        'leverage_ratio': 2.0,
+        'market_depth_ratio': 0.5,
+        'taker_buy_ratio': 0.6
+    }
+    
+    # Extract features
+    features = feature_extractor.calculate_features(market_data)
+    state = torch.FloatTensor(features).unsqueeze(0)
+    
+    # Get action
+    action, value, new_hidden = agent.act(state, hidden_states)
+    
+    # Validate action
+    is_valid, message = risk_manager.validate_action(
+        action, market_data['close_price'], account_balance=10000.0
     )
     
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
-        pin_memory=True,
-        num_workers=12,
-        persistent_workers=True
-    )
+    if is_valid:
+        logging.info(f"Taking action {action} with value estimate {value}")
+    else:
+        logging.warning(f"Action rejected: {message}")
+
+// File: src\models\reward.py
+import torch
+import numpy as np
+from typing import Dict, List, Optional, Union
+from dataclasses import dataclass
+from abc import ABC, abstractmethod
+import torch.nn.functional as F
+from torch.cuda.amp import autocast
+
+@dataclass
+class RewardConfig:
+    """Configuration for reward calculation"""
+    # PnL Rewards
+    pnl_scale: float = 1.0
+    realized_pnl_weight: float = 0.7
+    unrealized_pnl_weight: float = 0.3
     
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset,
-        batch_size=config.batch_size * 2,
-        shuffle=False,
-        pin_memory=True,
-        num_workers=12,
-        persistent_workers=True
-    )
+    # Risk-Adjusted Rewards
+    use_sharpe: bool = True
+    sharpe_window: int = 100
+    risk_free_rate: float = 0.0
     
-    return train_loader, val_loader
+    # Trading Behavior Rewards
+    timing_scale: float = 0.3
+    position_scale: float = 0.2
+    spread_scale: float = 0.1
+    
+    # Penalties
+    oversizing_penalty: float = -0.5
+    overtrading_penalty: float = -0.3
+    drawdown_penalty: float = -0.4
+    
+    # Exploration Rewards
+    curiosity_scale: float = 0.1
+    novelty_threshold: float = 0.1
+
+class BaseReward(ABC):
+    """Abstract base class for reward functions"""
+    
+    def __init__(self, config: RewardConfig):
+        self.config = config
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    @abstractmethod
+    def calculate(self, state: Dict[str, torch.Tensor], 
+                 action: torch.Tensor, 
+                 next_state: Dict[str, torch.Tensor]) -> torch.Tensor:
+        pass
+
+class PnLReward(BaseReward):
+    """Profit and Loss based reward"""
+    
+    @torch.compile
+    def calculate(self, state: Dict[str, torch.Tensor],
+                 action: torch.Tensor,
+                 next_state: Dict[str, torch.Tensor]) -> torch.Tensor:
+        with autocast():
+            realized_pnl = next_state['realized_pnl']
+            unrealized_pnl = next_state['unrealized_pnl']
+            
+            pnl_reward = (
+                self.config.realized_pnl_weight * realized_pnl +
+                self.config.unrealized_pnl_weight * unrealized_pnl
+            ) * self.config.pnl_scale
+            
+            return pnl_reward
+
+class SharpeReward(BaseReward):
+    """Sharpe ratio based reward"""
+    
+    def __init__(self, config: RewardConfig):
+        super().__init__(config)
+        self.returns_history = torch.zeros(
+            (config.sharpe_window,),
+            device=self.device
+        )
+        self.current_idx = 0
+    
+    @torch.compile
+    def calculate(self, state: Dict[str, torch.Tensor],
+                 action: torch.Tensor,
+                 next_state: Dict[str, torch.Tensor]) -> torch.Tensor:
+        with autocast():
+            # Update returns history
+            current_return = (
+                next_state['total_pnl'] - state['total_pnl']
+            ) / state['account_balance']
+            
+            self.returns_history[self.current_idx] = current_return
+            self.current_idx = (self.current_idx + 1) % self.config.sharpe_window
+            
+            # Calculate Sharpe ratio
+            if self.current_idx >= self.config.sharpe_window:
+                excess_returns = self.returns_history - self.config.risk_free_rate
+                sharpe = (
+                    torch.mean(excess_returns) /
+                    (torch.std(excess_returns) + 1e-7)
+                ) * torch.sqrt(torch.tensor(252.0, device=self.device))  # Annualized
+                
+                return sharpe
+            
+            return torch.tensor(0.0, device=self.device)
+
+class BehaviorReward(BaseReward):
+    """Trading behavior based reward"""
+    
+    @torch.compile
+    def calculate(self, state: Dict[str, torch.Tensor],
+                 action: torch.Tensor,
+                 next_state: Dict[str, torch.Tensor]) -> torch.Tensor:
+        with autocast():
+            # Timing reward based on price movement direction
+            price_movement = next_state['close_price'] - state['close_price']
+            timing_reward = torch.sign(price_movement) * torch.sign(action - 1)  # -1 for sell, 0 for hold, 1 for buy
+            timing_reward *= self.config.timing_scale
+            
+            # Position sizing reward
+            position_size = torch.abs(next_state['position_size'])
+            optimal_size = state['account_balance'] * state['volatility']
+            position_reward = -torch.abs(position_size - optimal_size) * self.config.position_scale
+            
+            # Spread cost penalty
+            spread_cost = state['bid_ask_spread'] * torch.abs(action - 1)
+            spread_penalty = -spread_cost * self.config.spread_scale
+            
+            return timing_reward + position_reward + spread_penalty
+
+class RiskPenalty(BaseReward):
+    """Risk-based penalties"""
+    
+    @torch.compile
+    def calculate(self, state: Dict[str, torch.Tensor],
+                 action: torch.Tensor,
+                 next_state: Dict[str, torch.Tensor]) -> torch.Tensor:
+        with autocast():
+            penalties = torch.tensor(0.0, device=self.device)
+            
+            # Oversizing penalty
+            max_position = state['account_balance'] * state['max_position_size']
+            if torch.abs(next_state['position_size']) > max_position:
+                penalties += self.config.oversizing_penalty
+            
+            # Overtrading penalty
+            if state['trade_count'] > state['optimal_trade_count']:
+                penalties += self.config.overtrading_penalty
+            
+            # Drawdown penalty
+            current_drawdown = (state['peak_equity'] - next_state['account_balance']) / state['peak_equity']
+            if current_drawdown > state['max_drawdown']:
+                penalties += self.config.drawdown_penalty
+            
+            return penalties
+
+class CuriosityReward(BaseReward):
+    """Intrinsic motivation through curiosity"""
+    
+    def __init__(self, config: RewardConfig, state_dim: int):
+        super().__init__(config)
+        self.state_history = torch.zeros(
+            (1000, state_dim),
+            device=self.device
+        )
+        self.current_idx = 0
+    
+    @torch.compile
+    def calculate(self, state: Dict[str, torch.Tensor],
+                 action: torch.Tensor,
+                 next_state: Dict[str, torch.Tensor]) -> torch.Tensor:
+        with autocast():
+            state_tensor = torch.cat([
+                torch.tensor(list(state.values()), device=self.device)
+            ])
+            
+            # Update state history
+            self.state_history[self.current_idx] = state_tensor
+            self.current_idx = (self.current_idx + 1) % 1000
+            
+            # Calculate novelty as distance to nearest neighbor
+            distances = torch.norm(
+                self.state_history - state_tensor.unsqueeze(0),
+                dim=1
+            )
+            novelty = torch.min(distances[distances > 0])
+            
+            # Scale novelty reward
+            novelty_reward = torch.where(
+                novelty > self.config.novelty_threshold,
+                self.config.curiosity_scale,
+                torch.tensor(0.0, device=self.device)
+            )
+            
+            return novelty_reward
+
+class CompositeReward:
+    """Combines multiple reward components"""
+    
+    def __init__(self, config: RewardConfig, state_dim: int):
+        self.components = {
+            'pnl': PnLReward(config),
+            'sharpe': SharpeReward(config),
+            'behavior': BehaviorReward(config),
+            'risk': RiskPenalty(config),
+            'curiosity': CuriosityReward(config, state_dim)
+        }
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    @torch.compile
+    def calculate_reward(self,
+                        state: Dict[str, torch.Tensor],
+                        action: torch.Tensor,
+                        next_state: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Calculate combined reward from all components"""
+        with autocast():
+            rewards = {}
+            
+            # Calculate rewards in parallel if on GPU
+            if self.device.type == 'cuda':
+                streams = [torch.cuda.Stream() for _ in self.components]
+                
+                for (name, component), stream in zip(self.components.items(), streams):
+                    with torch.cuda.stream(stream):
+                        rewards[name] = component.calculate(state, action, next_state)
+                
+                torch.cuda.synchronize()
+            else:
+                for name, component in self.components.items():
+                    rewards[name] = component.calculate(state, action, next_state)
+            
+            # Combine rewards
+            total_reward = sum(rewards.values())
+            
+            # Clip final reward for stability
+            return torch.clamp(total_reward, -10.0, 10.0)
 
 // File: src\models\__init__.py
 
@@ -846,8 +1751,525 @@ def create_dataloaders(config: LN2Config, train_data: torch.Tensor, val_data: to
 // File: src\tests\__init__.py
 
 
-// File: src\utils\logging.py
+// File: src\training\trainer.py
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.cuda.amp import GradScaler, autocast
+from torch.nn.utils import clip_grad_norm_
+import numpy as np
+from typing import Dict, List, Optional, Tuple
+import time
+from pathlib import Path
+import wandb
+from loguru import logger
 
+from src.config.config import TradingConfig
+from src.models.nlnn import ActorCritic
+from src.data.features import FeatureExtractor
+from src.env.bybit_env import BybitFuturesEnv
+from src.utils.risk_manager import RiskManager
+
+class Trainer:
+    def __init__(self, config: TradingConfig):
+        self.config = config
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Initialize components
+        self.env = BybitFuturesEnv(config)
+        self.feature_extractor = FeatureExtractor(config)
+        self.risk_manager = RiskManager(config)
+        
+        # Initialize model and optimizer
+        self.model = ActorCritic(
+            input_size=config.model.feature_dim,
+            hidden_size=config.model.hidden_size,
+            num_layers=config.model.num_layers
+        ).to(self.device)
+        
+        self.optimizer = optim.Adam(
+            self.model.parameters(),
+            lr=config.model.learning_rate
+        )
+        
+        # Initialize mixed precision training
+        self.scaler = GradScaler()
+        
+        # Initialize experience buffer
+        self.buffer_size = config.training.update_interval
+        self.clear_buffers()
+        
+        # Setup wandb logging
+        wandb.init(
+            project="nlnn-trading",
+            config=config.dict(),
+            name=f"train_{int(time.time())}"
+        )
+    
+    def clear_buffers(self):
+        """Reset experience buffers"""
+        self.states = []
+        self.actions = []
+        self.rewards = []
+        self.values = []
+        self.log_probs = []
+        self.hidden_states = []
+        self.masks = []
+    
+    @torch.compile
+    def compute_gae(self,
+                    rewards: torch.Tensor,
+                    values: torch.Tensor,
+                    masks: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute Generalized Advantage Estimation"""
+        advantages = torch.zeros_like(rewards)
+        returns = torch.zeros_like(rewards)
+        running_return = 0
+        running_advantage = 0
+        
+        for t in reversed(range(len(rewards))):
+            if t < len(rewards) - 1:
+                next_value = values[t + 1]
+            else:
+                next_value = 0
+                
+            running_return = rewards[t] + self.config.training.gamma * running_return * masks[t]
+            running_tderror = (
+                rewards[t] + 
+                self.config.training.gamma * next_value * masks[t] - 
+                values[t]
+            )
+            running_advantage = (
+                running_tderror + 
+                self.config.training.gamma * 
+                self.config.training.gae_lambda * 
+                running_advantage * 
+                masks[t]
+            )
+            
+            returns[t] = running_return
+            advantages[t] = running_advantage
+            
+        return returns, advantages
+    
+    def train_step(self) -> Dict[str, float]:
+        """Perform a single training step"""
+        # Convert buffers to tensors
+        states = torch.cat(self.states)
+        actions = torch.tensor(self.actions, device=self.device)
+        rewards = torch.tensor(self.rewards, device=self.device)
+        old_values = torch.cat(self.values)
+        old_log_probs = torch.cat(self.log_probs)
+        masks = torch.tensor(self.masks, device=self.device)
+        
+        # Compute returns and advantages
+        returns, advantages = self.compute_gae(rewards, old_values, masks)
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        # Prepare batches
+        batch_size = len(states) // self.config.training.num_minibatches
+        indices = np.arange(len(states))
+        
+        # Training metrics
+        metrics = {
+            "value_loss": 0,
+            "policy_loss": 0,
+            "entropy_loss": 0,
+            "total_loss": 0
+        }
+        
+        # Perform multiple epochs of training
+        for _ in range(self.config.training.num_epochs):
+            np.random.shuffle(indices)
+            
+            for start in range(0, len(states), batch_size):
+                end = start + batch_size
+                batch_indices = indices[start:end]
+                
+                # Get batch data
+                batch_states = states[batch_indices]
+                batch_actions = actions[batch_indices]
+                batch_returns = returns[batch_indices]
+                batch_advantages = advantages[batch_indices]
+                batch_old_values = old_values[batch_indices]
+                batch_old_log_probs = old_log_probs[batch_indices]
+                
+                # Forwar
+
+// File: src\utils\indicators.py
+import numpy as np
+import pandas as pd
+import ta
+from typing import List, Union
+from dataclasses import dataclass
+
+@dataclass
+class IndicatorConfig:
+    rsi_period: int = 14
+    macd_fast: int = 12
+    macd_slow: int = 26
+    macd_signal: int = 9
+    bb_period: int = 20
+    bb_std: int = 2
+    
+class TechnicalIndicators:
+    def __init__(self, config: IndicatorConfig = None):
+        self.config = config or IndicatorConfig()
+        
+    def calculate_all(self, prices: Union[List[float], np.ndarray]) -> dict:
+        """Calculate all technical indicators"""
+        df = pd.DataFrame({'close': prices})
+        
+        indicators = {}
+        
+        # RSI
+        indicators['rsi'] = self.calculate_rsi(df)
+        
+        # MACD
+        macd_data = self.calculate_macd(df)
+        indicators.update(macd_data)
+        
+        # Bollinger Bands
+        bb_data = self.calculate_bollinger_bands(df)
+        indicators.update(bb_data)
+        
+        # Volatility
+        indicators['volatility'] = self.calculate_volatility(df)
+        
+        return indicators
+        
+    def calculate_rsi(self, df: pd.DataFrame) -> float:
+        """Calculate Relative Strength Index"""
+        rsi = ta.momentum.RSIIndicator(
+            close=df['close'],
+            window=self.config.rsi_period
+        )
+        return rsi.rsi().iloc[-1]
+        
+    def calculate_macd(self, df: pd.DataFrame) -> dict:
+        """Calculate MACD indicator"""
+        macd = ta.trend.MACD(
+            close=df['close'],
+            window_slow=self.config.macd_slow,
+            window_fast=self.config.macd_fast,
+            window_sign=self.config.macd_signal
+        )
+        return {
+            'macd': macd.macd().iloc[-1],
+            'macd_signal': macd.macd_signal().iloc[-1],
+            'macd_diff': macd.macd_diff().iloc[-1]
+        }
+        
+    def calculate_bollinger_bands(self, df: pd.DataFrame) -> dict:
+        """Calculate Bollinger Bands"""
+        bb = ta.volatility.BollingerBands(
+            close=df['close'],
+            window=self.config.bb_period,
+            window_dev=self.config.bb_std
+        )
+        return {
+            'bb_high': bb.bollinger_hband().iloc[-1],
+            'bb_mid': bb.bollinger_mavg().iloc[-1],
+            'bb_low': bb.bollinger_lband().iloc[-1]
+        }
+        
+    def calculate_volatility(self, df: pd.DataFrame, window: int = 20) -> float:
+        """Calculate price volatility"""
+        returns = df['close'].pct_change()
+        return returns.std() * np.sqrt(252)  # Annualized volatility
+
+// File: src\utils\logging.py
+from loguru import logger
+import sys
+from pathlib import Path
+from datetime import datetime
+import json
+from typing import Dict, Any
+
+class CustomLogger:
+    def __init__(self, log_dir: str = "logs"):
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(exist_ok=True)
+        
+        # Remove default logger and set up our custom configuration
+        logger.remove()
+        
+        # Add file handler
+        log_file = self.log_dir / f"trading_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        logger.add(
+            log_file,
+            format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
+            level="INFO",
+            rotation="1 day",
+            compression="zip"
+        )
+        
+        # Add console handler
+        logger.add(
+            sys.stdout,
+            format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+            level="INFO"
+        )
+        
+    def log_metrics(self, metrics: Dict[str, Any], step: int):
+        """Log metrics to both file and wandb if configured"""
+        metrics_str = json.dumps(metrics)
+        logger.info(f"Step {step} metrics: {metrics_str}")
+
+custom_logger = CustomLogger()  # Singleton instance
+
+// File: src\utils\risk_manager.py
+import numpy as np
+from typing import Dict, Tuple, List
+from dataclasses import dataclass
+import threading
+from concurrent.futures import ThreadPoolExecutor
+import time
+from collections import deque
+from loguru import logger
+import torch
+
+@dataclass
+class RiskConfig:
+    max_position_size: float = 0.1
+    stop_loss_pct: float = 0.02
+    take_profit_pct: float = 0.04
+    max_leverage: float = 5.0
+    min_trade_interval: float = 1.0  # seconds
+    max_drawdown: float = 0.2
+    position_sizing_method: str = "adaptive_kelly"
+    num_threads: int = 24  # Optimized for Ryzen 9 7900X
+    risk_check_batch_size: int = 1000
+    use_cuda: bool = True
+
+class Position:
+    def __init__(self, size: float, entry_price: float, entry_time: float):
+        self.size = size
+        self.entry_price = entry_price
+        self.entry_time = entry_time
+        self.stop_loss = None
+        self.take_profit = None
+        self.unrealized_pnl = 0.0
+        self.realized_pnl = 0.0
+
+class EnhancedRiskManager:
+    """Hardware-optimized risk management system"""
+    
+    def __init__(self, config: RiskConfig):
+        self.config = config
+        self.device = torch.device("cuda" if torch.cuda.is_available() and config.use_cuda else "cpu")
+        
+        # Initialize thread pool for parallel processing
+        self.thread_pool = ThreadPoolExecutor(max_workers=config.num_threads)
+        
+        # Position management
+        self.positions: Dict[str, Position] = {}
+        self.position_lock = threading.Lock()
+        
+        # Performance tracking
+        self.trades_history = deque(maxlen=1000)
+        self.pnl_history = deque(maxlen=1000)
+        self.last_trade_time = 0
+        
+        # Risk metrics
+        self.current_drawdown = 0.0
+        self.peak_equity = 0.0
+        self.win_rate = 0.5  # Initial estimate
+        
+        # Batch processing buffers
+        self.pending_actions = []
+        self.pending_prices = []
+        self.pending_timestamps = []
+        
+        # CUDA streams for parallel computation
+        self.streams = None
+        if self.device.type == 'cuda':
+            self.streams = [torch.cuda.Stream() for _ in range(2)]
+
+    def validate_action_batch(self, 
+                            actions: List[int],
+                            prices: List[float],
+                            account_balance: float) -> List[Tuple[bool, str]]:
+        """Validate multiple actions in parallel"""
+        if self.device.type == 'cuda':
+            return self._validate_action_batch_gpu(actions, prices, account_balance)
+        else:
+            return self._validate_action_batch_cpu(actions, prices, account_balance)
+
+    @torch.compile
+    def _validate_action_batch_gpu(self,
+                                 actions: List[int],
+                                 prices: List[float],
+                                 account_balance: float) -> List[Tuple[bool, str]]:
+        """GPU-accelerated batch action validation"""
+        with torch.cuda.amp.autocast():
+            # Convert inputs to tensors
+            actions_tensor = torch.tensor(actions, device=self.device)
+            prices_tensor = torch.tensor(prices, device=self.device)
+            
+            # Calculate position sizes
+            position_sizes = self._calculate_position_sizes_gpu(
+                actions_tensor, prices_tensor, account_balance
+            )
+            
+            # Check position limits
+            position_valid = torch.abs(position_sizes) <= (
+                self.config.max_position_size * account_balance
+            )
+            
+            # Check leverage limits
+            leverage = torch.abs(position_sizes * prices_tensor) / account_balance
+            leverage_valid = leverage <= self.config.max_leverage
+            
+            # Check trading frequency
+            current_time = time.time()
+            time_valid = (current_time - self.last_trade_time) >= self.config.min_trade_interval
+            
+            # Combine all checks
+            valid = position_valid & leverage_valid & torch.full_like(
+                position_valid, time_valid, dtype=torch.bool
+            )
+            
+            # Generate messages
+            messages = []
+            for i, (p_valid, l_valid, is_valid) in enumerate(
+                zip(position_valid.cpu(), leverage_valid.cpu(), valid.cpu())
+            ):
+                if not is_valid:
+                    if not time_valid:
+                        messages.append("Trading too frequently")
+                    elif not p_valid:
+                        messages.append("Position size exceeds maximum")
+                    elif not l_valid:
+                        messages.append("Leverage exceeds maximum")
+                else:
+                    messages.append("")
+            
+            return list(zip(valid.cpu().tolist(), messages))
+
+    def _validate_action_batch_cpu(self,
+                                 actions: List[int],
+                                 prices: List[float],
+                                 account_balance: float) -> List[Tuple[bool, str]]:
+        """CPU-based parallel action validation"""
+        def validate_single(args):
+            action, price = args
+            return self._validate_single_action(action, price, account_balance)
+        
+        # Process validations in parallel
+        with ThreadPoolExecutor(max_workers=self.config.num_threads) as executor:
+            results = list(executor.map(validate_single, zip(actions, prices)))
+        
+        return results
+
+    def _validate_single_action(self,
+                              action: int,
+                              current_price: float,
+                              account_balance: float) -> Tuple[bool, str]:
+        """Validate a single action with all risk checks"""
+        current_time = time.time()
+        
+        # Check trading frequency
+        if current_time - self.last_trade_time < self.config.min_trade_interval:
+            return False, "Trading too frequently"
+        
+        # Calculate position size
+        position_size = self._calculate_adaptive_position_size(
+            action, current_price, account_balance
+        )
+        
+        # Check position limits
+        if abs(position_size) > self.config.max_position_size * account_balance:
+            return False, "Position size exceeds maximum"
+        
+        # Check leverage
+        leverage = abs(position_size * current_price) / account_balance
+        if leverage > self.config.max_leverage:
+            return False, "Leverage exceeds maximum"
+        
+        # Check drawdown
+        if self.current_drawdown > self.config.max_drawdown:
+            return False, "Maximum drawdown exceeded"
+        
+        return True, ""
+
+    @torch.compile
+    def _calculate_position_sizes_gpu(self,
+                                    actions: torch.Tensor,
+                                    prices: torch.Tensor,
+                                    account_balance: float) -> torch.Tensor:
+        """Calculate position sizes using GPU acceleration"""
+        # Base position size
+        base_size = account_balance * self.config.max_position_size
+        
+        # Calculate adaptive Kelly criterion
+        kelly_fraction = self._calculate_kelly_fraction_gpu
+
+// File: src\utils\system_monitor.py
+import psutil
+import GPUtil
+from dataclasses import dataclass
+from typing import List, Dict
+import numpy as np
+from loguru import logger
+
+@dataclass
+class SystemMetrics:
+    cpu_percent: float
+    memory_percent: float
+    gpu_utilization: List[float]
+    gpu_memory_utilization: List[float]
+
+class SystemMonitor:
+    def __init__(self):
+        self.metrics_history: List[SystemMetrics] = []
+        
+    def get_metrics(self) -> SystemMetrics:
+        """Get current system metrics"""
+        try:
+            # CPU and Memory
+            cpu_percent = psutil.cpu_percent(interval=1)
+            memory_percent = psutil.virtual_memory().percent
+            
+            # GPU metrics
+            gpus = GPUtil.getGPUs()
+            gpu_utilization = [gpu.load * 100 for gpu in gpus]
+            gpu_memory_utilization = [gpu.memoryUtil * 100 for gpu in gpus]
+            
+            metrics = SystemMetrics(
+                cpu_percent=cpu_percent,
+                memory_percent=memory_percent,
+                gpu_utilization=gpu_utilization,
+                gpu_memory_utilization=gpu_memory_utilization
+            )
+            
+            self.metrics_history.append(metrics)
+            return metrics
+            
+        except Exception as e:
+            logger.error(f"Error getting system metrics: {str(e)}")
+            return SystemMetrics(0.0, 0.0, [], [])
+            
+    def get_metrics_summary(self) -> Dict[str, float]:
+        """Get summary statistics of system metrics"""
+        if not self.metrics_history:
+            return {}
+            
+        metrics_array = np.array([
+            [m.cpu_percent, m.memory_percent] +
+            m.gpu_utilization +
+            m.gpu_memory_utilization
+            for m in self.metrics_history
+        ])
+        
+        return {
+            'cpu_mean': np.mean(metrics_array[:, 0]),
+            'cpu_max': np.max(metrics_array[:, 0]),
+            'memory_mean': np.mean(metrics_array[:, 1]),
+            'memory_max': np.max(metrics_array[:, 1]),
+            'gpu_util_mean': np.mean(metrics_array[:, 2:2+len(self.metrics_history[0].gpu_utilization)]),
+            'gpu_memory_mean': np.mean(metrics_array[:, -len(self.metrics_history[0].gpu_memory_utilization):])
+        }
 
 // File: src\utils\__init__.py
 
