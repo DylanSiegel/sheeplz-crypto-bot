@@ -4,10 +4,17 @@
     - setup.py
   src\config
     - config.py
+    - features.py
+    - hardware.py
+    - model.py
+    - risk.py
+    - training.py
     - __init__.py
   src\data
     - features.py
+    - indicators.py
     - processor.py
+    - webscoket_bybit.py
     - __init__.py
   src\env
     - bybit_env.py
@@ -23,7 +30,6 @@
   src\training
     - trainer.py
   src\utils
-    - indicators.py
     - logging.py
     - risk_manager.py
     - system_monitor.py
@@ -154,37 +160,133 @@ if __name__ == "__main__":
     setup_environment()
 
 // File: src\config\config.py
-from dataclasses import dataclass
-from typing import List, Optional
+# config.py
+
 from pydantic import BaseModel, Field
+from typing import List
+from .hardware import HardwareConfig
+from .model import ModelConfig
+from .risk import RiskConfig
+from .features import FeatureConfig
+from .training import TrainingConfig
+
+class TradingConfig(BaseModel):
+    """Master configuration class.
+
+    This class aggregates all configuration settings for the trading agent and its environment.
+
+    Attributes:
+        hardware (HardwareConfig): Configuration for hardware resources.
+        model (ModelConfig): Configuration for the neural network model.
+        risk (RiskConfig): Configuration for risk management parameters.
+        feature (FeatureConfig): Configuration for feature extraction.
+        training (TrainingConfig): Configuration for the training process.
+
+    Methods:
+        optimize_for_hardware(): Optimizes the configuration based on the detected hardware capabilities.
+
+    """
+    hardware: HardwareConfig = Field(default_factory=HardwareConfig)
+    model: ModelConfig = Field(default_factory=ModelConfig)
+    risk: RiskConfig = Field(default_factory=RiskConfig)
+    feature: FeatureConfig = Field(default_factory=FeatureConfig)
+    training: TrainingConfig = Field(default_factory=TrainingConfig)
+
+    def optimize_for_hardware(self):
+        """Optimizes configuration for current hardware.
+
+        This method adjusts certain parameters (primarily batch size) based on available GPU memory.
+        It also sets the number of threads used by PyTorch to optimize performance.
+        """
+        if self.hardware.cuda_available:
+            gpu_mem = torch.cuda.get_device_properties(0).total_memory
+            self.model.batch_size = min(self.model.batch_size, int(gpu_mem * 0.7 / (self.model.feature_dim * 4)))
+        torch.set_num_threads(self.hardware.torch_num_threads)
+        if self.hardware.cuda_available:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        return self
+
+def create_default_config() -> TradingConfig:
+    """Creates and returns a default configuration, optimized for the current hardware."""
+    config = TradingConfig()
+    return config.optimize_for_hardware()
+
 import torch
+
+# Example of how to save the default config to a file (config.pt)
+config = create_default_config()
+torch.save(config.model_dump(), "config.pt")
+
+// File: src\config\features.py
+from pydantic import BaseModel, Field
+from typing import List
+
+class FeatureConfig(BaseModel):
+    """Feature extraction configuration.
+
+    This class defines parameters for extracting features from market data.  These features are used as input to the trading agent's neural network.
+
+    Attributes:
+        rolling_window_size (int): The size of the rolling window used for calculating features.  A larger window considers more historical data but might make the features less responsive to recent changes.
+        technical_indicators (List[str]): A list of technical indicators to calculate.  These indicators provide insights into market trends and momentum.  Supported indicators depend on your `ta` library version.
+        market_features (List[str]): A list of raw market features to include. These are typically directly from the market data (e.g., price, volume).
+        normalization_method (str): The method used for normalizing features.  Normalization is essential to prevent features with larger scales from dominating the model's learning.
+
+
+    """
+    rolling_window_size: int = Field(100, description="Size of rolling window for features")
+    technical_indicators: List[str] = Field(default=["rsi", "macd", "bbands", "volatility"], description="List of technical indicators to use")
+    market_features: List[str] = Field(default=["price", "volume", "spread", "depth", "funding_rate"], description="List of market features to use")
+    normalization_method: str = Field("standard", description="Feature normalization method")
+
+// File: src\config\hardware.py
+from pydantic import BaseModel, Field
 import psutil
+import torch
 
 class HardwareConfig(BaseModel):
-    """Hardware-specific configuration"""
-    num_cpu_threads: int = Field(
-        default_factory=lambda: psutil.cpu_count(logical=True),
-        description="Number of CPU threads to use"
-    )
-    cuda_available: bool = Field(
-        default_factory=lambda: torch.cuda.is_available(),
-        description="Whether CUDA is available"
-    )
-    gpu_memory_limit: int = Field(
-        default=7168,  # 7GB for NVIDIA 3070, leaving 1GB for system
-        description="GPU memory limit in MB"
-    )
-    torch_num_threads: int = Field(
-        default=12,  # Optimized for Ryzen 9 7900X
-        description="Number of threads for PyTorch"
-    )
-    pin_memory: bool = Field(
-        default=True,
-        description="Use pinned memory for faster GPU transfer"
-    )
+    """Hardware-specific configuration.
+
+    This class encapsulates settings related to the hardware resources used by the trading agent.
+    It automatically detects certain hardware features and provides options for optimization.
+
+    Attributes:
+        num_cpu_threads (int): The number of CPU threads to utilize for parallel processing. 
+                               Defaults to the number of logical CPU cores detected by `psutil`.
+        cuda_available (bool): A boolean indicating whether CUDA (GPU acceleration) is available. 
+                               Automatically detected by PyTorch.
+        gpu_memory_limit (int): The maximum amount of GPU memory (in MB) to allocate for training. 
+                               Defaults to 7168 MB (7GB), leaving 1GB for system use on an NVIDIA 3070.  Adjust this based on your GPU's VRAM.
+        torch_num_threads (int): The number of threads PyTorch should use. Defaults to 12 (optimized for Ryzen 9 7900X). Adjust for your CPU.
+        pin_memory (bool): A boolean flag indicating whether to use pinned memory for faster data transfer between CPU and GPU. Defaults to True.  Generally recommended for GPU usage.
+
+    """
+    num_cpu_threads: int = Field(default_factory=lambda: psutil.cpu_count(logical=True), description="Number of CPU threads to use")
+    cuda_available: bool = Field(default_factory=lambda: torch.cuda.is_available(), description="Whether CUDA is available")
+    gpu_memory_limit: int = Field(default=7168, description="GPU memory limit in MB")
+    torch_num_threads: int = Field(default=12, description="Number of threads for PyTorch")
+    pin_memory: bool = Field(default=True, description="Use pinned memory for faster GPU transfer")
+
+// File: src\config\model.py
+from pydantic import BaseModel, Field
 
 class ModelConfig(BaseModel):
-    """Neural network configuration"""
+    """Neural network configuration.
+
+    This class defines the architecture and training hyperparameters for the neural network model.
+
+    Attributes:
+        feature_dim (int): The dimensionality of the input feature vector.  This should match the output of your feature extractor.
+        hidden_size (int): The number of neurons in each hidden layer of the neural network.
+        num_layers (int): The number of hidden layers in the n-LNN (novel neural network) architecture.
+        dropout (float): The dropout rate used for regularization during training (a value between 0 and 1).
+        learning_rate (float): The learning rate used by the optimizer.  This controls the step size during gradient descent.
+        batch_size (int): The size of the mini-batches used during training.  Larger batch sizes can improve training speed but require more memory.
+        sequence_length (int): The length of the input sequences used for training the recurrent layers (if applicable).  This is relevant if your model has RNN components.
+        gradient_clip (float): The maximum value for gradient clipping to prevent exploding gradients during training.  This helps stabilize training.
+
+    """
     feature_dim: int = Field(64, description="Input feature dimension")
     hidden_size: int = Field(256, description="Hidden layer size")
     num_layers: int = Field(4, description="Number of n-LNN layers")
@@ -194,40 +296,52 @@ class ModelConfig(BaseModel):
     sequence_length: int = Field(100, description="Sequence length for training")
     gradient_clip: float = Field(1.0, description="Gradient clipping value")
 
+// File: src\config\risk.py
+from pydantic import BaseModel, Field
+
 class RiskConfig(BaseModel):
-    """Risk management configuration"""
+    """Risk management configuration.
+
+    This class defines parameters to control risk during trading.  These parameters are crucial for preventing excessive losses.
+
+    Attributes:
+        max_position_size (float): The maximum fraction of the account balance that can be used for a single position.  A value between 0 and 1.  For example, 0.1 means a maximum of 10% of the account balance can be risked on any one trade.
+        stop_loss_pct (float): The percentage loss at which an open position will be automatically closed (stop-loss order).  A value between 0 and 1.  For example, 0.02 means a stop-loss order will be triggered if the position incurs a 2% loss.
+        take_profit_pct (float): The percentage profit at which an open position will be automatically closed (take-profit order). A value between 0 and 1. For example, 0.04 means a take-profit order will be triggered if the position achieves a 4% profit.
+        max_leverage (float): The maximum leverage allowed for trades.  This magnifies both profits and losses.  Higher leverage increases risk.
+        min_trade_interval (int): The minimum time (in seconds) between consecutive trades to avoid excessive trading frequency.  This helps to avoid over-trading and potential slippage.
+        max_drawdown (float): The maximum acceptable drawdown (percentage loss from peak equity) before trading is stopped.  This parameter helps to prevent catastrophic losses.
+        position_sizing_method (str): The method used for determining position sizes.  This could be 'kelly' (Kelly criterion), 'fixed', or another custom method.
+
+    """
     max_position_size: float = Field(0.1, description="Maximum position size as fraction of capital")
     stop_loss_pct: float = Field(0.02, description="Stop loss percentage")
     take_profit_pct: float = Field(0.04, description="Take profit percentage")
     max_leverage: float = Field(5.0, description="Maximum allowed leverage")
-    min_trade_interval: int = Field(5, description="Minimum intervals between trades")
+    min_trade_interval: int = Field(5, description="Minimum time interval between trades (seconds)")
     max_drawdown: float = Field(0.2, description="Maximum allowed drawdown")
     position_sizing_method: str = Field("kelly", description="Position sizing method")
 
-class FeatureConfig(BaseModel):
-    """Feature extraction configuration"""
-    rolling_window_size: int = Field(100, description="Size of rolling window for features")
-    technical_indicators: List[str] = Field(
-        default=["rsi", "macd", "bbands", "volatility"],
-        description="List of technical indicators to use"
-    )
-    market_features: List[str] = Field(
-        default=[
-            "price",
-            "volume",
-            "spread",
-            "depth",
-            "funding_rate"
-        ],
-        description="List of market features to use"
-    )
-    normalization_method: str = Field(
-        "standard",
-        description="Feature normalization method"
-    )
+// File: src\config\training.py
+from pydantic import BaseModel, Field
 
 class TrainingConfig(BaseModel):
-    """Training configuration"""
+    """Training configuration.
+
+    This class contains hyperparameters for the reinforcement learning training process.
+
+    Attributes:
+        num_episodes (int): The total number of training episodes.
+        gamma (float): The discount factor used in the reinforcement learning algorithm.  This determines the importance of future rewards. A value closer to 1 emphasizes long-term rewards.
+        gae_lambda (float): The lambda parameter for Generalized Advantage Estimation (GAE).  This parameter controls the bias-variance tradeoff in GAE.
+        entropy_coef (float): The coefficient for the entropy bonus in the loss function.  This encourages exploration during training.
+        value_loss_coef (float): The coefficient for the value function loss in the loss function.  This balances the policy loss and value function loss.
+        max_grad_norm (float): The maximum norm for gradient clipping to prevent exploding gradients during training.  Gradient clipping helps stabilize training.
+        update_interval (int): The number of steps between policy updates.  More frequent updates might lead to faster learning but can be more noisy.
+        num_minibatches (int): The number of minibatches used for each policy update. This parameter is used in algorithms like PPO to reduce computational cost.
+        warmup_steps (int): The number of initial steps during which the policy is not updated.  This allows the agent to gather some initial experience before updating the policy.
+
+    """
     num_episodes: int = Field(10000, description="Number of training episodes")
     gamma: float = Field(0.99, description="Discount factor")
     gae_lambda: float = Field(0.95, description="GAE lambda parameter")
@@ -238,233 +352,210 @@ class TrainingConfig(BaseModel):
     num_minibatches: int = Field(4, description="Number of minibatches per update")
     warmup_steps: int = Field(1000, description="Number of warmup steps")
 
-class TradingConfig(BaseModel):
-    """Master configuration class"""
-    hardware: HardwareConfig = Field(default_factory=HardwareConfig)
-    model: ModelConfig = Field(default_factory=ModelConfig)
-    risk: RiskConfig = Field(default_factory=RiskConfig)
-    feature: FeatureConfig = Field(default_factory=FeatureConfig)
-    training: TrainingConfig = Field(default_factory=TrainingConfig)
-    
-    def optimize_for_hardware(self):
-        """Optimize configuration for current hardware"""
-        # Optimize batch size based on GPU memory
-        if self.hardware.cuda_available:
-            gpu_mem = torch.cuda.get_device_properties(0).total_memory
-            self.model.batch_size = min(
-                self.model.batch_size,
-                int(gpu_mem * 0.7 / (self.model.feature_dim * 4))  # 4 bytes per float
-            )
-        
-        # Optimize number of threads
-        torch.set_num_threads(self.hardware.torch_num_threads)
-        
-        # Enable TF32 for faster training on Ampere GPUs
-        if self.hardware.cuda_available:
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-        
-        return self
-
-def create_default_config() -> TradingConfig:
-    """Create and return a default configuration"""
-    config = TradingConfig()
-    return config.optimize_for_hardware()
-
 // File: src\config\__init__.py
 
 
 // File: src\data\features.py
-import torch
 import numpy as np
-from typing import Dict, List, Optional, Tuple
-from collections import deque
+import pandas as pd
+import ta
+from typing import List, Union
 from dataclasses import dataclass
-import threading
-from concurrent.futures import ThreadPoolExecutor
-from joblib import Parallel, delayed
-import talib
-from loguru import logger
 
 @dataclass
-class FeatureConfig:
-    rolling_window_size: int = 100
+class IndicatorConfig:
+    """Configuration for technical indicator calculations.
+
+    Attributes:
+        rsi_period (int): The period for Relative Strength Index (RSI) calculation.
+        macd_fast (int): The fast period for Moving Average Convergence Divergence (MACD) calculation.
+        macd_slow (int): The slow period for MACD calculation.
+        macd_signal (int): The signal period for MACD calculation.
+        bb_period (int): The period for Bollinger Bands calculation.
+        bb_std (int): The standard deviation multiplier for Bollinger Bands calculation.
+
+    """
     rsi_period: int = 14
-    volatility_window: int = 20
-    num_threads: int = 24  # Optimized for Ryzen 9 7900X
-    use_cuda: bool = True
-    batch_size: int = 512
-    feature_dim: int = 10
+    macd_fast: int = 12
+    macd_slow: int = 26
+    macd_signal: int = 9
+    bb_period: int = 20
+    bb_std: int = 2
 
-class EnhancedFeatureExtractor:
-    """Hardware-optimized feature extractor for high-frequency trading"""
+class TechnicalIndicators:
+    """Calculates various technical indicators from price data.
+
+    This class uses the `TA-Lib` library to efficiently compute several common technical indicators.
+
+    Args:
+        config (IndicatorConfig, optional): Configuration object specifying parameters for indicator calculations. 
+                                            Defaults to `IndicatorConfig()`.
+
+    Methods:
+        calculate_all(prices: Union[List[float], np.ndarray]) -> dict: Calculates all configured indicators.
+        calculate_rsi(df: pd.DataFrame) -> float: Calculates the Relative Strength Index (RSI).
+        calculate_macd(df: pd.DataFrame) -> dict: Calculates the Moving Average Convergence Divergence (MACD) and its signal and difference.
+        calculate_bollinger_bands(df: pd.DataFrame) -> dict: Calculates the Bollinger Bands (upper, middle, lower).
+        calculate_volatility(df: pd.DataFrame, window: int = 20) -> float: Calculates annualized volatility.
+
+    """
+    def __init__(self, config: IndicatorConfig = None):
+        self.config = config or IndicatorConfig()
+
+    def calculate_all(self, prices: Union[List[float], np.ndarray]) -> dict:
+        """Calculates all configured technical indicators.
+
+        Args:
+            prices (Union[List[float], np.ndarray]): A list or NumPy array of closing prices.
+
+        Returns:
+            dict: A dictionary containing all calculated indicators.
+
+        """
+        df = pd.DataFrame({'close': prices})
+        indicators = {}
+        indicators['rsi'] = self.calculate_rsi(df)
+        macd_data = self.calculate_macd(df)
+        indicators.update(macd_data)
+        bb_data = self.calculate_bollinger_bands(df)
+        indicators.update(bb_data)
+        indicators['volatility'] = self.calculate_volatility(df)
+        return indicators
+
+    def calculate_rsi(self, df: pd.DataFrame) -> float:
+        """Calculates the Relative Strength Index (RSI).
+
+        Args:
+            df (pd.DataFrame): Pandas DataFrame with a 'close' column containing closing prices.
+
+        Returns:
+            float: The RSI value.
+
+        """
+        rsi = ta.momentum.RSIIndicator(close=df['close'], window=self.config.rsi_period)
+        return rsi.rsi().iloc[-1]
+
+    def calculate_macd(self, df: pd.DataFrame) -> dict:
+        """Calculates the Moving Average Convergence Divergence (MACD) and its signal and difference.
+
+        Args:
+            df (pd.DataFrame): Pandas DataFrame with a 'close' column containing closing prices.
+
+        Returns:
+            dict: A dictionary containing the MACD, MACD signal, and MACD difference.
+
+        """
+        macd = ta.trend.MACD(close=df['close'], window_slow=self.config.macd_slow, window_fast=self.config.macd_fast, window_sign=self.config.macd_signal)
+        return {'macd': macd.macd().iloc[-1], 'macd_signal': macd.macd_signal().iloc[-1], 'macd_diff': macd.macd_diff().iloc[-1]}
+
+    def calculate_bollinger_bands(self, df: pd.DataFrame) -> dict:
+        """Calculates the Bollinger Bands (upper, middle, lower).
+
+        Args:
+            df (pd.DataFrame): Pandas DataFrame with a 'close' column containing closing prices.
+
+        Returns:
+            dict: A dictionary containing the upper, middle, and lower Bollinger Bands.
+
+        """
+        bb = ta.volatility.BollingerBands(close=df['close'], window=self.config.bb_period, window_dev=self.config.bb_std)
+        return {'bb_high': bb.bollinger_hband().iloc[-1], 'bb_mid': bb.bollinger_mavg().iloc[-1], 'bb_low': bb.bollinger_lband().iloc[-1]}
+
+    def calculate_volatility(self, df: pd.DataFrame, window: int = 20) -> float:
+        """Calculates annualized volatility.
+
+        Args:
+            df (pd.DataFrame): Pandas DataFrame with a 'close' column containing closing prices.
+            window (int, optional): The rolling window size for volatility calculation. Defaults to 20.
+
+        Returns:
+            float: The annualized volatility.
+
+        """
+        returns = df['close'].pct_change()
+        return returns.std() * np.sqrt(252)  # Annualized volatility
+
+// File: src\data\indicators.py
+import numpy as np
+import pandas as pd
+import ta
+from typing import List, Union
+from dataclasses import dataclass
+
+@dataclass
+class IndicatorConfig:
+    rsi_period: int = 14
+    macd_fast: int = 12
+    macd_slow: int = 26
+    macd_signal: int = 9
+    bb_period: int = 20
+    bb_std: int = 2
     
-    def __init__(self, config: FeatureConfig):
-        self.config = config
-        self.device = torch.device("cuda" if torch.cuda.is_available() and config.use_cuda else "cpu")
+class TechnicalIndicators:
+    def __init__(self, config: IndicatorConfig = None):
+        self.config = config or IndicatorConfig()
         
-        # Initialize circular buffers on GPU if available
-        self.price_history = torch.zeros(config.rolling_window_size, device=self.device)
-        self.volume_history = torch.zeros(config.rolling_window_size, device=self.device)
-        self.current_idx = 0
+    def calculate_all(self, prices: Union[List[float], np.ndarray]) -> dict:
+        """Calculate all technical indicators"""
+        df = pd.DataFrame({'close': prices})
         
-        # Initialize thread pool for CPU calculations
-        self.thread_pool = ThreadPoolExecutor(max_workers=config.num_threads)
+        indicators = {}
         
-        # Pre-allocate buffers for technical indicators
-        self.rsi_buffer = torch.zeros(config.rolling_window_size, device=self.device)
-        self.volatility_buffer = torch.zeros(config.rolling_window_size, device=self.device)
+        # RSI
+        indicators['rsi'] = self.calculate_rsi(df)
         
-        # CUDA streams for parallel computation
-        self.streams = None
-        if self.device.type == 'cuda':
-            self.streams = [torch.cuda.Stream() for _ in range(3)]
-            
-    def update_history(self, price: float, volume: float):
-        """Update price and volume history with new data"""
-        self.price_history[self.current_idx] = price
-        self.volume_history[self.current_idx] = volume
-        self.current_idx = (self.current_idx + 1) % self.config.rolling_window_size
-
-    @torch.compile
-    def calculate_features_gpu(self, market_data: Dict[str, float]) -> torch.Tensor:
-        """Calculate features using GPU acceleration"""
-        with torch.cuda.amp.autocast():
-            # Update histories
-            self.update_history(market_data['close_price'], market_data['volume'])
-            
-            # Calculate basic features in parallel streams
-            if self.streams:
-                # Stream 1: Price-based features
-                with torch.cuda.stream(self.streams[0]):
-                    price_features = self._calculate_price_features(market_data)
-                
-                # Stream 2: Volume-based features
-                with torch.cuda.stream(self.streams[1]):
-                    volume_features = self._calculate_volume_features(market_data)
-                
-                # Stream 3: Technical indicators
-                with torch.cuda.stream(self.streams[2]):
-                    technical_features = self._calculate_technical_features()
-                
-                # Synchronize streams
-                torch.cuda.synchronize()
-                
-                # Combine features
-                features = torch.cat([price_features, volume_features, technical_features])
-            else:
-                features = self._calculate_features_sequential(market_data)
-            
-            return torch.clamp(features, -1, 1)
-
-    @torch.compile
-    def _calculate_price_features(self, market_data: Dict[str, float]) -> torch.Tensor:
-        """Calculate price-related features"""
-        normalized_price = self._normalize_tensor(
-            torch.tensor([market_data['close_price']], device=self.device),
-            self.price_history
+        # MACD
+        macd_data = self.calculate_macd(df)
+        indicators.update(macd_data)
+        
+        # Bollinger Bands
+        bb_data = self.calculate_bollinger_bands(df)
+        indicators.update(bb_data)
+        
+        # Volatility
+        indicators['volatility'] = self.calculate_volatility(df)
+        
+        return indicators
+        
+    def calculate_rsi(self, df: pd.DataFrame) -> float:
+        """Calculate Relative Strength Index"""
+        rsi = ta.momentum.RSIIndicator(
+            close=df['close'],
+            window=self.config.rsi_period
         )
-        spread_feature = torch.tensor(
-            [market_data['bid_ask_spread'] / market_data['close_price']],
-            device=self.device
+        return rsi.rsi().iloc[-1]
+        
+    def calculate_macd(self, df: pd.DataFrame) -> dict:
+        """Calculate MACD indicator"""
+        macd = ta.trend.MACD(
+            close=df['close'],
+            window_slow=self.config.macd_slow,
+            window_fast=self.config.macd_fast,
+            window_sign=self.config.macd_signal
         )
-        funding_feature = torch.tensor(
-            [market_data['funding_rate']],
-            device=self.device
+        return {
+            'macd': macd.macd().iloc[-1],
+            'macd_signal': macd.macd_signal().iloc[-1],
+            'macd_diff': macd.macd_diff().iloc[-1]
+        }
+        
+    def calculate_bollinger_bands(self, df: pd.DataFrame) -> dict:
+        """Calculate Bollinger Bands"""
+        bb = ta.volatility.BollingerBands(
+            close=df['close'],
+            window=self.config.bb_period,
+            window_dev=self.config.bb_std
         )
-        return torch.cat([normalized_price, spread_feature, funding_feature])
-
-    @torch.compile
-    def _calculate_volume_features(self, market_data: Dict[str, float]) -> torch.Tensor:
-        """Calculate volume-related features"""
-        normalized_volume = self._normalize_tensor(
-            torch.tensor([market_data['volume']], device=self.device),
-            self.volume_history
-        )
-        depth_feature = torch.tensor(
-            [market_data['market_depth_ratio']],
-            device=self.device
-        )
-        taker_feature = torch.tensor(
-            [market_data['taker_buy_ratio']],
-            device=self.device
-        )
-        return torch.cat([normalized_volume, depth_feature, taker_feature])
-
-    @torch.compile
-    def _calculate_technical_features(self) -> torch.Tensor:
-        """Calculate technical indicators using GPU"""
-        # Calculate RSI
-        delta = self.price_history.diff()
-        gains = torch.where(delta > 0, delta, torch.zeros_like(delta))
-        losses = torch.where(delta < 0, -delta, torch.zeros_like(delta))
+        return {
+            'bb_high': bb.bollinger_hband().iloc[-1],
+            'bb_mid': bb.bollinger_mavg().iloc[-1],
+            'bb_low': bb.bollinger_lband().iloc[-1]
+        }
         
-        avg_gains = gains.rolling(window=self.config.rsi_period).mean()
-        avg_losses = losses.rolling(window=self.config.rsi_period).mean()
-        
-        rs = avg_gains / (avg_losses + 1e-8)
-        rsi = 100 - (100 / (1 + rs))
-        
-        # Calculate volatility
-        returns = self.price_history.diff() / self.price_history[:-1]
-        volatility = returns.std()
-        
-        # Combine technical features
-        technical_features = torch.stack([
-            rsi[-1] / 100.0,  # Normalize RSI to [0, 1]
-            volatility,
-            returns[-1]  # Most recent return
-        ])
-        
-        return technical_features
-
-    @torch.compile
-    def _normalize_tensor(self, value: torch.Tensor, history: torch.Tensor) -> torch.Tensor:
-        """Normalize values using tensor operations"""
-        min_val = history.min()
-        max_val = history.max()
-        range_val = max_val - min_val
-        
-        # Handle edge case where range is 0
-        mask = range_val > 0
-        normalized = torch.where(
-            mask,
-            (value - min_val) / (range_val + 1e-8) * 2 - 1,
-            torch.zeros_like(value)
-        )
-        return normalized
-
-    def calculate_features(self, market_data: Dict[str, float]) -> np.ndarray:
-        """Main feature calculation method with hardware optimization"""
-        if self.device.type == 'cuda':
-            features = self.calculate_features_gpu(market_data)
-            return features.cpu().numpy()
-        else:
-            # Fallback to CPU implementation with parallel processing
-            return self._calculate_features_cpu(market_data)
-
-    def _calculate_features_cpu(self, market_data: Dict[str, float]) -> np.ndarray:
-        """CPU-based feature calculation with parallel processing"""
-        with Parallel(n_jobs=self.config.num_threads) as parallel:
-            # Split calculations across threads
-            features = parallel(
-                delayed(self._calculate_feature_group)(market_data, group_id)
-                for group_id in range(3)
-            )
-        
-        return np.concatenate(features)
-
-    def _calculate_feature_group(self, market_data: Dict[str, float], group_id: int) -> np.ndarray:
-        """Calculate a group of features in parallel"""
-        if group_id == 0:
-            # Price-based features
-            return self._calculate_price_features_cpu(market_data)
-        elif group_id == 1:
-            # Volume-based features
-            return self._calculate_volume_features_cpu(market_data)
-        else:
-            # Technical indicators
-            return self._calculate_technical_features_cpu()
+    def calculate_volatility(self, df: pd.DataFrame, window: int = 20) -> float:
+        """Calculate price volatility"""
+        returns = df['close'].pct_change()
+        return returns.std() * np.sqrt(252)  # Annualized volatility
 
 // File: src\data\processor.py
 from typing import Dict, List
@@ -491,6 +582,9 @@ class DataProcessor:
         }
         return processed_data
 
+// File: src\data\webscoket_bybit.py
+
+
 // File: src\data\__init__.py
 from .processor import DataProcessor
 from .features import FeatureCalculator
@@ -498,347 +592,148 @@ from .features import FeatureCalculator
 __all__ = ['DataProcessor', 'FeatureCalculator']
 
 // File: src\env\bybit_env.py
-import numpy as np
-import pandas as pd
-from datetime import datetime, timedelta
-import pytest
-from typing import Dict, List, Tuple
-import matplotlib.pyplot as plt
-from dataclasses import dataclass
+import asyncio
+import aiowebsocket
+import json
+import hmac
+import hashlib
+import time
+from loguru import logger
+from src.data.features import EnhancedFeatureExtractor
+# ... other imports ...
 
-@dataclass
-class RewardConfig:
-    """Configuration for multi-factor reward calculation"""
-    # PnL Factors
-    pnl_scale: float = 1.0
-    realized_weight: float = 0.7
-    unrealized_weight: float = 0.3
-    
-    # Risk Factors
-    max_drawdown_penalty: float = -2.0
-    overexposure_penalty: float = -1.0
-    volatility_scale: float = 0.2
-    
-    # Trading Factors
-    entry_reward: float = 0.1
-    exit_reward: float = 0.1
-    holding_cost: float = -0.01
-    spread_penalty: float = -0.1
-    
-    # Market Factors
-    trend_alignment: float = 0.2
-    volume_scale: float = 0.1
-    funding_penalty: float = -0.5
+BYBIT_WEBSOCKET_URL = "wss://stream-testnet.bybit.com/v5/public/linear" #Change to mainnet if needed
 
-class EnhancedReward:
-    """Multi-factor reward calculation system"""
-    
-    def __init__(self, config: RewardConfig):
+class BybitFuturesEnv(gym.Env):
+    def __init__(self, config, api_key=None, api_secret=None):
+        # ... other initializations ...
         self.config = config
-        self.price_history = []
-        self.position_history = []
-        self.pnl_history = []
-        self.peak_equity = 0
-        
-    def calculate_reward(self, 
-                        current_state: Dict,
-                        previous_state: Dict,
-                        action: float,
-                        trade_result: Dict) -> Tuple[float, Dict]:
-        """Calculate comprehensive reward based on multiple factors"""
-        
-        # Update histories
-        self.price_history.append(current_state['market_data']['last_price'])
-        self.position_history.append(current_state['account_data']['position_size'])
-        self.pnl_history.append(current_state['account_data']['wallet_balance'])
-        
-        # Calculate individual reward components
-        pnl_reward = self._calculate_pnl_reward(current_state, previous_state)
-        risk_reward = self._calculate_risk_reward(current_state)
-        trading_reward = self._calculate_trading_reward(current_state, action, trade_result)
-        market_reward = self._calculate_market_reward(current_state)
-        
-        # Combine rewards
-        total_reward = (
-            pnl_reward +
-            risk_reward +
-            trading_reward +
-            market_reward
-        )
-        
-        # Update peak equity
-        self.peak_equity = max(self.peak_equity, current_state['account_data']['wallet_balance'])
-        
-        # Return reward and components for logging
-        components = {
-            'pnl_reward': pnl_reward,
-            'risk_reward': risk_reward,
-            'trading_reward': trading_reward,
-            'market_reward': market_reward,
-            'total_reward': total_reward
-        }
-        
-        return total_reward, components
-    
-    def _calculate_pnl_reward(self, current_state: Dict, previous_state: Dict) -> float:
-        """Calculate PnL-based reward component"""
-        realized_pnl = (
-            current_state['account_data']['wallet_balance'] -
-            previous_state['account_data']['wallet_balance']
-        )
-        unrealized_pnl = current_state['account_data']['unrealized_pnl']
-        
-        return self.config.pnl_scale * (
-            self.config.realized_weight * realized_pnl +
-            self.config.unrealized_weight * unrealized_pnl
-        )
-    
-    def _calculate_risk_reward(self, current_state: Dict) -> float:
-        """Calculate risk-based reward component"""
-        # Drawdown penalty
-        current_drawdown = (self.peak_equity - current_state['account_data']['wallet_balance']) / self.peak_equity
-        drawdown_penalty = self.config.max_drawdown_penalty * current_drawdown
-        
-        # Position overexposure penalty
-        position_size = abs(current_state['account_data']['position_size'])
-        max_position = current_state['account_data']['wallet_balance'] * 0.1  # 10% max position
-        overexposure_penalty = self.config.overexposure_penalty * max(0, position_size - max_position)
-        
-        # Volatility adjustment
-        if len(self.price_history) > 20:
-            returns = np.diff(self.price_history[-20:]) / self.price_history[-21:-1]
-            volatility = np.std(returns)
-            volatility_adjustment = -self.config.volatility_scale * volatility
-        else:
-            volatility_adjustment = 0
-            
-        return drawdown_penalty + overexposure_penalty + volatility_adjustment
-    
-    def _calculate_trading_reward(self, current_state: Dict, action: float, trade_result: Dict) -> float:
-        """Calculate trading behavior-based reward component"""
-        # Entry/exit rewards
-        position_change = abs(action) > 0.01
-        if position_change:
-            trading_reward = self.config.entry_reward if abs(action) > 0 else self.config.exit_reward
-        else:
-            trading_reward = 0
-            
-        # Holding cost for existing positions
-        position_size = abs(current_state['account_data']['position_size'])
-        holding_cost = self.config.holding_cost * position_size
-        
-        # Spread penalty
-        spread = (
-            current_state['market_data']['best_ask'] -
-            current_state['market_data']['best_bid']
-        ) / current_state['market_data']['last_price']
-        spread_penalty = self.config.spread_penalty * spread * abs(action)
-        
-        return trading_reward + holding_cost + spread_penalty
-    
-    def _calculate_market_reward(self, current_state: Dict) -> float:
-        """Calculate market condition-based reward component"""
-        # Trend alignment reward
-        if len(self.price_history) > 20:
-            trend = (self.price_history[-1] - self.price_history[-20]) / self.price_history[-20]
-            position = current_state['account_data']['position_size']
-            trend_reward = self.config.trend_alignment * trend * np.sign(position)
-        else:
-            trend_reward = 0
-            
-        # Volume-based reward
-        volume_ratio = current_state['market_data']['24h_volume'] / np.mean(self.price_history)
-        volume_reward = self.config.volume_scale * np.log1p(volume_ratio)
-        
-        # Funding rate penalty
-        funding_rate = current_state['market_data']['funding_rate']
-        position = current_state['account_data']['position_size']
-        funding_penalty = self.config.funding_penalty * funding_rate * position
-        
-        return trend_reward + volume_reward + funding_penalty
+        self.feature_extractor = EnhancedFeatureExtractor(config.feature)
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.websocket = None
+        self.market_data_queue = asyncio.Queue()
+        self.last_ping_time = 0
 
-class TestBybitEnvironment:
-    """Test suite for Bybit trading environment"""
-    
-    @pytest.fixture
-    def env(self):
-        """Create test environment"""
-        return BybitBTCEnvironment(
-            api_key="test_key",
-            api_secret="test_secret",
-            initial_balance=10000,
-            max_position=0.1
-        )
-    
-    @pytest.fixture
-    def reward_calculator(self):
-        """Create reward calculator"""
-        return EnhancedReward(RewardConfig())
-    
-    def test_environment_initialization(self, env):
-        """Test environment initialization"""
-        assert env.symbol == "BTCUSDT"
-        assert env.initial_balance == 10000
-        assert env.current_position == 0
-        assert env.entry_price == 0
-    
-    def test_market_data_fetching(self, env):
-        """Test market data fetching"""
-        market_data = env._get_market_data()
-        required_fields = [
-            'last_price', 'mark_price', 'index_price', '24h_volume',
-            'funding_rate', 'best_bid', 'best_ask'
-        ]
-        for field in required_fields:
-            assert field in market_data
-            assert isinstance(market_data[field], float)
-    
-    def test_account_data_fetching(self, env):
-        """Test account data fetching"""
-        account_data = env._get_account_data()
-        required_fields = [
-            'wallet_balance', 'available_balance', 'position_size',
-            'position_value', 'unrealized_pnl'
-        ]
-        for field in required_fields:
-            assert field in account_data
-            assert isinstance(account_data[field], float)
-    
-    def test_trade_execution(self, env):
-        """Test trade execution"""
-        action = 0.5  # 50% of max position
-        trade_result = env._execute_trade(action)
-        assert 'orderId' in trade_result
-        assert env.current_position > 0
-    
-    def test_environment_reset(self, env):
-        """Test environment reset"""
-        observation, info = env.reset()
-        assert 'market_data' in observation
-        assert 'account_data' in observation
-        assert env.current_position == 0
-        assert env.account_balance == env.initial_balance
-    
-    def test_full_episode(self, env, reward_calculator):
-        """Test full trading episode"""
-        observation, info = env.reset()
-        total_rewards = 0
-        
-        for _ in range(10):  # Run 10 steps
-            action = np.random.uniform(-1, 1)  # Random actions
-            next_observation, reward, done, truncated, info = env.step(action)
-            
-            # Calculate enhanced reward
-            enhanced_reward, components = reward_calculator.calculate_reward(
-                next_observation,
-                observation,
-                action,
-                info['trade_result']
-            )
-            
-            total_rewards += enhanced_reward
-            observation = next_observation
-            
-            if done:
+    async def connect_websocket(self):
+        """Establishes a websocket connection to Bybit, handling authentication if needed."""
+        if self.api_key and self.api_secret:
+            auth_data = self._generate_auth_data()
+            url = f"{BYBIT_WEBSOCKET_URL}?max_active_time=1m" # Customize alive time
+            async with aiowebsocket.connect(url) as ws:
+                self.websocket = ws
+                await self.websocket.send(json.dumps(auth_data))
+                auth_response = await self.websocket.receive()
+                if not self._check_auth_success(json.loads(auth_response)):
+                    logger.error("Authentication failed!")
+                    return
+                await self.subscribe_to_channels()
+                await self._websocket_loop()
+
+        else:
+            async with aiowebsocket.connect(BYBIT_WEBSOCKET_URL) as ws:
+                self.websocket = ws
+                await self.subscribe_to_channels()
+                await self._websocket_loop()
+
+
+    def _generate_auth_data(self):
+      """Generates authentication data for private channels."""
+      expires = int((time.time() + 60) * 1000)  # Expires in 60 seconds
+      message = f"GET/realtime{expires}".encode('utf-8')
+      signature = hmac.new(self.api_secret.encode('utf-8'), message, hashlib.sha256).hexdigest()
+      return {
+          "op": "auth",
+          "args": [self.api_key, expires, signature]
+      }
+
+    def _check_auth_success(self, response):
+        """Checks the authentication response from Bybit."""
+        return response.get('retCode') == 0
+
+    async def subscribe_to_channels(self):
+        """Subscribes to the necessary Bybit websocket channels."""
+        await self.websocket.send(json.dumps({"op": "subscribe", "args": ["instrument_info.100ms.BTCUSDT"]})) #Subscribe to BTCUSDT
+        # Add other subscriptions as needed (e.g., trades, klines)
+
+    async def _websocket_loop(self):
+        """Main loop for receiving and processing websocket messages."""
+        while True:
+            try:
+                message = await self.websocket.receive()
+                await self.process_websocket_message(message)
+                if time.time() - self.last_ping_time > 20:  #Send ping every 20 seconds
+                  self.last_ping_time = time.time()
+                  await self.websocket.send(json.dumps({"op": "ping"}))
+                  pong_response = await asyncio.wait_for(self.websocket.receive(), timeout=5) #wait for pong
+                  if pong_response != '"pong"': #check for successful pong
+                    logger.warning("Ping timeout, attempting reconnect...")
+                    await self.websocket.close()
+                    await self.connect_websocket() #Attempt to reconnect
+                    break
+
+            except asyncio.TimeoutError:
+                logger.warning("Websocket receive timeout")
+                await self.websocket.close()
+                await self.connect_websocket()
                 break
-                
-        assert isinstance(total_rewards, float)
-        env.close()
-    
-    def test_position_limits(self, env):
-        """Test position size limits"""
-        # Try to open position larger than max_position
-        action = 2.0  # Should be clipped to 1.0
-        observation, reward, done, truncated, info = env.step(action)
-        assert abs(env.current_position) <= env.max_position * env.account_balance
-    
-    def test_drawdown_termination(self, env):
-        """Test drawdown-based termination"""
-        # Simulate large loss
-        env.account_balance = env.initial_balance * 0.4  # 60% loss
-        observation, reward, done, truncated, info = env.step(0)
-        assert done == True
 
-def plot_trading_session(env_history: Dict):
-    """Plot trading session results"""
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(15, 10))
-    
-    # Plot price and positions
-    ax1.plot(env_history['prices'], label='Price')
-    ax1.set_title('Price and Positions')
-    ax1.set_ylabel('Price')
-    
-    # Add position markers
-    for i, pos in enumerate(env_history['positions']):
-        if pos > 0:
-            ax1.scatter(i, env_history['prices'][i], color='green', marker='^')
-        elif pos < 0:
-            ax1.scatter(i, env_history['prices'][i], color='red', marker='v')
-    
-    # Plot PnL
-    ax2.plot(env_history['pnl'], label='PnL')
-    ax2.set_title('Profit and Loss')
-    ax2.set_ylabel('USDT')
-    
-    # Plot rewards
-    ax3.plot(env_history['rewards'], label='Reward')
-    ax3.set_title('Rewards')
-    ax3.set_ylabel('Reward')
-    
-    plt.tight_layout()
-    plt.show()
-
-if __name__ == "__main__":
-    # Run basic validation
-    env = BybitBTCEnvironment(
-        api_key="your_testnet_api_key",
-        api_secret="your_testnet_api_secret"
-    )
-    reward_calculator = EnhancedReward(RewardConfig())
-    
-    # Run test trading session
-    observation, info = env.reset()
-    history = {
-        'prices': [],
-        'positions': [],
-        'pnl': [],
-        'rewards': []
-    }
-    
-    try:
-        for _ in range(100):  # Run 100 steps
-            # Simple momentum strategy for testing
-            returns = np.diff(history['prices'][-20:]) if len(history['prices']) >= 20 else [0]
-            action = np.sign(np.mean(returns)) * 0.5  # 50% of max position
-            
-            # Take action
-            next_observation, reward, done, truncated, info = env.step(action)
-            
-            # Calculate enhanced reward
-            enhanced_reward, components = reward_calculator.calculate_reward(
-                next_observation,
-                observation,
-                action,
-                info['trade_result']
-            )
-            
-            # Update history
-            history['prices'].append(next_observation['market_data'][0])  # Last price
-            history['positions'].append(next_observation['account_data'][1])  # Position size
-            history['pnl'].append(next_observation['account_data'][0] - env.initial_balance)  # PnL
-            history['rewards'].append(enhanced_reward)
-            
-            observation = next_observation
-            
-            if done:
-                print("Episode finished due to termination condition")
+            except aiowebsocket.exceptions.WebSocketError as e:
+                logger.error(f"Websocket error: {e}")
+                await asyncio.sleep(5)
+                await self.websocket.close()
+                await self.connect_websocket()
                 break
-                
-    finally:
-        env.close()
-        
-    # Plot results
-    plot_trading_session(history)
+            except Exception as e:
+                logger.exception(f"An unexpected error occurred: {e}")
+                await asyncio.sleep(5)
+                await self.websocket.close()
+                await self.connect_websocket()
+                break
+
+
+
+    async def process_websocket_message(self, message):
+        """Processes a single message received from the Bybit websocket."""
+        try:
+            data = json.loads(message)
+            if data['topic'] == 'instrument_info.100ms.BTCUSDT':
+                await self.market_data_queue.put(self._parse_market_data(data['data']))
+
+        except json.JSONDecodeError:
+            logger.error("Invalid JSON received from websocket")
+        except KeyError as e:
+            logger.error(f"Missing key in websocket message: {e}")
+        except Exception as e:
+            logger.exception(f"Error processing websocket message: {e}")
+
+
+    def _parse_market_data(self, raw_data):
+        """Parses and processes a single market data point from Bybit's websocket.
+
+        Args:
+          raw_data (dict): A dictionary containing raw market data from Bybit's websocket.
+
+        Returns:
+          dict: A dictionary containing processed market data ready for feature extraction. Returns an empty dictionary if parsing fails.
+        """
+        try:
+            processed_data = {
+                'close_price': float(raw_data['last_price']),
+                'volume': float(raw_data['volume']),
+                'bid_ask_spread': float(raw_data['best_ask_price']) - float(raw_data['best_bid_price']),
+                'funding_rate': float(raw_data['funding_rate']),
+                'market_depth_ratio': self._calculate_depth_ratio(raw_data),  # Implement this function
+                'taker_buy_ratio': float(raw_data.get('taker_buy_sell_ratio', 0.5)) # Handle missing data gracefully
+            }
+            return processed_data
+        except (KeyError, ValueError, TypeError) as e:
+            logger.warning(f"Error parsing market data: {e}, Raw Data: {raw_data}")
+            return {}
+
+    # ... rest of your BybitFuturesEnv class ...
+
+    # ... (rest of your code) ...
 
 // File: src\env\__init__.py
 
@@ -1895,88 +1790,6 @@ class Trainer:
                 batch_old_log_probs = old_log_probs[batch_indices]
                 
                 # Forwar
-
-// File: src\utils\indicators.py
-import numpy as np
-import pandas as pd
-import ta
-from typing import List, Union
-from dataclasses import dataclass
-
-@dataclass
-class IndicatorConfig:
-    rsi_period: int = 14
-    macd_fast: int = 12
-    macd_slow: int = 26
-    macd_signal: int = 9
-    bb_period: int = 20
-    bb_std: int = 2
-    
-class TechnicalIndicators:
-    def __init__(self, config: IndicatorConfig = None):
-        self.config = config or IndicatorConfig()
-        
-    def calculate_all(self, prices: Union[List[float], np.ndarray]) -> dict:
-        """Calculate all technical indicators"""
-        df = pd.DataFrame({'close': prices})
-        
-        indicators = {}
-        
-        # RSI
-        indicators['rsi'] = self.calculate_rsi(df)
-        
-        # MACD
-        macd_data = self.calculate_macd(df)
-        indicators.update(macd_data)
-        
-        # Bollinger Bands
-        bb_data = self.calculate_bollinger_bands(df)
-        indicators.update(bb_data)
-        
-        # Volatility
-        indicators['volatility'] = self.calculate_volatility(df)
-        
-        return indicators
-        
-    def calculate_rsi(self, df: pd.DataFrame) -> float:
-        """Calculate Relative Strength Index"""
-        rsi = ta.momentum.RSIIndicator(
-            close=df['close'],
-            window=self.config.rsi_period
-        )
-        return rsi.rsi().iloc[-1]
-        
-    def calculate_macd(self, df: pd.DataFrame) -> dict:
-        """Calculate MACD indicator"""
-        macd = ta.trend.MACD(
-            close=df['close'],
-            window_slow=self.config.macd_slow,
-            window_fast=self.config.macd_fast,
-            window_sign=self.config.macd_signal
-        )
-        return {
-            'macd': macd.macd().iloc[-1],
-            'macd_signal': macd.macd_signal().iloc[-1],
-            'macd_diff': macd.macd_diff().iloc[-1]
-        }
-        
-    def calculate_bollinger_bands(self, df: pd.DataFrame) -> dict:
-        """Calculate Bollinger Bands"""
-        bb = ta.volatility.BollingerBands(
-            close=df['close'],
-            window=self.config.bb_period,
-            window_dev=self.config.bb_std
-        )
-        return {
-            'bb_high': bb.bollinger_hband().iloc[-1],
-            'bb_mid': bb.bollinger_mavg().iloc[-1],
-            'bb_low': bb.bollinger_lband().iloc[-1]
-        }
-        
-    def calculate_volatility(self, df: pd.DataFrame, window: int = 20) -> float:
-        """Calculate price volatility"""
-        returns = df['close'].pct_change()
-        return returns.std() * np.sqrt(252)  # Annualized volatility
 
 // File: src\utils\logging.py
 from loguru import logger
