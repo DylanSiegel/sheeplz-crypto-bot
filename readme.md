@@ -15,40 +15,37 @@ This repository contains the code for n-LNN, a deep reinforcement learning (DRL)
 
 DATA FOLDER
 
-data/
-│
-├── raw/
-│   ├── btc_1min_data.csv               # Raw 1-minute timeframe data
-│   ├── btc_15min_data.csv              # Raw 15-minute timeframe data
-│   ├── btc_30min_data.csv              # Raw 30-minute timeframe data
-│   ├── btc_4hr_data.csv                # Raw 4-hour timeframe data
-│   ├── btc_daily_data.csv              # Raw daily timeframe data
-│   └── btc_weekly_data.csv             # Raw weekly timeframe data
-│
-├── processed/
-│   ├── 1min_processed.csv              # Preprocessed and feature-engineered 1-minute data
-│   ├── 15min_processed.csv             # Preprocessed and feature-engineered 15-minute data
-│   ├── 30min_processed.csv             # Preprocessed and feature-engineered 30-minute data
-│   ├── 4hr_processed.csv               # Preprocessed and feature-engineered 4-hour data
-│   ├── daily_processed.csv             # Preprocessed and feature-engineered daily data
-│   └── weekly_processed.csv            # Preprocessed and feature-engineered weekly data
-│
-├── feature_engineering/
-│   ├── technical_indicators.py         # Script for adding technical indicators
-│   ├── multi_timeframe_features.py     # Script for multi-timeframe features
-│   ├── frequency_features.py           # Script for Fourier Transform and other frequency features
-│   └── normalization.py                # Script for normalizing features
-│
-├── preprocessing/
-│   ├── data_cleaning.py                # Handles missing values, outliers, and basic cleaning
-│   ├── time_sync.py                    # Aligns timeframes, fills gaps, and resamples data
-│   └── stationarization.py             # Applies log transformations, differencing, etc., for stationarity
-│
-├── loaders/
-│   ├── load_raw_data.py                # Functions to load raw data from various sources
-│   ├── load_processed_data.py          # Functions to load processed data ready for model training
-│   └── batch_generator.py              # Generates data batches for efficient training in n-LNN
-│
-└── utils/
-    ├── config.py                       # Central configuration file for data paths and preprocessing parameters
-    └── logger.py                       # Logging configurations for tracking data processing steps
+src/
+├── data/
+│   ├── raw/
+│   │   └── btc_usdt_1m_klines.csv           # Original data
+│   │
+│   ├── processed/
+│   │   ├── btc_1m_normalized.parquet        # Standard normalized features
+│   │   ├── btc_1m_hypersphere.parquet       # Hyperspherical features
+│   │   └── btc_1m_tensors/                  # Additional transformations
+│   │
+│   ├── data_preprocessor.py                 # (formerly processor.py)
+│   │   - Primary data loading
+│   │   - Data cleaning
+│   │   - Base feature creation
+│   │
+│   ├── market_indicators.py                 # (formerly indicators.py)
+│   │   - Technical analysis indicators
+│   │   - Market microstructure features
+│   │   - Volume profiles
+│   │
+│   ├── feature_transformer.py               # (formerly features.py)
+│   │   - Feature normalization
+│   │   - Hyperspherical transformations
+│   │   - Tensor preparation
+│   │
+│   └── __init__.py
+
+snippet of data 1 min kline- 
+open_time,open,high,low,close,volume,close_time,quote_asset_volume,number_of_trades,taker_buy_base_asset_volume,taker_buy_quote_asset_volume,ignore
+2020-01-01 00:00:00+00:00,7189.43,7190.52,7177.0,7182.44,246.092,2020-01-01 00:00:59.999000+00:00,1767430.16121,336,46.63,334813.1982,0
+2020-01-01 00:01:00+00:00,7182.43,7182.44,7178.75,7179.01,70.909,2020-01-01 00:01:59.999000+00:00,509145.78482,140,32.597,234063.27884,0
+2020-01-01 00:02:00+00:00,7179.01,7179.01,7175.25,7177.93,99.42,2020-01-01 00:02:59.999000+00:00,713539.55348,148,16.311,117066.92118,0
+2020-01-01 00:03:00+00:00,7177.77,7182.6,7177.0,7181.11,69.33,2020-01-01 00:03:59.999000+00:00,497793.35929,104,43.723,313920.02981,0
+2020-01-01 00:04:00+00:00,7179.1,7179.1,7172.94,7175.25,97.368,2020-01-01 00:04:59.999000+00:00,698627.39382,193,36.616,262734.68999,0

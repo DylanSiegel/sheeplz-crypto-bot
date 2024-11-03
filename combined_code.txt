@@ -14,8 +14,9 @@
     - features.py
     - indicators.py
     - processor.py
-    - webscoket_bybit.py
     - __init__.py
+  src\data\raw
+    - btc_usdt_1m_klines.csv
   src\env
     - bybit_env.py
     - __init__.py
@@ -582,14 +583,20 @@ class DataProcessor:
         }
         return processed_data
 
-// File: src\data\webscoket_bybit.py
-
-
 // File: src\data\__init__.py
 from .processor import DataProcessor
 from .features import FeatureCalculator
 
 __all__ = ['DataProcessor', 'FeatureCalculator']
+
+// File: src\data\raw\btc_usdt_1m_klines.csv
+// Snippet:
+                open_time    open    high     low   close  volume                       close_time  quote_asset_volume  number_of_trades  taker_buy_base_asset_volume  taker_buy_quote_asset_volume  ignore
+2020-01-01 00:00:00+00:00 7189.43 7190.52 7177.00 7182.44 246.092 2020-01-01 00:00:59.999000+00:00        1.767430e+06               336                       46.630                  334813.19820       0
+2020-01-01 00:01:00+00:00 7182.43 7182.44 7178.75 7179.01  70.909 2020-01-01 00:01:59.999000+00:00        5.091458e+05               140                       32.597                  234063.27884       0
+2020-01-01 00:02:00+00:00 7179.01 7179.01 7175.25 7177.93  99.420 2020-01-01 00:02:59.999000+00:00        7.135396e+05               148                       16.311                  117066.92118       0
+2020-01-01 00:03:00+00:00 7177.77 7182.60 7177.00 7181.11  69.330 2020-01-01 00:03:59.999000+00:00        4.977934e+05               104                       43.723                  313920.02981       0
+2020-01-01 00:04:00+00:00 7179.10 7179.10 7172.94 7175.25  97.368 2020-01-01 00:04:59.999000+00:00        6.986274e+05               193                       36.616                  262734.68999       0
 
 // File: src\env\bybit_env.py
 import asyncio
