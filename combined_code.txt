@@ -1,1858 +1,2063 @@
 **File Tree (Relevant Files Only)**
-  src
-    - main.py
-  src\config
-    - config.py
-    - __init__.py
-  src\data
-    - base_preprocessor.py
-    - kline_preprocessor.py
-    - market_preprocessor.py
-    - __init__.py
-  src\data\raw
-    - btc_usdt_1m_klines.csv
-  src\pipeline
-    - augmenters.py
-    - datasets.py
-    - handlers.py
-    - market_indicators.py
-    - metrics.py
-    - normalizers.py
-    - pipeline.py
-    - __init__.py
-  src\shared
-    - exceptions.py
-    - types.py
-  src\utils
-    - logging.py
-    - system_monitor.py
-    - __init__.py
-// File: src\main.py
-# src/main.py
+  .
+    - agent.py
+    - gym.py
+    - market_base.py
+    - optimized_market.py
+    - regime.py
+    - train.py
+    - viz.py
+  data\raw
+    - btc_usdt_1m_processed.csv
+// File: agent.py
+# File: agent.py
 
-from pathlib import Path
 import torch
-from datetime import datetime
-import sys
-from typing import Tuple
-import pandas as pd
+import numpy as np
+from torch import nn
+from torch.optim import Adam
+from collections import deque
+import random
 
-from config.config import TradingConfig, TargetType, NormalizationType
-from pipeline.pipeline import TradingDataPipeline
-from pipeline.handlers import DirectionTargetCalculator
-from utils.logging import custom_logger
-from pipeline.metrics import PipelineMetrics
-from pipeline.market_indicators import TechnicalIndicators, IndicatorConfig
-from data.kline_preprocessor import KlinePreprocessor
-from utils.system_monitor import SystemMonitor
+class DQNAgent:
+    def __init__(
+        self,
+        state_dim,
+        action_dim,
+        hidden_dim=256,
+        gamma=0.99,
+        epsilon_start=1.0,
+        epsilon_end=0.01,
+        epsilon_decay=500,
+        lr=1e-4,
+        buffer_size=100000,
+        batch_size=64,
+        device='cuda' if torch.cuda.is_available() else 'cpu'
+    ):
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.device = device
 
-def create_config() -> TradingConfig:
-    """Create and initialize configuration"""
-    return TradingConfig(
-        # Data Parameters
-        sequence_length=60,            # 1-hour lookback
-        prediction_horizon=5,          # 5-minute prediction
-        batch_size=4096,              # Optimized for 8GB VRAM
-        
-        # Hardware Optimization
-        num_workers=6,                # Half of Ryzen 9 7900X cores
-        pin_memory=True,
-        
-        # Processing Parameters
-        outlier_std_threshold=4.0,
-        volume_percentile_threshold=0.9995,
-        use_robust_scaling=True,
-        
-        # Target Configuration
-        target_type=TargetType.DIRECTION,
-        target_normalization=NormalizationType.ROBUST
-    )
+        self.policy_net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, action_dim)
+        ).to(device)
 
-def process_and_save_data(
-    config: TradingConfig,
-    input_path: Path,
-    output_path: Path,
-    metrics: PipelineMetrics
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Process kline data and save results"""
-    system_monitor = SystemMonitor()
+        self.target_net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, action_dim)
+        ).to(device)
+
+        self.optimizer = Adam(self.policy_net.parameters(), lr=lr)
+        self.gamma = gamma
+        self.epsilon = epsilon_start
+        self.epsilon_end = epsilon_end
+        self.epsilon_decay = epsilon_decay
+        self.buffer = deque(maxlen=buffer_size)
+        self.batch_size = batch_size
+        self.steps_done = 0
+
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.target_net.eval()
+
+    def select_action(self, state):
+        self.steps_done += 1
+        epsilon = self.epsilon_end + (self.epsilon - self.epsilon_end) * \
+                  np.exp(-1. * self.steps_done / self.epsilon_decay)
+        if random.random() < epsilon:
+            return random.randrange(self.action_dim)
+        else:
+            with torch.no_grad():
+                state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+                q_values = self.policy_net(state)
+                return q_values.argmax().item()
+
+    def store_transition(self, transition):
+        self.buffer.append(transition)
+
+    def update(self):
+        if len(self.buffer) < self.batch_size:
+            return
+        transitions = random.sample(self.buffer, self.batch_size)
+        batch = Transition(*zip(*transitions))
+
+        state_batch = torch.stack(batch.state).to(self.device)
+        action_batch = torch.tensor(batch.action, device=self.device).unsqueeze(1)
+        reward_batch = torch.tensor(batch.reward, device=self.device)
+        next_state_batch = torch.stack(batch.next_state).to(self.device)
+        done_batch = torch.tensor(batch.done, device=self.device)
+
+        state_action_values = self.policy_net(state_batch).gather(1, action_batch)
+
+        with torch.no_grad():
+            next_state_values = self.target_net(next_state_batch).max(1)[0]
+            expected_state_action_values = reward_batch + self.gamma * next_state_values * (1 - done_batch)
+
+        loss = nn.functional.mse_loss(state_action_values.squeeze(), expected_state_action_values)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+    def update_target_net(self):
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+
+from collections import namedtuple
+Transition = namedtuple('Transition', ('state', 'action', 'reward', 'next_state', 'done'))
+
+
+// File: gym.py
+import torch
+import numpy as np
+from typing import Tuple, Dict, List, Optional
+from dataclasses import dataclass
+from collections import deque
+import logging
+from torch.cuda import amp
+from market_base import Action, MarketState
+from optimized_market import OptimizedRewardCalculator
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class TradingEnvConfig:
+    """Configuration for trading environment"""
+    initial_balance: float = 10000.0
+    max_position_size: float = 1.0
+    transaction_cost: float = 0.001
+    history_length: int = 100
+    device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
+    use_amp: bool = True  # Use automatic mixed precision
+    batch_size: int = 512  # Optimized for 8GB VRAM
+
+class TradingEnvironment:
+    """GPU-accelerated trading environment with batched operations"""
     
-    try:
-        # Initialize preprocessor
-        preprocessor = KlinePreprocessor(config)
+    def __init__(
+        self,
+        market_states: List[MarketState],
+        config: Optional[TradingEnvConfig] = None
+    ):
+        self.config = config or TradingEnvConfig()
+        self.device = torch.device(self.config.device)
         
-        # Load and process data
-        custom_logger.logger.info(f"Loading data from {input_path}")
-        raw_data = pd.read_parquet(input_path) if input_path.suffix == '.parquet' else pd.read_csv(input_path)
-        
-        # Process features and targets
-        custom_logger.logger.info("Processing kline data...")
-        features, targets = preprocessor.process_klines(raw_data)
-        
-        # Log processing metrics
-        current_metrics = system_monitor.get_metrics()
-        metrics.update('processing_time', current_metrics.cpu_percent)
-        metrics.update('memory_usage', current_metrics.memory_percent)
-        
-        custom_logger.log_metrics({
-            'cpu_usage': current_metrics.cpu_percent,
-            'memory_usage': current_metrics.memory_percent,
-            'gpu_utilization': current_metrics.gpu_utilization,
-            'data_samples': len(features)
-        }, step=0)
-        
-        # Save processed data
-        custom_logger.logger.info(f"Saving processed data to {output_path}")
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        torch.save({
-            'features': features,
-            'targets': targets,
-            'config': config.to_dict(),
-            'processing_timestamp': datetime.now().isoformat()
-        }, output_path)
-        
-        # Log summary statistics
-        custom_logger.logger.info(f"Processed {len(features):,} samples")
-        custom_logger.logger.info(f"Feature shape: {features.shape}")
-        custom_logger.logger.info(f"Target shape: {targets.shape}")
-        
-        return features, targets
-        
-    except Exception as e:
-        custom_logger.logger.error(f"Error processing data: {str(e)}", exception=True)
-        raise
-
-def main():
-    try:
-        # Initialize configuration
-        config = create_config()
-        custom_logger.logger.info("Configuration initialized")
-        
-        # Initialize metrics tracker
-        metrics = PipelineMetrics()
-        
-        # Define paths
-        input_path = Path("src/data/raw/btc_usdt_1m_klines.parquet")
-        output_path = Path("src/data/processed/kline_features.pt")
-        
-        # Process and save data
-        features, targets = process_and_save_data(
-            config,
-            input_path,
-            output_path,
-            metrics
+        # Initialize reward calculator
+        self.reward_calc = OptimizedRewardCalculator(
+            transaction_cost=self.config.transaction_cost,
+            device=self.config.device
         )
         
-        # Log final metrics
-        metrics.log_summary()
-        custom_logger.logger.info("Data processing completed successfully")
+        # Convert market states to tensors and move to GPU
+        self.states = self._prepare_market_states(market_states)
+        self.current_step = 0
+        self.history = deque(maxlen=self.config.history_length)
         
-        # Optional: Create training/validation splits
-        if features is not None and targets is not None:
-            split_idx = int(len(features) * 0.8)
+        # Initialize portfolio state
+        self._initialize_portfolio()
+        
+        # Enable automatic mixed precision if configured
+        self.scaler = amp.GradScaler() if self.config.use_amp else None
+        
+        logger.info(f"Trading environment initialized with {len(market_states)} states")
+    
+    def _prepare_market_states(self, market_states: List[MarketState]) -> Dict[str, torch.Tensor]:
+        """Prepare market states for GPU processing"""
+        encoded_states = []
+        prices = []
+        regime_labels = []
+        
+        # Process in batches to manage memory
+        for i in range(0, len(market_states), self.config.batch_size):
+            batch = market_states[i:i + self.config.batch_size]
+            encoded_states.extend([state.encoded_state for state in batch])
+            prices.extend([state.current_price for state in batch])
+            regime_labels.extend([state.regime_label for state in batch])
+        
+        return {
+            'encoded_states': torch.stack(encoded_states).to(self.device),
+            'prices': torch.tensor(prices, dtype=torch.float32).to(self.device),
+            'regime_labels': torch.tensor(regime_labels, dtype=torch.long).to(self.device)
+        }
+    
+    def _initialize_portfolio(self):
+        """Initialize portfolio state tensors on GPU"""
+        self.balance = torch.tensor(self.config.initial_balance, 
+                                  device=self.device, 
+                                  dtype=torch.float32)
+        self.position_size = torch.tensor(0.0, 
+                                        device=self.device, 
+                                        dtype=torch.float32)
+        self.position_value = torch.tensor(0.0, 
+                                         device=self.device, 
+                                         dtype=torch.float32)
+    
+    @torch.no_grad()
+    def step(self, action: int) -> Tuple[MarketState, float, bool, Dict]:
+        """Execute one environment step with GPU acceleration"""
+        if self.current_step >= len(self.states['encoded_states']) - 1:
+            return self._get_current_state(), 0.0, True, {}
+        
+        current_state = self._get_current_state()
+        next_state = self._get_next_state()
+        
+        # Use automatic mixed precision for calculations if configured
+        with amp.autocast() if self.config.use_amp else nullcontext():
+            # Calculate reward and execute trade
+            reward, metrics = self.reward_calc.calculate_reward(
+                current_state,
+                next_state,
+                action,
+                float(self.position_size)
+            )
             
-            split_data = {
-                'train_features': features[:split_idx],
-                'train_targets': targets[:split_idx],
-                'val_features': features[split_idx:],
-                'val_targets': targets[split_idx:],
-                'config': config.to_dict()
+            # Update portfolio based on action
+            self._execute_trade(action, current_state, next_state)
+        
+        # Update state
+        self.current_step += 1
+        
+        # Record state in history
+        self.history.append({
+            'step': self.current_step,
+            'action': action,
+            'reward': reward,
+            'balance': float(self.balance),
+            'position_size': float(self.position_size),
+            'price': float(self.states['prices'][self.current_step])
+        })
+        
+        done = self.current_step >= len(self.states['encoded_states']) - 1
+        info = {
+            'metrics': metrics,
+            'portfolio_value': float(self.balance + self.position_value)
+        }
+        
+        return next_state, reward, done, info
+    
+    @torch.no_grad()
+    def _execute_trade(
+        self,
+        action: int,
+        current_state: MarketState,
+        next_state: MarketState
+    ) -> None:
+        """Execute trading action with GPU-accelerated calculations"""
+        current_price = self.states['prices'][self.current_step]
+        
+        if action == Action.BUY.value and self.position_size < self.config.max_position_size:
+            # Calculate maximum purchasable amount
+            max_purchase = (self.balance * (1 - self.config.transaction_cost)) / current_price
+            purchase_size = min(
+                self.config.max_position_size - self.position_size,
+                max_purchase
+            )
+            
+            if purchase_size > 0:
+                cost = purchase_size * current_price * (1 + self.config.transaction_cost)
+                self.balance -= cost
+                self.position_size += purchase_size
+                
+        elif action == Action.SELL.value and self.position_size > 0:
+            # Calculate sale proceeds
+            sale_proceeds = (self.position_size * current_price * 
+                           (1 - self.config.transaction_cost))
+            self.balance += sale_proceeds
+            self.position_size = torch.tensor(0.0, device=self.device)
+        
+        # Update position value
+        self.position_value = self.position_size * self.states['prices'][self.current_step]
+    
+    def reset(self) -> MarketState:
+        """Reset the environment to initial state"""
+        self.current_step = 0
+        self._initialize_portfolio()
+        self.history.clear()
+        return self._get_current_state()
+    
+    def _get_current_state(self) -> MarketState:
+        """Get current market state"""
+        return MarketState(
+            encoded_state=self.states['encoded_states'][self.current_step],
+            regime_label=int(self.states['regime_labels'][self.current_step]),
+            current_price=float(self.states['prices'][self.current_step]),
+            timestamp=None,  # Timestamp not needed for training
+            metrics=self._get_state_metrics()
+        )
+    
+    def _get_next_state(self) -> MarketState:
+        """Get next market state"""
+        next_step = self.current_step + 1
+        return MarketState(
+            encoded_state=self.states['encoded_states'][next_step],
+            regime_label=int(self.states['regime_labels'][next_step]),
+            current_price=float(self.states['prices'][next_step]),
+            timestamp=None,
+            metrics=self._get_state_metrics()
+        )
+    
+    def _get_state_metrics(self) -> Dict[str, float]:
+        """Calculate current state metrics"""
+        return {
+            'portfolio_value': float(self.balance + self.position_value),
+            'position_size': float(self.position_size),
+            'balance': float(self.balance)
+        }
+
+class nullcontext:
+    """Context manager that does nothing"""
+    def __enter__(self): return None
+    def __exit__(self, *excinfo): pass
+
+// File: market_base.py
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional, Union, Any
+import torch
+import numpy as np
+import pandas as pd
+from enum import Enum
+
+class Action(Enum):
+    """Trading action enumeration"""
+    HOLD = 0
+    BUY = 1
+    SELL = 2
+
+@dataclass
+class MarketState:
+    """Container for market state information with validation"""
+    encoded_state: torch.Tensor
+    regime_label: int
+    current_price: float
+    timestamp: pd.Timestamp
+    metrics: Dict[str, float]
+    
+    def __post_init__(self):
+        """Validate state attributes after initialization"""
+        if not isinstance(self.encoded_state, torch.Tensor):
+            raise TypeError("encoded_state must be a torch.Tensor")
+        if not isinstance(self.regime_label, (int, np.integer)):
+            raise TypeError("regime_label must be an integer")
+        if not isinstance(self.current_price, (float, np.floating)):
+            raise TypeError("current_price must be a float")
+        if not isinstance(self.timestamp, pd.Timestamp):
+            raise TypeError("timestamp must be a pd.Timestamp")
+        if not isinstance(self.metrics, dict):
+            raise TypeError("metrics must be a dictionary")
+    
+    def to_tensor(self) -> torch.Tensor:
+        """Convert state to tensor format for DRL"""
+        return self.encoded_state
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert state to dictionary format"""
+        return {
+            'encoded_state': self.encoded_state.numpy(),
+            'regime_label': self.regime_label,
+            'current_price': self.current_price,
+            'timestamp': self.timestamp,
+            'metrics': self.metrics
+        }
+    
+    @classmethod
+    def from_dict(cls, state_dict: Dict[str, Any]) -> 'MarketState':
+        """Create MarketState from dictionary"""
+        return cls(
+            encoded_state=torch.tensor(state_dict['encoded_state']),
+            regime_label=state_dict['regime_label'],
+            current_price=state_dict['current_price'],
+            timestamp=pd.Timestamp(state_dict['timestamp']),
+            metrics=state_dict['metrics']
+        )
+
+class RewardCalculator:
+    """Calculate DRL rewards based on market state and actions with regime-aware adjustments"""
+    
+    def __init__(
+        self,
+        transaction_cost: float = 0.001,
+        holding_cost: float = 0.0001,
+        volatility_penalty: float = 0.1,
+        regime_multipliers: Optional[Dict[int, float]] = None
+    ):
+        """
+        Initialize reward calculator with costs and penalties
+        
+        Args:
+            transaction_cost: Cost per transaction as percentage
+            holding_cost: Cost of holding position per step
+            volatility_penalty: Penalty factor for volatility
+            regime_multipliers: Dict mapping regime IDs to reward multipliers
+        """
+        self._validate_costs(transaction_cost, holding_cost, volatility_penalty)
+        self.transaction_cost = transaction_cost
+        self.holding_cost = holding_cost
+        self.volatility_penalty = volatility_penalty
+        
+        # Set default regime multipliers if none provided
+        self.regime_multipliers = regime_multipliers or {
+            0: 0.8,  # High volatility - reduce reward
+            1: 1.0,  # Normal trading
+            2: 1.2,  # Trending market - increase reward
+        }
+        
+        # Initialize metrics tracking
+        self.reset_metrics()
+    
+    def _validate_costs(
+        self,
+        transaction_cost: float,
+        holding_cost: float,
+        volatility_penalty: float
+    ) -> None:
+        """Validate cost parameters"""
+        if not 0 <= transaction_cost <= 0.1:
+            raise ValueError("transaction_cost must be between 0 and 0.1")
+        if not 0 <= holding_cost <= 0.01:
+            raise ValueError("holding_cost must be between 0 and 0.01")
+        if not 0 <= volatility_penalty <= 1.0:
+            raise ValueError("volatility_penalty must be between 0 and 1.0")
+    
+    def reset_metrics(self) -> None:
+        """Reset accumulated metrics"""
+        self.total_rewards = 0.0
+        self.total_costs = 0.0
+        self.total_penalties = 0.0
+        self.rewards_by_regime = {}
+        self.action_counts = {action: 0 for action in Action}
+    
+    def calculate_reward(
+        self,
+        current_state: MarketState,
+        next_state: MarketState,
+        action: Union[Action, int],
+        position_size: float
+    ) -> Tuple[float, Dict[str, float]]:
+        """
+        Calculate reward for a single state transition
+        
+        Args:
+            current_state: Current market state
+            next_state: Next market state
+            action: Trading action (HOLD=0, BUY=1, SELL=2)
+            position_size: Size of position as percentage of portfolio
+            
+        Returns:
+            reward: Calculated reward
+            metrics: Dictionary of reward components
+        """
+        # Validate inputs
+        if isinstance(action, int):
+            action = Action(action)
+        if not isinstance(action, Action):
+            raise ValueError(f"Invalid action: {action}")
+        if not 0 <= position_size <= 1:
+            raise ValueError("position_size must be between 0 and 1")
+        
+        # Calculate price change
+        price_change = (next_state.current_price - current_state.current_price) / current_state.current_price
+        
+        # Calculate base reward
+        if action == Action.BUY:
+            base_reward = price_change * position_size
+            costs = self.transaction_cost * position_size
+        elif action == Action.SELL:
+            base_reward = -price_change * position_size
+            costs = self.transaction_cost * position_size
+        else:  # HOLD
+            base_reward = 0
+            costs = self.holding_cost * position_size
+        
+        # Apply volatility penalty
+        volatility = current_state.metrics.get('volatility', 0)
+        vol_penalty = -self.volatility_penalty * volatility * position_size
+        
+        # Get regime multiplier
+        regime_multiplier = self.regime_multipliers.get(
+            current_state.regime_label,
+            1.0
+        )
+        
+        # Calculate final reward
+        reward = (base_reward - costs + vol_penalty) * regime_multiplier
+        
+        # Update metrics
+        self.total_rewards += reward
+        self.total_costs += costs
+        self.total_penalties += abs(vol_penalty)
+        self.action_counts[action] += 1
+        
+        if current_state.regime_label not in self.rewards_by_regime:
+            self.rewards_by_regime[current_state.regime_label] = []
+        self.rewards_by_regime[current_state.regime_label].append(reward)
+        
+        metrics = {
+            'base_reward': base_reward,
+            'costs': costs,
+            'vol_penalty': vol_penalty,
+            'regime_multiplier': regime_multiplier,
+            'total_reward': reward,
+            'price_change': price_change,
+            'volatility': volatility
+        }
+        
+        return reward, metrics
+    
+    def get_metrics_summary(self) -> Dict[str, Any]:
+        """Get summary of accumulated metrics"""
+        summary = {
+            'total_rewards': self.total_rewards,
+            'total_costs': self.total_costs,
+            'total_penalties': self.total_penalties,
+            'action_counts': {action.name: count for action, count in self.action_counts.items()},
+            'rewards_by_regime': {
+                regime: {
+                    'mean': np.mean(rewards),
+                    'std': np.std(rewards),
+                    'count': len(rewards)
+                }
+                for regime, rewards in self.rewards_by_regime.items()
             }
+        }
+        return summary
+
+class DataValidationMixin:
+    """Mixin class for data validation methods"""
+    
+    @staticmethod
+    def validate_market_data(
+        data: np.ndarray,
+        min_sequence_length: int,
+        expected_features: int
+    ) -> None:
+        """Validate market data array"""
+        if not isinstance(data, np.ndarray):
+            raise TypeError("data must be a numpy array")
+        
+        if data.ndim != 3:
+            raise ValueError(f"data must be 3D, got shape {data.shape}")
             
-            split_path = output_path.parent / 'train_val_split.pt'
-            torch.save(split_data, split_path)
+        if data.shape[1] < min_sequence_length:
+            raise ValueError(
+                f"Sequence length must be at least {min_sequence_length}, "
+                f"got {data.shape[1]}"
+            )
             
-            custom_logger.logger.info(
-                f"Train/validation split saved - "
-                f"Train: {len(split_data['train_features']):,} samples, "
-                f"Val: {len(split_data['val_features']):,} samples"
+        if data.shape[2] < expected_features:
+            raise ValueError(
+                f"Expected at least {expected_features} features, "
+                f"got {data.shape[2]}"
+            )
+    
+    @staticmethod
+    def validate_timestamps(
+        timestamps: pd.DatetimeIndex,
+        n_samples: int
+    ) -> None:
+        """Validate timestamp index"""
+        if not isinstance(timestamps, pd.DatetimeIndex):
+            raise TypeError("timestamps must be a pandas DatetimeIndex")
+            
+        if len(timestamps) != n_samples:
+            raise ValueError(
+                f"Number of timestamps ({len(timestamps)}) must match "
+                f"number of samples ({n_samples})"
             )
         
-    except Exception as e:
-        custom_logger.logger.error(f"Pipeline failed: {str(e)}", exception=True)
-        sys.exit(1)
+        if timestamps.freq is None:
+            if pd.infer_freq(timestamps) is None:
+                raise ValueError(
+                    "timestamps must have a frequency or regular interval"
+                )
+
+// File: optimized_market.py
+import torch
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional, Union, Any
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from functools import lru_cache
+import logging
+from tqdm import tqdm
+from torch.cuda import amp
+from dataclasses import dataclass
+from enum import Enum
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("market_analysis.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class Action(Enum):
+    """Trading action enumeration"""
+    HOLD = 0
+    BUY = 1
+    SELL = 2
+
+@dataclass
+class MarketState:
+    """Container for market state information with validation"""
+    encoded_state: torch.Tensor
+    regime_label: int
+    current_price: float
+    timestamp: pd.Timestamp
+    metrics: Dict[str, float]
+    
+    def __post_init__(self):
+        """Validate state attributes after initialization"""
+        if not isinstance(self.encoded_state, torch.Tensor):
+            raise TypeError("encoded_state must be a torch.Tensor")
+        if not isinstance(self.regime_label, (int, np.integer)):
+            raise TypeError("regime_label must be an integer")
+        if not isinstance(self.current_price, (float, np.floating)):
+            raise TypeError("current_price must be a float")
+        if not isinstance(self.timestamp, pd.Timestamp):
+            raise TypeError("timestamp must be a pd.Timestamp")
+        if not isinstance(self.metrics, dict):
+            raise TypeError("metrics must be a dictionary")
+
+class OptimizedMarketRegimeDetector:
+    """Optimized market regime detector with GPU acceleration"""
+    
+    def __init__(
+        self,
+        n_regimes: int = 8,
+        feature_window: int = 20,
+        clustering_method: str = 'kmeans',
+        random_state: int = 42,
+        device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
+    ):
+        self.n_regimes = n_regimes
+        self.feature_window = feature_window
+        self.device = device
+        self.scaler = StandardScaler()
+        self.is_fitted = False
+        
+        # Initialize clustering
+        self._init_clustering(clustering_method, random_state)
+        
+        # Batch size based on GPU memory (8GB VRAM)
+        self.batch_size = 4096 if device == 'cuda' else 1024
+        
+        self.feature_names = [
+            'volatility', 'trend', 'volume_ratio', 'momentum',
+            'hour_sin', 'hour_cos', 'weekday_0', 'weekday_1', 
+            'weekday_2', 'weekday_3', 'weekday_4', 'weekday_5', 'weekday_6'
+        ]
+        
+    def _init_clustering(self, method: str, random_state: int) -> None:
+        """Initialize clustering algorithm with GPU support"""
+        if method == 'kmeans':
+            self.cluster_model = KMeans(
+                n_clusters=self.n_regimes,
+                random_state=random_state,
+                n_init='auto'
+            )
+    
+    def _encode_cyclical_time(self, hour: int) -> Tuple[float, float]:
+        """Encode hour using sine and cosine transformation"""
+        hour_rad = 2 * np.pi * hour / 24.0
+        return np.sin(hour_rad), np.cos(hour_rad)
+    
+    @lru_cache(maxsize=1024)
+    def _extract_features(self, data_key: Tuple[float, ...], timestamp: pd.Timestamp) -> np.ndarray:
+        """Cached feature extraction for repeated sequences"""
+        data = np.array(data_key).reshape(-1, 5)  # Reshape for OHLCV
+        
+        # Move data to GPU if available
+        if self.device == 'cuda':
+            data_tensor = torch.from_numpy(data).to(self.device)
+            
+            # Perform calculations on GPU
+            close_prices = data_tensor[:, 3]
+            returns = torch.diff(torch.log(close_prices))
+            volatility = returns[-self.feature_window:].std().item()
+            
+            # Calculate trend
+            x = torch.arange(self.feature_window, device=self.device, dtype=torch.float32)
+            y = close_prices[-self.feature_window:]
+            trend = torch.polyfit(x, y, 1)[0].item()
+            
+            # Move back to CPU for remaining calculations
+            data = data_tensor.cpu().numpy()
+        else:
+            # Perform calculations on CPU
+            returns = np.diff(np.log(data[:, 3]))
+            volatility = np.std(returns[-self.feature_window:])
+            trend = np.polyfit(np.arange(self.feature_window), data[-self.feature_window:, 3], 1)[0]
+        
+        volume_ratio = np.mean(data[-5:, 4]) / np.mean(data[-self.feature_window:, 4])
+        momentum = data[-1, 3] / data[-self.feature_window, 3] - 1
+        hour_sin, hour_cos = self._encode_cyclical_time(timestamp.hour)
+        weekday_onehot = np.eye(7)[timestamp.weekday()]
+        
+        features = np.array([
+            volatility,
+            trend,
+            volume_ratio,
+            momentum,
+            hour_sin,
+            hour_cos,
+            *weekday_onehot
+        ])
+        
+        return features.reshape(1, -1)
+    
+    def fit(self, data: np.ndarray, timestamps: pd.DatetimeIndex) -> None:
+        """Fit the regime detector on historical data"""
+        # Extract features for all samples
+        all_features = []
+        for i in tqdm(range(len(data)), desc="Extracting features"):
+            features = self._extract_features(tuple(data[i].flatten()), timestamps[i])
+            all_features.append(features)
+        
+        features_array = np.vstack(all_features)
+        
+        # Scale features
+        scaled_features = self.scaler.fit_transform(features_array)
+        
+        # Fit clustering model
+        self.cluster_model.fit(scaled_features)
+        self.is_fitted = True
+        
+        # Store cluster centers
+        self.cluster_centers_ = self.cluster_model.cluster_centers_
+    
+    def predict(self, data: np.ndarray, timestamps: pd.DatetimeIndex) -> np.ndarray:
+        """Predict market regimes for new data"""
+        if not self.is_fitted:
+            raise ValueError("MarketRegimeDetector must be fitted before making predictions")
+        
+        # Extract features
+        all_features = []
+        for i in range(len(data)):
+            features = self._extract_features(tuple(data[i].flatten()), timestamps[i])
+            all_features.append(features)
+        
+        features_array = np.vstack(all_features)
+        
+        # Scale features
+        scaled_features = self.scaler.transform(features_array)
+        
+        # Predict regimes
+        predictions = self.cluster_model.predict(scaled_features)
+        
+        return predictions
+
+class OptimizedHypersphericalEncoder:
+    """GPU-accelerated hyperspherical encoder with mixed precision training"""
+    
+    def __init__(
+        self,
+        projection_dim: int = 128,
+        n_regimes: int = 8,
+        sequence_length: int = 60,
+        min_features: int = 17,
+        device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
+    ):
+        self.device = torch.device(device)
+        self.projection_dim = projection_dim
+        self.sequence_length = sequence_length
+        self.min_features = min_features
+        
+        # Initialize components
+        self.regime_detector = OptimizedMarketRegimeDetector(
+            n_regimes=n_regimes,
+            device=device
+        )
+        
+        # Move models to GPU
+        self.projection = torch.nn.Linear(min_features, projection_dim).to(self.device)
+        self.layer_norm = torch.nn.LayerNorm(projection_dim).to(self.device)
+        
+        # Initialize scalers
+        self.price_scaler = StandardScaler()
+        self.indicator_scaler = StandardScaler()
+        
+        # Enable automatic mixed precision
+        self.scaler = amp.GradScaler()
+    
+    def _encode_market_data(self, data: np.ndarray) -> torch.Tensor:
+        """Encode raw market data into latent representation"""
+        # Split data into components
+        price_data = data[:, :, :5]  # OHLCV
+        indicator_data = data[:, :, 5:self.min_features]  # Technical indicators
+        
+        # Scale components
+        price_scaled = self.price_scaler.transform(price_data.reshape(-1, 5))
+        price_scaled = price_scaled.reshape(data.shape[0], self.sequence_length, 5)
+        
+        indicator_scaled = self.indicator_scaler.transform(indicator_data.reshape(-1, 12))
+        indicator_scaled = indicator_scaled.reshape(data.shape[0], self.sequence_length, 12)
+        
+        # Convert to tensors and move to GPU if available
+        price_tensor = torch.FloatTensor(price_scaled[:, -1, :]).to(self.device)
+        indicator_tensor = torch.FloatTensor(indicator_scaled[:, -1, :]).to(self.device)
+        
+        # Combine features
+        combined = torch.cat([price_tensor, indicator_tensor], dim=1)
+        
+        # Project and normalize with mixed precision
+        with amp.autocast():
+            projected = self.projection(combined)
+            normalized = self.layer_norm(projected)
+        
+        return normalized
+    
+    def encode_sequence(
+        self,
+        data: Union[np.ndarray, torch.Tensor],
+        timestamp: pd.Timestamp
+    ) -> MarketState:
+        """Encode a single market sequence into a MarketState"""
+        # Convert to numpy if tensor
+        if isinstance(data, torch.Tensor):
+            data = data.cpu().numpy()
+        
+        # Reshape for batch processing
+        data_batch = data.reshape(1, *data.shape)
+        
+        # Encode market data
+        market_encoded = self._encode_market_data(data_batch)
+        
+        # Get regime
+        regime = self.regime_detector.predict(
+            data_batch,
+            pd.DatetimeIndex([timestamp])
+        )[0]
+        
+        # Calculate metrics
+        metrics = self._calculate_metrics(data_batch)
+        
+        # Create market state
+        state = MarketState(
+            encoded_state=market_encoded[0],
+            regime_label=regime,
+            current_price=float(data[-1, 3]),  # Latest close price
+            timestamp=timestamp,
+            metrics=metrics
+        )
+        
+        return state
+    
+    def _calculate_metrics(self, data: np.ndarray) -> Dict[str, float]:
+        """Calculate market metrics from sequence data"""
+        close_prices = data[:, :, 3]  # Close price is 4th column
+        volume = data[:, :, 4]        # Volume is 5th column
+        
+        # Calculate returns and volatility
+        returns = np.diff(np.log(close_prices), axis=1)
+        volatility = np.std(returns, axis=1)[-1]
+        
+        # Volume metrics
+        rel_volume = volume[:, -1] / np.mean(volume, axis=1)
+        
+        # Additional metrics
+        price_momentum = (close_prices[:, -1] / close_prices[:, -20] - 1)[-1]
+        volume_momentum = (volume[:, -1] / volume[:, -20] - 1)[-1]
+        
+        return {
+            'volatility': float(volatility),
+            'relative_volume': float(rel_volume[-1]),
+            'price_momentum': float(price_momentum),
+            'volume_momentum': float(volume_momentum)
+        }
+
+class OptimizedMarketVisualizer:
+    """Multi-threaded market visualizer with GPU acceleration"""
+    
+    def __init__(
+        self,
+        data_path: str,
+        num_workers: int = 12,  # Optimized for Ryzen 9 7900X
+        device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
+    ):
+        self.device = device
+        self.num_workers = num_workers
+        self.data_path = Path(data_path)
+        
+        # Load data efficiently
+        self._load_data()
+        
+        # Initialize encoder
+        self.encoder = OptimizedHypersphericalEncoder(device=device)
+        
+    def _load_data(self) -> None:
+        """Efficient data loading with parallel processing"""
+        chunks = np.array_split(pd.read_csv(self.data_path), self.num_workers)
+        
+        with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
+            results = list(executor.map(self._process_chunk, chunks))
+            
+        self.df = pd.concat(results)
+        self.df['timestamp'] = pd.to_datetime(self.df['open_time'])
+        self.df.set_index('timestamp', inplace=True)
+        
+    @staticmethod
+    def _process_chunk(chunk: pd.DataFrame) -> pd.DataFrame:
+        """Process a single data chunk"""
+        return chunk
+    
+    def visualize_parallel(self, n_samples: int = 1000) -> List[MarketState]:
+        """Parallel visualization processing"""
+        max_samples = len(self.df) - self.encoder.sequence_length
+        n_samples = min(n_samples, max_samples)
+        
+        # Split work across threads
+        batch_size = n_samples // self.num_workers
+        batches = [(i * batch_size, min((i + 1) * batch_size, n_samples)) 
+                  for i in range(self.num_workers)]
+        
+        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+            futures = [
+                executor.submit(self._process_batch, start, end)
+                for start, end in batches
+            ]
+            
+            results = []
+            for future in tqdm(futures, desc="Processing batches"):
+                results.extend(future.result())
+                
+        return results
+    
+    def _process_batch(self, start: int, end: int) -> List[MarketState]:
+        """Process a batch of visualizations"""
+        results = []
+        for i in range(start, end):
+            sequence = self.df.iloc[i:i + self.encoder.sequence_length].values
+            timestamp = self.df.index[i + self.encoder.sequence_length - 1]
+            
+            # Move data to GPU if available
+            if self.device == 'cuda':
+                sequence_tensor = torch.tensor(sequence, device='cuda')
+            else:
+                sequence_tensor = torch.tensor(sequence)
+                
+            state = self.encoder.encode_sequence(sequence_tensor, timestamp)
+            results.append(state)
+            
+        return results
+
+def optimize_system():
+   
+    if torch.cuda.is_available():
+        # Set GPU memory allocation strategy
+        torch.cuda.set_per_process_memory_fraction(0.8)  # Reserve 20% for system
+        torch.backends.cudnn.benchmark = True  # Optimize CUDA operations
+        
+    # Set number of threads for parallel processing
+    torch.set_num_threads(24)  # Optimize for 24 logical processors
+    
+    # Configure numpy to use multiple threads
+    np.set_num_threads(24)
+    
+    logger.info("System optimized for parallel processing and GPU acceleration")
+
+class OptimizedRewardCalculator:
+    """Calculate DRL rewards based on market state and actions with regime-aware adjustments"""
+    
+    def __init__(
+        self,
+        transaction_cost: float = 0.001,
+        holding_cost: float = 0.0001,
+        volatility_penalty: float = 0.1,
+        regime_multipliers: Optional[Dict[int, float]] = None,
+        device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
+    ):
+        """Initialize reward calculator with costs and penalties"""
+        self._validate_costs(transaction_cost, holding_cost, volatility_penalty)
+        self.transaction_cost = transaction_cost
+        self.holding_cost = holding_cost
+        self.volatility_penalty = volatility_penalty
+        self.device = device
+        
+        # Set default regime multipliers if none provided
+        self.regime_multipliers = regime_multipliers or {
+            0: 0.8,  # High volatility - reduce reward
+            1: 1.0,  # Normal trading
+            2: 1.2,  # Trending market - increase reward
+        }
+        
+        # Initialize metrics tracking
+        self.reset_metrics()
+        
+        # Move multipliers to GPU if available
+        if self.device == 'cuda':
+            self.regime_multipliers_tensor = {
+                k: torch.tensor(v, device='cuda')
+                for k, v in self.regime_multipliers.items()
+            }
+    
+    def _validate_costs(
+        self,
+        transaction_cost: float,
+        holding_cost: float,
+        volatility_penalty: float
+    ) -> None:
+        """Validate cost parameters"""
+        if not 0 <= transaction_cost <= 0.1:
+            raise ValueError("transaction_cost must be between 0 and 0.1")
+        if not 0 <= holding_cost <= 0.01:
+            raise ValueError("holding_cost must be between 0 and 0.01")
+        if not 0 <= volatility_penalty <= 1.0:
+            raise ValueError("volatility_penalty must be between 0 and 1.0")
+    
+    def reset_metrics(self) -> None:
+        """Reset accumulated metrics"""
+        self.total_rewards = 0.0
+        self.total_costs = 0.0
+        self.total_penalties = 0.0
+        self.rewards_by_regime = {}
+        self.action_counts = {action: 0 for action in Action}
+    
+    def calculate_reward(
+        self,
+        current_state: MarketState,
+        next_state: MarketState,
+        action: Union[Action, int],
+        position_size: float
+    ) -> Tuple[float, Dict[str, float]]:
+        """Calculate reward for a single state transition with GPU acceleration"""
+        # Validate inputs
+        if isinstance(action, int):
+            action = Action(action)
+        if not isinstance(action, Action):
+            raise ValueError(f"Invalid action: {action}")
+        if not 0 <= position_size <= 1:
+            raise ValueError("position_size must be between 0 and 1")
+        
+        # Move calculations to GPU if available
+        if self.device == 'cuda':
+            current_price = torch.tensor(current_state.current_price, device='cuda')
+            next_price = torch.tensor(next_state.current_price, device='cuda')
+            position_size_tensor = torch.tensor(position_size, device='cuda')
+            
+            # Calculate price change
+            price_change = (next_price - current_price) / current_price
+            
+            # Calculate base reward
+            if action == Action.BUY:
+                base_reward = price_change * position_size_tensor
+                costs = self.transaction_cost * position_size_tensor
+            elif action == Action.SELL:
+                base_reward = -price_change * position_size_tensor
+                costs = self.transaction_cost * position_size_tensor
+            else:  # HOLD
+                base_reward = torch.tensor(0.0, device='cuda')
+                costs = self.holding_cost * position_size_tensor
+            
+            # Apply volatility penalty
+            volatility = torch.tensor(
+                current_state.metrics['volatility'],
+                device='cuda'
+            )
+            vol_penalty = -self.volatility_penalty * volatility * position_size_tensor
+            
+            # Get regime multiplier
+            regime_multiplier = self.regime_multipliers_tensor.get(
+                current_state.regime_label,
+                torch.tensor(1.0, device='cuda')
+            )
+            
+            # Calculate final reward
+            reward = (base_reward - costs + vol_penalty) * regime_multiplier
+            
+            # Move results back to CPU
+            reward = reward.item()
+            metrics = {
+                'base_reward': base_reward.item(),
+                'costs': costs.item(),
+                'vol_penalty': vol_penalty.item(),
+                'regime_multiplier': regime_multiplier.item(),
+                'total_reward': reward,
+                'price_change': price_change.item(),
+                'volatility': volatility.item()
+            }
+        else:
+            # CPU calculations (original implementation)
+            price_change = (next_state.current_price - current_state.current_price) / current_state.current_price
+            
+            if action == Action.BUY:
+                base_reward = price_change * position_size
+                costs = self.transaction_cost * position_size
+            elif action == Action.SELL:
+                base_reward = -price_change * position_size
+                costs = self.transaction_cost * position_size
+            else:  # HOLD
+                base_reward = 0
+                costs = self.holding_cost * position_size
+            
+            volatility = current_state.metrics['volatility']
+            vol_penalty = -self.volatility_penalty * volatility * position_size
+            
+            regime_multiplier = self.regime_multipliers.get(
+                current_state.regime_label,
+                1.0
+            )
+            
+            reward = (base_reward - costs + vol_penalty) * regime_multiplier
+            
+            metrics = {
+                'base_reward': base_reward,
+                'costs': costs,
+                'vol_penalty': vol_penalty,
+                'regime_multiplier': regime_multiplier,
+                'total_reward': reward,
+                'price_change': price_change,
+                'volatility': volatility
+            }
+        
+        # Update metrics
+        self.total_rewards += reward
+        self.total_costs += metrics['costs']
+        self.total_penalties += abs(metrics['vol_penalty'])
+        self.action_counts[action] += 1
+        
+        if current_state.regime_label not in self.rewards_by_regime:
+            self.rewards_by_regime[current_state.regime_label] = []
+        self.rewards_by_regime[current_state.regime_label].append(reward)
+        
+        return reward, metrics
+    
+    def get_metrics_summary(self) -> Dict[str, Any]:
+        """Get summary of accumulated metrics"""
+        summary = {
+            'total_rewards': self.total_rewards,
+            'total_costs': self.total_costs,
+            'total_penalties': self.total_penalties,
+            'action_counts': {action.name: count for action, count in self.action_counts.items()},
+            'rewards_by_regime': {
+                regime: {
+                    'mean': np.mean(rewards),
+                    'std': np.std(rewards),
+                    'count': len(rewards)
+                }
+                for regime, rewards in self.rewards_by_regime.items()
+            }
+        }
+        return summary
+
+def main():
+    """Main entry point for optimized market analysis"""
+    # Configure system
+    optimize_system()
+    
+    # Initialize components
+    data_path = "data/raw/btc_usdt_1m_processed.csv"
+    visualizer = OptimizedMarketVisualizer(data_path)
+    
+    # Process some sample data
+    n_samples = 1000
+    results = visualizer.visualize_parallel(n_samples)
+    
+    logger.info(f"Processed {len(results)} market states")
+    
+    # Test reward calculation
+    reward_calc = OptimizedRewardCalculator()
+    if len(results) >= 2:
+        reward, metrics = reward_calc.calculate_reward(
+            results[0],
+            results[1],
+            Action.BUY,
+            0.5
+        )
+        logger.info(f"Sample reward calculation: {reward:.4f}")
+        logger.info(f"Reward metrics: {metrics}")
 
 if __name__ == "__main__":
     main()
 
-// File: src\config\config.py
-# src/config/config.py
-
-from __future__ import annotations
-from typing import Any, Dict, List, Optional, Tuple, Union, TypeVar, Set
-from dataclasses import dataclass, field, fields, asdict
-from enum import Enum
-from pathlib import Path
-import json
-import yaml
-
-class TargetType(Enum):
-    """Types of prediction targets supported by the system."""
-    DIRECTION = "direction"  # Binary classification (up/down)
-    PRICE = "price"         # Direct price prediction
-    VOLATILITY = "volatility"  # Volatility prediction
-    CUSTOM = "custom"       # Custom target type
-
-class NormalizationType(Enum):
-    """Supported data normalization methods."""
-    STANDARD = "standard"  # Zero mean, unit variance
-    MINMAX = "minmax"     # Scale to [0,1] range
-    ROBUST = "robust"     # Using median and IQR
-    NONE = "none"         # No normalization
-
-@dataclass
-class TechnicalIndicatorParams:
-    """Parameters for technical indicators."""
-    rsi: Dict[str, List[int]] = field(default_factory=lambda: {'periods': [6, 14, 24]})
-    ema: Dict[str, List[int]] = field(default_factory=lambda: {'periods': [5, 10, 20, 60, 120]})
-    macd: Dict[str, int] = field(default_factory=lambda: {'fast': 12, 'slow': 26, 'signal': 9})
-    bb: Dict[str, Union[int, float]] = field(default_factory=lambda: {'period': 20, 'std': 2.0})
-    atr: Dict[str, int] = field(default_factory=lambda: {'period': 14})
-    volatility: Dict[str, int] = field(default_factory=lambda: {'period': 20})
-    follow_line: Dict[str, Union[int, float, bool]] = field(default_factory=lambda: {
-        'atr_period': 5,
-        'bb_period': 21,
-        'bb_deviation': 1.00,
-        'use_atr_filter': True
-    })
-
-@dataclass
-class TradingConfig:
-    """Configuration for the trading data pipeline.
-    
-    Attributes:
-        sequence_length: Number of time steps in the input sequence
-        prediction_horizon: List of future time steps to predict
-        batch_size: Number of samples per batch
-        num_workers: Number of data loading worker processes
-        pin_memory: Whether to pin memory for GPU transfer
-        prefetch_factor: Number of batches to prefetch
-        price_features: List of price-related features to use
-        volume_features: List of volume-related features to use
-        technical_indicators_config: Configuration for technical indicators
-        outlier_std_threshold: Standard deviation threshold for outlier removal
-        volume_percentile_threshold: Percentile threshold for volume clipping
-        normalization_type: Type of normalization to apply
-        learning_rate: Initial learning rate
-        weight_decay: L2 regularization factor
-        epsilon: Small value for numerical stability
-        gradient_clip_val: Maximum gradient norm
-        use_augmentation: Whether to use data augmentation
-        noise_level: Standard deviation of Gaussian noise
-        jitter_ratio: Ratio of time steps to jitter
-    """
-    
-    # Core Parameters
-    sequence_length: int = field(default=60)
-    prediction_horizon: List[int] = field(default_factory=lambda: [5])
-    batch_size: int = field(default=4096)
-
-    # Hardware Optimization
-    num_workers: int = field(default=6)
-    pin_memory: bool = field(default=True)
-    prefetch_factor: int = field(default=2)
-
-    # Feature Groups
-    price_features: List[str] = field(default_factory=lambda: [
-        'open', 'high', 'low', 'close'
-    ])
-    volume_features: List[str] = field(default_factory=lambda: [
-        'volume', 'quote_asset_volume',
-        'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume'
-    ])
-    technical_indicators_config: TechnicalIndicatorParams = field(
-        default_factory=TechnicalIndicatorParams
-    )
-
-    # Data Preprocessing
-    outlier_std_threshold: float = field(default=4.0)
-    volume_percentile_threshold: float = field(default=0.9995)
-    normalization_type: NormalizationType = field(default=NormalizationType.ROBUST)
-
-    # Training Parameters
-    learning_rate: float = field(default=1e-4)
-    weight_decay: float = field(default=1e-6)
-    epsilon: float = field(default=1e-8)
-    gradient_clip_val: float = field(default=1.0)
-
-    # Data Augmentation
-    use_augmentation: bool = field(default=True)
-    noise_level: float = field(default=0.01)
-    jitter_ratio: float = field(default=0.1)
-
-    # Derived Attributes
-    technical_indicators: List[str] = field(init=False)
-    input_dim: int = field(init=False)
-
-    def __post_init__(self) -> None:
-        """Validates configuration and initializes derived attributes."""
-        self._validate_config()
-        self._derive_attributes()
-
-    def _validate_config(self) -> None:
-        """Validates configuration parameters."""
-        # Core parameter validation
-        if self.sequence_length <= 0:
-            raise ValueError("sequence_length must be positive")
-        if not self.prediction_horizon:
-            raise ValueError("prediction_horizon cannot be empty")
-        if not all(h > 0 for h in self.prediction_horizon):
-            raise ValueError("All prediction horizons must be positive")
-        if self.batch_size <= 0:
-            raise ValueError("batch_size must be positive")
-
-        # Hardware parameter validation
-        if self.num_workers < 0:
-            raise ValueError("num_workers cannot be negative")
-        if self.prefetch_factor <= 0:
-            raise ValueError("prefetch_factor must be positive")
-
-        # Feature validation
-        if not self.price_features:
-            raise ValueError("price_features cannot be empty")
-        if not self.volume_features:
-            raise ValueError("volume_features cannot be empty")
-        
-        # Check for feature name uniqueness
-        all_features = set(self.price_features) | set(self.volume_features)
-        if len(all_features) < len(self.price_features) + len(self.volume_features):
-            raise ValueError("Duplicate feature names found")
-
-        # Data preprocessing validation
-        if self.outlier_std_threshold <= 0:
-            raise ValueError("outlier_std_threshold must be positive")
-        if not 0 < self.volume_percentile_threshold <= 1:
-            raise ValueError("volume_percentile_threshold must be between 0 and 1")
-
-        # Training parameter validation
-        if self.learning_rate <= 0:
-            raise ValueError("learning_rate must be positive")
-        if self.weight_decay < 0:
-            raise ValueError("weight_decay cannot be negative")
-        if self.epsilon <= 0:
-            raise ValueError("epsilon must be positive")
-        if self.gradient_clip_val <= 0:
-            raise ValueError("gradient_clip_val must be positive")
-
-        # Augmentation parameter validation
-        if not 0 <= self.noise_level <= 1:
-            raise ValueError("noise_level must be between 0 and 1")
-        if not 0 <= self.jitter_ratio <= 1:
-            raise ValueError("jitter_ratio must be between 0 and 1")
-
-    def _derive_attributes(self) -> None:
-        """Derives technical indicators and input dimension."""
-        self.technical_indicators = self._expand_indicator_names()
-        self.input_dim = (
-            len(self.price_features) +
-            len(self.volume_features) +
-            len(self.technical_indicators)
-        )
-
-    def _expand_indicator_names(self) -> List[str]:
-        """Expands technical indicator configurations into feature names."""
-        indicators = []
-        
-        # RSI indicators
-        for period in self.technical_indicators_config.rsi['periods']:
-            indicators.append(f"rsi_{period}")
-        
-        # EMA indicators
-        for period in self.technical_indicators_config.ema['periods']:
-            indicators.append(f"ema_{period}")
-        
-        # MACD components
-        indicators.extend([
-            'macd_line',
-            'macd_signal',
-            'macd_histogram'
-        ])
-        
-        # Bollinger Bands components
-        indicators.extend([
-            'bb_upper',
-            'bb_middle',
-            'bb_lower',
-            'bb_bandwidth'
-        ])
-        
-        # ATR and Volatility
-        indicators.extend([
-            'atr',
-            'volatility'
-        ])
-        
-        # Follow Line components
-        indicators.extend([
-            'follow_line',
-            'follow_line_trend'
-        ])
-        
-        return indicators
-
-    @classmethod
-    def from_dict(cls, config_dict: Dict[str, Any]) -> TradingConfig:
-        """Creates a TradingConfig instance from a dictionary."""
-        # Convert string enum values to proper enum types
-        if 'normalization_type' in config_dict:
-            config_dict['normalization_type'] = NormalizationType[config_dict['normalization_type'].upper()]
-        
-        # Convert technical indicators config
-        if 'technical_indicators_config' in config_dict:
-            config_dict['technical_indicators_config'] = TechnicalIndicatorParams(
-                **config_dict['technical_indicators_config']
-            )
-        
-        return cls(**config_dict)
-
-    @classmethod
-    def from_file(cls, file_path: Union[str, Path]) -> TradingConfig:
-        """Loads configuration from a JSON or YAML file."""
-        file_path = Path(file_path)
-        
-        with open(file_path, 'r') as f:
-            if file_path.suffix == '.json':
-                config_dict = json.load(f)
-            elif file_path.suffix in {'.yml', '.yaml'}:
-                config_dict = yaml.safe_load(f)
-            else:
-                raise ValueError(f"Unsupported file format: {file_path.suffix}")
-        
-        return cls.from_dict(config_dict)
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Converts configuration to a dictionary."""
-        config_dict = asdict(self)
-        
-        # Convert enum values to strings
-        config_dict['normalization_type'] = self.normalization_type.value
-        
-        # Remove derived attributes
-        config_dict.pop('technical_indicators', None)
-        config_dict.pop('input_dim', None)
-        
-        return config_dict
-
-    def save(self, file_path: Union[str, Path]) -> None:
-        """Saves configuration to a JSON or YAML file."""
-        file_path = Path(file_path)
-        config_dict = self.to_dict()
-        
-        with open(file_path, 'w') as f:
-            if file_path.suffix == '.json':
-                json.dump(config_dict, f, indent=2)
-            elif file_path.suffix in {'.yml', '.yaml'}:
-                yaml.dump(config_dict, f, default_flow_style=False)
-            else:
-                raise ValueError(f"Unsupported file format: {file_path.suffix}")
-
-// File: src\config\__init__.py
-
-
-// File: src\data\base_preprocessor.py
-# src/data/base_preprocessor.py
-
-from abc import ABC, abstractmethod
-import pandas as pd
+// File: regime.py
 import numpy as np
-from typing import Dict, Any, Optional
-from dataclasses import dataclass
-import logging
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans, DBSCAN
+from sklearn.mixture import GaussianMixture
+from typing import Optional, List, Union, Tuple, Dict
+import pandas as pd
 
-from config.config import TradingConfig
-from shared.exceptions import ValidationError, ProcessingError
-from utils.logging import custom_logger
-
-@dataclass
-class PreprocessingStats:
-    """Statistics from data preprocessing operations."""
-    total_rows: int = 0
-    memory_usage_mb: float = 0.0
-    processing_time_sec: float = 0.0
-    outliers_removed: Dict[str, int] = field(default_factory=dict)
-    invalid_values_fixed: int = 0
-    features_generated: int = 0
-
-class BasePreprocessor(ABC):
-    """Base class for data preprocessing."""
-    
-    def __init__(self, config: TradingConfig):
-        self.config = config
-        self.logger = custom_logger.logger
-        self.stats = PreprocessingStats()
-    
-    def clean_data(self, data: pd.DataFrame) -> pd.DataFrame:
-        """Common data cleaning operations."""
-        clean_data = data.copy()
-        
-        # Handle outliers
-        self._remove_outliers(clean_data)
-        
-        # Handle invalid values
-        self._handle_invalid_values(clean_data)
-        
-        return clean_data
-    
-    def _remove_outliers(self, data: pd.DataFrame) -> None:
-        """Remove outliers using robust statistics."""
-        for col in data.select_dtypes(include=[np.number]).columns:
-            rolling = data[col].rolling(window=24, center=True, min_periods=1)
-            q_high = rolling.quantile(0.9995)
-            q_low = rolling.quantile(0.0005)
-            
-            outliers = ((data[col] > q_high) | (data[col] < q_low)).sum()
-            self.stats.outliers_removed[col] = outliers
-            
-            data[col] = np.where(
-                data[col] > q_high,
-                q_high,
-                np.where(data[col] < q_low, q_low, data[col])
-            )
-    
-    def _handle_invalid_values(self, data: pd.DataFrame) -> None:
-        """Handle missing and invalid values."""
-        numeric_cols = data.select_dtypes(include=[np.number]).columns
-        invalid_mask = data[numeric_cols].isna() | np.isinf(data[numeric_cols])
-        self.stats.invalid_values_fixed = invalid_mask.sum().sum()
-        
-        # Replace with appropriate values
-        for col in numeric_cols:
-            data[col] = data[col].fillna(method='ffill').fillna(0)
-            data[col] = np.nan_to_num(data[col], nan=0.0, posinf=None, neginf=None)
-    
-    @abstractmethod
-    def validate_data(self, data: pd.DataFrame) -> None:
-        """Validate input data requirements."""
-        pass
-
-// File: src\data\kline_preprocessor.py
-# src/data/kline_preprocessor.py
-
-import torch
-from typing import Dict, List
-
-@dataclass
-class ProcessedKlines:
-    """Container for processed kline data."""
-    features: torch.Tensor
-    targets: Dict[int, torch.Tensor]
-    feature_names: List[str]
-    target_type: TargetType
-    stats: PreprocessingStats
-
-class KlinePreprocessor(BasePreprocessor):
-    """Processes OHLCV data for ML model input."""
-    
+class MarketRegimeDetector:
+    """
+    Enhanced market regime detector with time-based features and flexible clustering
+    """
     def __init__(
         self,
-        config: TradingConfig,
-        technical_indicators: Optional[TechnicalIndicators] = None
+        n_regimes: int = 8,
+        feature_window: int = 20,
+        clustering_method: str = 'kmeans',
+        random_state: int = 42
     ):
-        super().__init__(config)
-        self.technical_indicators = technical_indicators or TechnicalIndicators(
-            config.technical_indicators_config
-        )
+        """
+        Initialize the market regime detector
+        
+        Args:
+            n_regimes: Number of distinct market regimes to detect
+            feature_window: Window size for calculating features
+            clustering_method: One of ['kmeans', 'dbscan', 'gmm']
+            random_state: Random seed for reproducibility
+        """
+        self.n_regimes = n_regimes
+        self.feature_window = feature_window
+        self.random_state = random_state
+        self.clustering_method = clustering_method
+        
+        # Initialize clustering algorithm
+        if clustering_method == 'kmeans':
+            self.cluster_model = KMeans(
+                n_clusters=n_regimes,
+                random_state=random_state,
+                n_init='auto'
+            )
+        elif clustering_method == 'dbscan':
+            self.cluster_model = DBSCAN(
+                eps=0.3,
+                min_samples=5
+            )
+        elif clustering_method == 'gmm':
+            self.cluster_model = GaussianMixture(
+                n_components=n_regimes,
+                random_state=random_state
+            )
+        else:
+            raise ValueError(f"Unknown clustering method: {clustering_method}")
+            
+        self.scaler = StandardScaler()
+        self.is_fitted = False
+        self.feature_names = [
+            'volatility', 'trend', 'volume_ratio', 'momentum',
+            'hour_sin', 'hour_cos', 'weekday_0', 'weekday_1', 
+            'weekday_2', 'weekday_3', 'weekday_4', 'weekday_5', 'weekday_6'
+        ]
     
-    def process_klines(
+    def _encode_cyclical_time(self, hour: int) -> Tuple[float, float]:
+        """Encode hour using sine and cosine transformation"""
+        hour_rad = 2 * np.pi * hour / 24.0
+        return np.sin(hour_rad), np.cos(hour_rad)
+    
+    def _extract_features(self, data: np.ndarray, timestamp: pd.Timestamp) -> np.ndarray:
+        """
+        Extract market and time-based features (vectorized)
+        
+        Args:
+            data: Market data array of shape (sequence_length, features)
+            timestamp: Timestamp for time-based features
+            
+        Returns:
+            features: Array of extracted features
+        """
+        # Market features (vectorized calculations)
+        close_prices = data[:, 3]
+        volume = data[:, 4]
+        
+        # Calculate returns and features
+        returns = np.diff(np.log(close_prices))
+        volatility = np.std(returns[-self.feature_window:])
+        
+        # Trend calculation
+        x = np.arange(self.feature_window)
+        slope, _ = np.polyfit(x, close_prices[-self.feature_window:], 1)
+        
+        # Volume profile
+        volume_ratio = np.mean(volume[-5:]) / np.mean(volume[-self.feature_window:])
+        
+        # Momentum
+        momentum = (close_prices[-1] / close_prices[-self.feature_window] - 1)
+        
+        # Time-based features
+        hour_sin, hour_cos = self._encode_cyclical_time(timestamp.hour)
+        weekday = timestamp.weekday()
+        weekday_onehot = np.zeros(7)
+        weekday_onehot[weekday] = 1
+        
+        # Combine all features
+        features = np.concatenate([
+            [volatility, slope, volume_ratio, momentum],
+            [hour_sin, hour_cos],
+            weekday_onehot
+        ])
+        
+        return features.reshape(1, -1)
+    
+    def fit(self, data: np.ndarray, timestamps: pd.DatetimeIndex) -> None:
+        """
+        Fit the regime detector on historical data
+        
+        Args:
+            data: Historical market data of shape (n_samples, sequence_length, features)
+            timestamps: Corresponding timestamps for each sample
+        """
+        # Extract features for all samples
+        all_features = []
+        for i in range(len(data)):
+            features = self._extract_features(data[i], timestamps[i])
+            all_features.append(features)
+        
+        features_array = np.vstack(all_features)
+        
+        # Scale features
+        scaled_features = self.scaler.fit_transform(features_array)
+        
+        # Fit clustering model
+        self.cluster_model.fit(scaled_features)
+        self.is_fitted = True
+        
+        # Store cluster characteristics
+        if self.clustering_method != 'dbscan':
+            if hasattr(self.cluster_model, 'cluster_centers_'):
+                self.cluster_centers_ = self.cluster_model.cluster_centers_
+            else:
+                self.cluster_centers_ = self.cluster_model.means_
+    
+    def predict(self, data: np.ndarray, timestamps: pd.DatetimeIndex) -> np.ndarray:
+        """
+        Predict market regimes for new data
+        
+        Args:
+            data: Market data of shape (n_samples, sequence_length, features)
+            timestamps: Corresponding timestamps for each sample
+            
+        Returns:
+            predictions: Array of regime labels
+        """
+        if not self.is_fitted:
+            raise ValueError("MarketRegimeDetector must be fitted before making predictions")
+        
+        # Extract features
+        all_features = []
+        for i in range(len(data)):
+            features = self._extract_features(data[i], timestamps[i])
+            all_features.append(features)
+        
+        features_array = np.vstack(all_features)
+        
+        # Scale features
+        scaled_features = self.scaler.transform(features_array)
+        
+        # Predict regimes
+        if self.clustering_method in ['kmeans', 'dbscan']:
+            predictions = self.cluster_model.predict(scaled_features)
+        else:  # GMM
+            predictions = self.cluster_model.predict(scaled_features)
+        
+        return predictions
+    
+    def get_regime_characteristics(self) -> List[Dict]:
+        """
+        Get characteristics of each regime based on cluster centers
+        
+        Returns:
+            List of dictionaries containing regime characteristics
+        """
+        if not self.is_fitted:
+            raise ValueError("MarketRegimeDetector must be fitted before getting characteristics")
+        
+        if self.clustering_method == 'dbscan':
+            raise ValueError("Regime characteristics not available for DBSCAN")
+            
+        characteristics = []
+        centers = self.scaler.inverse_transform(self.cluster_centers_)
+        
+        for i, center in enumerate(centers):
+            regime_dict = {
+                'regime_id': i,
+                'characteristics': {
+                    name: value for name, value in zip(self.feature_names, center)
+                },
+                'interpretation': self._interpret_regime(center)
+            }
+            characteristics.append(regime_dict)
+            
+        return characteristics
+    
+    def _interpret_regime(self, center: np.ndarray) -> str:
+        """
+        Generate human-readable interpretation of regime characteristics
+        
+        Args:
+            center: Cluster center array
+            
+        Returns:
+            interpretation: String describing the regime
+        """
+        volatility, trend, volume_ratio, momentum = center[:4]
+        
+        descriptions = []
+        
+        # Volatility interpretation
+        if volatility > 1.5:
+            descriptions.append("High volatility")
+        elif volatility < 0.5:
+            descriptions.append("Low volatility")
+        
+        # Trend interpretation
+        if trend > 0.01:
+            descriptions.append("Upward trending")
+        elif trend < -0.01:
+            descriptions.append("Downward trending")
+        else:
+            descriptions.append("Range-bound")
+            
+        # Volume interpretation
+        if volume_ratio > 1.2:
+            descriptions.append("High volume")
+        elif volume_ratio < 0.8:
+            descriptions.append("Low volume")
+            
+        # Momentum interpretation
+        if momentum > 0.02:
+            descriptions.append("Strong momentum")
+        elif momentum < -0.02:
+            descriptions.append("Weak momentum")
+        
+        return ", ".join(descriptions)
+
+// File: train.py
+import torch
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from typing import Tuple, Dict, Optional, List
+from sklearn.preprocessing import StandardScaler
+from torch.utils.data import DataLoader, TensorDataset
+
+from market_base import MarketState, RewardCalculator, DataValidationMixin
+from regime import MarketRegimeDetector
+
+class HypersphericalEncoder(DataValidationMixin):
+    """
+    Encodes market sequences into hyperspherical latent space with regime awareness
+    """
+    def __init__(
         self,
-        data: pd.DataFrame,
-        validate: bool = True
-    ) -> ProcessedKlines:
-        """Process klines into ML-ready format."""
-        if validate:
-            self.validate_data(data)
+        projection_dim: int = 128,
+        n_regimes: int = 8,
+        sequence_length: int = 60,
+        min_features: int = 17  # OHLCV(5) + Indicators(12)
+    ):
+        self.projection_dim = projection_dim
+        self.n_regimes = n_regimes
+        self.sequence_length = sequence_length
+        self.min_features = min_features
         
-        # Clean data using base class method
-        clean_data = self.clean_data(data)
+        # Initialize components
+        self.regime_detector = MarketRegimeDetector(n_regimes=n_regimes)
+        self.price_scaler = StandardScaler()
+        self.indicator_scaler = StandardScaler()
+        self.layer_norm = torch.nn.LayerNorm(projection_dim)
         
-        # Generate features
-        feature_data = self._generate_features(clean_data)
+        # Initialize projection layer after feature dimension is determined
+        self.projection = None
         
-        # Calculate targets
-        targets = self._calculate_targets(clean_data['close'])
+    def fit_scalers(self, data: np.ndarray):
+        """Fits the scalers to the input data."""
+        price_data = data[:, :, :5]  # OHLCV
+        indicator_data = data[:, :, 5:self.min_features]  # Technical indicators
+        
+        # Fit scalers
+        self.price_scaler.fit(price_data.reshape(-1, 5))
+        self.indicator_scaler.fit(indicator_data.reshape(-1, self.min_features - 5))
+    
+    def _init_projection(self, total_features: int) -> None:
+        """Initialize the projection layer with correct input dimension"""
+        self.projection = torch.nn.Linear(total_features, self.projection_dim)
+        
+    def _calculate_metrics(self, data: np.ndarray) -> Dict[str, float]:
+        """
+        Calculate market metrics from sequence data
+        
+        Args:
+            data: Market data array of shape (batch_size, sequence_length, features)
+            
+        Returns:
+            Dict of computed metrics
+        """
+        close_prices = data[:, :, 3]  # Close price is 4th column
+        volume = data[:, :, 4]        # Volume is 5th column
+        
+        # Calculate returns and volatility
+        returns = np.diff(np.log(close_prices), axis=1)
+        volatility = np.std(returns, axis=1)[-1]
+        
+        # Volume metrics
+        rel_volume = volume[:, -1] / np.mean(volume, axis=1)
+        
+        # Additional metrics
+        price_momentum = (close_prices[:, -1] / close_prices[:, -20] - 1)[-1]
+        volume_momentum = (volume[:, -1] / volume[:, -20] - 1)[-1]
+        
+        return {
+            'volatility': float(volatility),
+            'relative_volume': float(rel_volume[-1]),
+            'price_momentum': float(price_momentum),
+            'volume_momentum': float(volume_momentum)
+        }
+    
+    def _encode_market_data(self, data: np.ndarray) -> torch.Tensor:
+        """
+        Encode raw market data into latent representation
+        
+        Args:
+            data: Market data array of shape (batch_size, sequence_length, features)
+            
+        Returns:
+            Encoded tensor of shape (batch_size, projection_dim)
+        """
+        # Split data into components
+        price_data = data[:, :, :5]  # OHLCV
+        indicator_data = data[:, :, 5:self.min_features]  # Technical indicators
+        
+        # Scale components
+        price_scaled = self.price_scaler.transform(price_data.reshape(-1, 5))
+        price_scaled = price_scaled.reshape(data.shape[0], self.sequence_length, 5)
+        
+        indicator_scaled = self.indicator_scaler.transform(indicator_data.reshape(-1, 12))
+        indicator_scaled = indicator_scaled.reshape(data.shape[0], self.sequence_length, 12)
         
         # Convert to tensors
-        features = self._prepare_features(feature_data)
+        price_tensor = torch.FloatTensor(price_scaled[:, -1, :])
+        indicator_tensor = torch.FloatTensor(indicator_scaled[:, -1, :])
         
-        return ProcessedKlines(
-            features=features,
-            targets=targets,
-            feature_names=self.config.technical_indicators,
-            target_type=self.config.target_type,
-            stats=self.stats
-        )
+        # Initialize projection if needed
+        if self.projection is None:
+            total_features = price_tensor.shape[1] + indicator_tensor.shape[1]
+            self._init_projection(total_features)
+        
+        # Combine features
+        combined = torch.cat([price_tensor, indicator_tensor], dim=1)
+        
+        # Project and normalize
+        projected = self.projection(combined)
+        normalized = self.layer_norm(projected)
+        
+        return normalized
     
-    def validate_data(self, data: pd.DataFrame) -> None:
-        """Validate OHLCV data requirements."""
-        # Implementation for OHLCV-specific validation
-        pass
-    
-    def _validate_ohlc(self, data: pd.DataFrame) -> None:
-        """Validate and fix OHLC relationships."""
-        # OHLCV-specific validation logic
-        pass
-
-// File: src\data\market_preprocessor.py
-# src/data/market_preprocessor.py
-
-from pathlib import Path
-from typing import Union, Optional
-
-class MarketDataPreprocessor(BasePreprocessor):
-    """Handles loading and storing large market datasets."""
-    
-    def __init__(
+    def encode_sequence(
         self,
-        config: TradingConfig,
-        data_path: Optional[Path] = None
-    ):
-        super().__init__(config)
-        self.data_path = data_path
-        self._setup_chunking()
-    
-    def load_and_process(
-        self,
-        output_path: Optional[Path] = None
-    ) -> pd.DataFrame:
-        """Load, clean, and optionally save market data."""
-        # Implementation focusing on efficient data loading and storage
-        pass
-    
-    def validate_data(self, data: pd.DataFrame) -> None:
-        """Validate market data requirements."""
-        pass
-
-// File: src\data\__init__.py
-# File: src/data/__init__.py
-
-from .base_preprocessor import MarketDataPreprocessor
-from .feature_transformer import KlineFeatureTransformer, KlineTransformerConfig
-from .market_indicators import TechnicalIndicators, IndicatorConfig
-
-
-// File: src\data\raw\btc_usdt_1m_klines.csv
-// Snippet:
-                open_time    open    high     low   close  volume                       close_time  quote_asset_volume  number_of_trades  taker_buy_base_asset_volume  taker_buy_quote_asset_volume  ignore
-2020-01-01 00:00:00+00:00 7189.43 7190.52 7177.00 7182.44 246.092 2020-01-01 00:00:59.999000+00:00        1.767430e+06               336                       46.630                  334813.19820       0
-2020-01-01 00:01:00+00:00 7182.43 7182.44 7178.75 7179.01  70.909 2020-01-01 00:01:59.999000+00:00        5.091458e+05               140                       32.597                  234063.27884       0
-2020-01-01 00:02:00+00:00 7179.01 7179.01 7175.25 7177.93  99.420 2020-01-01 00:02:59.999000+00:00        7.135396e+05               148                       16.311                  117066.92118       0
-2020-01-01 00:03:00+00:00 7177.77 7182.60 7177.00 7181.11  69.330 2020-01-01 00:03:59.999000+00:00        4.977934e+05               104                       43.723                  313920.02981       0
-2020-01-01 00:04:00+00:00 7179.10 7179.10 7172.94 7175.25  97.368 2020-01-01 00:04:59.999000+00:00        6.986274e+05               193                       36.616                  262734.68999       0
-
-// File: src\pipeline\augmenters.py
-# File: src/pipeline/augmenters.py
-
-import torch
-import logging
-from config.config import TradingConfig
-
-
-class DataAugmenter:
-    """Implements various data augmentation strategies."""
-
-    def __init__(self, config: TradingConfig):
-        """Initializes the data augmenter.
-
-        Args:
-            config: Trading configuration containing augmentation parameters
+        data: np.ndarray,
+        timestamp: pd.Timestamp
+    ) -> MarketState:
         """
-        self.config = config
-        self.logger = logging.getLogger(__name__)
-
-    def augment(self, sequence: torch.Tensor) -> torch.Tensor:
-        """Applies configured augmentations to the input sequence.
-
+        Encode a single market sequence into a MarketState
+        
         Args:
-            sequence: Input tensor to augment
-
+            data: Market sequence of shape (sequence_length, features)
+            timestamp: Timestamp for the sequence
+            
         Returns:
-            Augmented tensor
+            MarketState object containing encoded state and metadata
         """
-        if not self.config.use_augmentation:
-            return sequence
-
-        augmented = sequence.clone()
-
-        # Apply Gaussian noise
-        if self.config.noise_level > 0:
-            noise = torch.randn_like(augmented) * self.config.noise_level
-            augmented += noise
-
-        # Apply time jittering
-        if self.config.jitter_ratio > 0:
-            augmented = self._apply_time_jitter(augmented)
-
-        return augmented
-
-    def _apply_time_jitter(self, sequence: torch.Tensor) -> torch.Tensor:
-        """Applies time jittering to the sequence.
-
-        Args:
-            sequence: Input tensor to jitter
-
-        Returns:
-            Time jittered tensor
-        """
-        seq_len = sequence.size(0)
-        num_jitter = int(seq_len * self.config.jitter_ratio)
-
-        if num_jitter > 0:
-            jitter_idx = torch.randperm(seq_len)[:num_jitter]
-            augmented_sequence = sequence.clone()
-            augmented_sequence[jitter_idx] = sequence[jitter_idx].roll(1, dims=0)
-            self.logger.debug(f"Applied time jittering on indices: {jitter_idx.tolist()}")
-            return augmented_sequence
-
-        return sequence
-
-
-// File: src\pipeline\datasets.py
-# File: src/pipeline/datasets.py
-
-import torch
-from torch.utils.data import Dataset
-from typing import Dict, List, Optional, Tuple, Union
-from pipeline.handlers import TargetCalculator
-from config.config import TradingConfig
-from pipeline.normalizers import FeatureNormalizer
-from pipeline.augmenters import DataAugmenter
-import logging
-
-from data.base_preprocessor import ValidationError
-
-
-def validate_tensor_shape(tensor: torch.Tensor, expected_shape: Tuple[Optional[int], ...], name: str) -> None:
-    """Validates tensor shape against expected shape.
-
-    Args:
-        tensor: Tensor to validate
-        expected_shape: Expected shape (None for dynamic dimensions)
-        name: Name of the tensor for error messages
-
-    Raises:
-        ValidationError: If tensor shape doesn't match expected shape
-    """
-    if len(tensor.shape) != len(expected_shape):
-        raise ValidationError(
-            f"Expected {name} to have {len(expected_shape)} dimensions, "
-            f"got {len(tensor.shape)}"
+        # Validate input
+        self.validate_market_data(
+            data.reshape(1, *data.shape), 
+            self.sequence_length, 
+            self.min_features
         )
-
-    for i, (actual, expected) in enumerate(zip(tensor.shape, expected_shape)):
-        if expected is not None and actual != expected:
-            raise ValidationError(
-                f"Expected {name} dimension {i} to be {expected}, got {actual}"
-            )
-
-
-class SequencedMarketDataset(Dataset):
-    """Dataset for creating sequences from market data."""
-
-    def __init__(
+        
+        # Reshape for batch processing
+        data_batch = data.reshape(1, *data.shape)
+        
+        # Encode market data
+        market_encoded = self._encode_market_data(data_batch)
+        
+        # Get regime
+        regime = self.regime_detector.predict(
+            data_batch, 
+            pd.DatetimeIndex([timestamp])
+        )[0]
+        
+        # Calculate metrics
+        metrics = self._calculate_metrics(data_batch)
+        
+        # Create market state
+        state = MarketState(
+            encoded_state=market_encoded[0],
+            regime_label=regime,
+            current_price=float(data[-1, 3]),  # Latest close price
+            timestamp=timestamp,
+            metrics=metrics
+        )
+        
+        return state
+    
+    def create_training_batch(
         self,
         data: pd.DataFrame,
-        config: TradingConfig,
-        feature_normalizer: FeatureNormalizer,
-        target_calculator: TargetCalculator,
-        data_augmenter: Optional[DataAugmenter] = None,
-        is_training: bool = True
-    ):
-        """Initializes the dataset.
-
-        Args:
-            data: Input DataFrame containing market data
-            config: Trading configuration
-            feature_normalizer: Normalizer for features
-            target_calculator: Calculator for targets
-            data_augmenter: Optional augmenter for training data
-            is_training: Whether this is a training dataset
+        batch_size: int = 64
+    ) -> Tuple[DataLoader, RewardCalculator]:
         """
-        self.config = config
-        self.normalizer = feature_normalizer
-        self.target_calculator = target_calculator
-        self.augmenter = data_augmenter
-        self.is_training = is_training
-
-        self.features = self._prepare_features(data)
-        self.sequences, self.targets = self._create_sequences()
-
-        # Validate shapes
-        self._validate_shapes()
-
-    def _prepare_features(self, data: pd.DataFrame) -> torch.Tensor:
-        """Prepares and normalizes features from raw data.
-
-        Args:
-            data: Input DataFrame
-
-        Returns:
-            Normalized feature tensor
-        """
-        # Extract relevant features
-        feature_data = data[self.config.feature_keys + self.config.technical_indicators].values
-        features = torch.tensor(feature_data, dtype=torch.float32)
-
-        # Transform features using already fitted normalizer
-        normalized_features = self.normalizer.transform(features)
-
-        return normalized_features
-
-    def _create_sequences(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Creates sequences and corresponding targets.
-
-        Returns:
-            Tuple of (sequences, targets) tensors
-        """
-        total_sequences = len(self.features) - self.config.sequence_length - self.config.prediction_horizon + 1
-        sequences = []
-        targets = []
-
-        for i in range(total_sequences):
-            # Extract sequence
-            seq = self.features[i:i + self.config.sequence_length]
-
-            # Apply augmentation if training
-            if self.is_training and self.augmenter is not None:
-                seq = self.augmenter.augment(seq)
-
-            # Calculate target
-            target = self.target_calculator(
-                self.features,
-                i + self.config.sequence_length - 1,
-                self.config.prediction_horizon
-            )
-
-            sequences.append(seq)
-            targets.append(target)
-
-        return torch.stack(sequences), torch.stack(targets)
-
-    def _validate_shapes(self) -> None:
-        """Validates shapes of sequences and targets."""
-        expected_seq_shape = (None, self.config.sequence_length, self.config.input_dim)
-        expected_target_shape = (None, self.target_calculator.get_output_dim())
-
-        validate_tensor_shape(self.sequences, expected_seq_shape, "sequences")
-        validate_tensor_shape(self.targets, expected_target_shape, "targets")
-
-    def __len__(self) -> int:
-        """Returns the number of sequences in the dataset."""
-        return len(self.sequences)
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Returns a sequence and target pair.
-
-        Args:
-            idx: Index of the sequence to retrieve
-
-        Returns:
-            Tuple of (sequence, target) tensors
-        """
-        return self.sequences[idx], self.targets[idx]
-
-
-// File: src\pipeline\handlers.py
-# File: src/pipeline/handlers.py
-
-from abc import ABC, abstractmethod
-import torch
-from typing import Dict, Any, Tuple, List, Optional
-import logging
-from datetime import datetime, timezone
-import json
-import asyncio
-import websockets
-import queue
-from dataclasses import dataclass
-import itertools
-from concurrent.futures import ThreadPoolExecutor
-
-from pipeline.normalizers import FeatureNormalizer
-from pipeline.augmenters import DataAugmenter
-from config.config import TradingConfig, TargetType
-from data.base_preprocessor import ProcessingError
-from pipeline.market_indicators import TechnicalIndicators
-
-
-class TargetCalculator(ABC):
-    """Abstract base class for target calculation strategies."""
-
-    @abstractmethod
-    def __call__(self, data: torch.Tensor, index: int, horizon: int) -> torch.Tensor:
-        """Calculates the target value for a given index and horizon.
-
-        Args:
-            data: Input tensor containing feature data
-            index: Current time step index
-            horizon: Number of steps ahead to predict
-
-        Returns:
-            Tensor containing the calculated target value
-        """
-        pass
-
-    @abstractmethod
-    def get_output_dim(self) -> int:
-        """Returns the dimension of the target output."""
-        pass
-
-    @abstractmethod
-    def get_target_type(self) -> TargetType:
-        """Returns the type of target this calculator produces."""
-        pass
-
-
-class DirectionTargetCalculator(TargetCalculator):
-    """Calculates directional movement as target."""
-
-    def __init__(self):
-        self.target_type = TargetType.DIRECTION
-
-    def __call__(self, data: torch.Tensor, index: int, horizon: int) -> torch.Tensor:
-        """Calculates direction: 1 if price increases, 0 otherwise."""
-        current_price = data[index, 3]  # Assuming 'close' is at index 3
-        future_price = data[index + horizon, 3]
-        direction = 1.0 if future_price > current_price else 0.0
-        return torch.tensor(direction, dtype=torch.float32)
-
-    def get_output_dim(self) -> int:
-        return 1
-
-    def get_target_type(self) -> TargetType:
-        return self.target_type
-
-
-@dataclass
-class RealTimeDataHandler:
-    """Handles real-time market data processing and buffering."""
-
-    config: TradingConfig
-    normalizer: FeatureNormalizer
-    target_calculator: TargetCalculator
-    feature_extractor: Any  # Replace with actual type if available
-    buffer_size: int = 300
-    max_reconnect_attempts: int = 5
-
-    def __post_init__(self):
-        """Initializes buffers and queues."""
-        self.feature_buffer = FeatureBuffer(self.buffer_size)
-        self.sequence_queue = queue.Queue(maxsize=self.config.batch_size * 2)
-
-        # Initialize state
-        self._is_running = False
-        self._websocket = None
-        self._executor = ThreadPoolExecutor(max_workers=2)
-        self.logger = logging.getLogger(__name__)
-
-    async def start(self, uri: str) -> None:
-        """Starts the real-time data handling process.
-
-        Args:
-            uri: WebSocket URI to connect to
-        """
-        self._is_running = True
-        reconnect_attempts = 0
-
-        while self._is_running and reconnect_attempts < self.max_reconnect_attempts:
-            try:
-                async with websockets.connect(uri) as websocket:
-                    self._websocket = websocket
-                    reconnect_attempts = 0  # Reset counter on successful connection
-                    self.logger.info(f"Connected to {uri}")
-
-                    while self._is_running:
-                        message = await websocket.recv()
-                        await self._process_message(message)
-
-            except websockets.exceptions.ConnectionClosed:
-                reconnect_attempts += 1
-                wait_time = min(2 ** reconnect_attempts, 60)  # Exponential backoff
-                self.logger.warning(
-                    f"Connection lost. Retrying in {wait_time}s "
-                    f"(attempt {reconnect_attempts}/{self.max_reconnect_attempts})"
-                )
-                await asyncio.sleep(wait_time)
-
-            except Exception as e:
-                self.logger.error(f"Error in WebSocket connection: {str(e)}")
-                break
-
-        self._is_running = False
-        self.logger.info("Real-time data handler stopped")
-
-    async def _process_message(self, message: str) -> None:
-        """Processes incoming WebSocket messages.
-
-        Args:
-            message: Raw WebSocket message
-        """
-        loop = asyncio.get_event_loop()
-        try:
-            data = json.loads(message)
-
-            # Extract features asynchronously to prevent blocking
-            features = await loop.run_in_executor(
-                self._executor,
-                self.feature_extractor.extract_features,
-                data
-            )
-
-            # Handle missing timestamps by extrapolating from previous data
-            if 'timestamp' not in data or data['timestamp'] is None:
-                if self.feature_buffer.buffer:
-                    last_timestamp = self.feature_buffer.buffer[-1].get('timestamp', datetime.now(timezone.utc).timestamp() * 1000)
-                    features['timestamp'] = last_timestamp + 60000  # Add 1 minute in ms
-                else:
-                    features['timestamp'] = datetime.now(timezone.utc).timestamp() * 1000
-
-            # Convert to tensor
-            feature_tensor = torch.tensor(features.values, dtype=torch.float32)
-
-            # Normalize features asynchronously
-            normalized_features = await loop.run_in_executor(
-                self._executor,
-                self.normalizer.transform,
-                feature_tensor.unsqueeze(0)
-            )
-            normalized_features = normalized_features.squeeze(0)
-
-            # Add to buffer
-            self.feature_buffer.append(normalized_features)
-
-            # Get sequence if available
-            sequence = self.feature_buffer.get_sequence(self.config.sequence_length)
-            if sequence is not None:
-                # Add to queue if space available
-                try:
-                    self.sequence_queue.put_nowait(sequence)
-                except queue.Full:
-                    self.logger.warning("Sequence queue full, dropping oldest sequence")
-                    self.sequence_queue.get_nowait()  # Remove oldest
-                    self.sequence_queue.put_nowait(sequence)
-
-        except json.JSONDecodeError:
-            self.logger.error("Failed to decode WebSocket message")
-        except Exception as e:
-            self.logger.error(f"Error processing message: {str(e)}")
-
-    def get_next_sequence(self, timeout: float = 0.1) -> Optional[torch.Tensor]:
-        """Retrieves the next available sequence.
-
-        Args:
-            timeout: Time to wait for sequence in seconds
-
-        Returns:
-            Sequence tensor if available, None otherwise
-        """
-        try:
-            return self.sequence_queue.get(timeout=timeout)
-        except queue.Empty:
-            return None
-
-    def stop(self) -> None:
-        """Stops the real-time data handler."""
-        self._is_running = False
-        if self._websocket:
-            asyncio.create_task(self._websocket.close())
-        self._executor.shutdown(wait=True)
-
-
-class FeatureBuffer:
-    """Thread-safe buffer for storing and managing feature sequences."""
-
-    def __init__(self, max_size: int):
-        """Initializes the feature buffer.
-
-        Args:
-            max_size: Maximum number of features to store
-        """
-        self.max_size = max_size
-        self.buffer = deque(maxlen=max_size)
-        self._lock = threading.Lock()
-
-    def append(self, features: torch.Tensor) -> None:
-        """Appends features to the buffer thread-safely.
-
-        Args:
-            features: Feature tensor to append
-        """
-        with self._lock:
-            # Optionally include timestamp for extrapolation
-            # Assuming features include a timestamp at a specific index
-            self.buffer.append(features)
-
-    def get_sequence(self, sequence_length: int) -> Optional[torch.Tensor]:
-        """Retrieves a sequence of specified length if available.
-
-        Args:
-            sequence_length: Length of sequence to retrieve
-
-        Returns:
-            Sequence tensor if available, None otherwise
-        """
-        with self._lock:
-            if len(self.buffer) < sequence_length:
-                return None
-
-            sequence = list(itertools.islice(
-                self.buffer,
-                len(self.buffer) - sequence_length,
-                len(self.buffer)
-            ))
-            return torch.stack(sequence)
-
-    def clear(self) -> None:
-        """Clears the buffer."""
-        with self._lock:
-            self.buffer.clear()
-
-
-// File: src\pipeline\market_indicators.py
-# File: src/pipeline/market_indicators.py
-
-import numpy as np
-import pandas as pd
-import ta
-from typing import List, Union, Dict, Tuple
-from dataclasses import dataclass, field
-from config.config import TradingConfig, IndicatorConfig
-
-
-@dataclass
-class IndicatorConfig:
-    """Configuration class for technical indicators"""
-    # MACD parameters
-    macd_fast: int = 12
-    macd_slow: int = 26
-    macd_signal: int = 9
-
-    # Bollinger Bands parameters
-    bb_period: int = 20
-    bb_std: int = 2
-
-    # Multiple periods for EMA and RSI
-    ema_periods: List[int] = field(default_factory=lambda: [5, 10, 20, 60, 120])
-    rsi_periods: List[int] = field(default_factory=lambda: [6, 14, 24])
-
-    # Volatility calculation period
-    volatility_period: int = 20
-
-    # Follow Line (FL) parameters
-    fl_atr_period: int = 5
-    fl_bb_period: int = 21
-    fl_bb_deviation: float = 1.00
-    fl_use_atr_filter: bool = True
-
-
-class TechnicalIndicators:
-    """Class for calculating various technical indicators"""
-
-    def __init__(self, config: IndicatorConfig = None):
-        """Initialize with optional custom configuration"""
-        self.config = config or IndicatorConfig()
-
-    def calculate_all(self, df: pd.DataFrame) -> Dict:
-        """Calculate all technical indicators
-
-        Args:
-            df: DataFrame with 'high', 'low', 'close' columns
-
-        Returns:
-            Dictionary containing all calculated indicators
-        """
-        indicators = {}
-
-        # Multiple RSI periods
-        indicators['rsi'] = {
-            f'rsi_{period}': self.calculate_rsi(df, period)
-            for period in self.config.rsi_periods
-        }
-
-        # Multiple EMA periods
-        indicators['ema'] = {
-            f'ema_{period}': self.calculate_ema(df, period)
-            for period in self.config.ema_periods
-        }
-
-        # MACD
-        indicators.update(self.calculate_macd(df))
-
-        # Bollinger Bands
-        indicators.update(self.calculate_bollinger_bands(df))
-
-        # Volatility
-        indicators['volatility'] = self.calculate_volatility(
-            df,
-            self.config.volatility_period
-        )
-
-        # Follow Line
-        indicators.update(self.calculate_follow_line(df))
-
-        return indicators
-
-    def calculate_follow_line(self, df: pd.DataFrame) -> Dict[str, Union[pd.Series, Dict[str, pd.Series]]]:
-        """Calculate the Follow Line (FL) indicator and its signals
-
-        Args:
-            df: DataFrame with 'high', 'low', 'close' columns
-
-        Returns:
-            Dictionary containing FL values and signals
-        """
-        # Calculate Bollinger Bands
-        bb = ta.volatility.BollingerBands(
-            close=df['close'],
-            window=self.config.fl_bb_period,
-            window_dev=self.config.fl_bb_deviation
-        )
-        upper_band = bb.bollinger_hband()
-        lower_band = bb.bollinger_lband()
-
-        # Calculate ATR
-        atr = ta.volatility.AverageTrueRange(
-            high=df['high'],
-            low=df['low'],
-            close=df['close'],
-            window=self.config.fl_atr_period
-        ).average_true_range()
-
-        # Initialize Follow Line series
-        fl = pd.Series(index=df.index, dtype=float)
-        trend = pd.Series(index=df.index, dtype=float)
-
-        # Calculate Follow Line values
-        for i in range(len(df)):
-            if i == 0:
-                fl.iloc[i] = df['close'].iloc[i]
-                trend.iloc[i] = 0
-                continue
-
-            prev_fl = fl.iloc[i - 1]
-            curr_price = df['close'].iloc[i]
-            curr_high = df['high'].iloc[i]
-            curr_low = df['low'].iloc[i]
-
-            # Determine new FL value based on price position relative to Bollinger Bands
-            if curr_price > upper_band.iloc[i]:
-                new_fl = curr_low - (atr.iloc[i] if self.config.fl_use_atr_filter else 0)
-            elif curr_price < lower_band.iloc[i]:
-                new_fl = curr_high + (atr.iloc[i] if self.config.fl_use_atr_filter else 0)
-            else:
-                new_fl = prev_fl
-
-            # Adjust FL based on trend to prevent unnecessary reversals
-            if prev_fl > new_fl:  # Previous trend was up
-                fl.iloc[i] = min(prev_fl, new_fl)
-                trend.iloc[i] = -1 if fl.iloc[i] < prev_fl else 1
-            else:  # Previous trend was down or flat
-                fl.iloc[i] = max(prev_fl, new_fl)
-                trend.iloc[i] = 1 if fl.iloc[i] > prev_fl else -1
-
-        # Generate buy/sell signals
-        signals = self._generate_fl_signals(trend)
-
-        return {
-            'follow_line': {
-                'fl_value': fl,
-                'fl_trend': trend,
-                'signals': signals
-            }
-        }
-
-    def _generate_fl_signals(self, trend: pd.Series) -> Dict[str, pd.Series]:
-        """Generate buy/sell signals based on trend changes
-
-        Args:
-            trend: Series of trend values (1 for up, -1 for down)
-
-        Returns:
-            Dictionary containing buy and sell signals
-        """
-        buy_signals = (trend == 1) & (trend.shift(1) == -1)
-        sell_signals = (trend == -1) & (trend.shift(1) == 1)
-
-        return {
-            'buy_signals': buy_signals,
-            'sell_signals': sell_signals
-        }
-
-    def calculate_rsi(self, df: pd.DataFrame, period: int) -> pd.Series:
-        """Calculate Relative Strength Index for a given period"""
-        rsi = ta.momentum.RSIIndicator(
-            close=df['close'],
-            window=period
-        )
-        return rsi.rsi()
-
-    def calculate_ema(self, df: pd.DataFrame, period: int) -> pd.Series:
-        """Calculate Exponential Moving Average for a given period"""
-        ema = ta.trend.EMAIndicator(
-            close=df['close'],
-            window=period
-        )
-        return ema.ema_indicator()
-
-    def calculate_macd(self, df: pd.DataFrame) -> Dict[str, pd.Series]:
-        """Calculate MACD indicator with its components"""
-        macd = ta.trend.MACD(
-            close=df['close'],
-            window_slow=self.config.macd_slow,
-            window_fast=self.config.macd_fast,
-            window_sign=self.config.macd_signal
-        )
-        return {
-            'macd_line': macd.macd(),
-            'macd_signal': macd.macd_signal(),
-            'macd_histogram': macd.macd_diff()
-        }
-
-    def calculate_bollinger_bands(self, df: pd.DataFrame) -> Dict[str, pd.Series]:
-        """Calculate Bollinger Bands components"""
-        bb = ta.volatility.BollingerBands(
-            close=df['close'],
-            window=self.config.bb_period,
-            window_dev=self.config.bb_std
-        )
-        return {
-            'bb_upper': bb.bollinger_hband(),
-            'bb_middle': bb.bollinger_mavg(),
-            'bb_lower': bb.bollinger_lband(),
-            'bb_bandwidth': bb.bollinger_hband() - bb.bollinger_lband()
-        }
-
-    def calculate_volatility(self, df: pd.DataFrame, window: int) -> pd.Series:
-        """Calculate annualized price volatility"""
-        returns = df['close'].pct_change().dropna()
-        return returns.rolling(window=window).std() * np.sqrt(252)
-
-
-// File: src\pipeline\metrics.py
-# File: src/pipeline/metrics.py
-
-import time
-from typing import Dict, List
-import logging
-
-
-class PipelineMetrics:
-    """Tracks and logs pipeline performance metrics."""
-
-    def __init__(self):
-        """Initializes the metrics tracker."""
-        self.metrics: Dict[str, List[float]] = {
-            'processing_time': [],
-            'queue_size': [],
-            'sequence_length': []
-        }
-        self.start_time = time.time()
-        self.logger = logging.getLogger(__name__)
-
-    def update(self, metric_name: str, value: float) -> None:
-        """Updates a metric value.
-
-        Args:
-            metric_name: Name of the metric
-            value: New value
-        """
-        if metric_name in self.metrics:
-            self.metrics[metric_name].append(value)
-
-    def log_summary(self) -> None:
-        """Logs a summary of tracked metrics."""
-        runtime = time.time() - self.start_time
-
-        for name, values in self.metrics.items():
-            if values:
-                avg_value = sum(values) / len(values)
-                min_value = min(values)
-                max_value = max(values)
-                self.logger.info(
-                    f"{name} - Average: {avg_value:.4f}, "
-                    f"Min: {min_value:.4f}, "
-                    f"Max: {max_value:.4f}"
-                )
-
-        self.logger.info(f"Total runtime: {runtime:.2f}s")
-
-    def reset(self) -> None:
-        """Resets all metrics."""
-        for key in self.metrics:
-            self.metrics[key] = []
-        self.start_time = time.time()
-
-
-// File: src\pipeline\normalizers.py
-# src/pipeline/normalizers.py
-"""Feature normalization implementation"""
-
-from abc import ABC, abstractmethod
-import torch
-from typing import Dict, Optional
-from shared.types import NormalizationType
-from shared.exceptions import ProcessingError
-
-class BaseNormalizer(ABC):
-    """Abstract base class for feature normalization."""
-    
-    @abstractmethod
-    def fit(self, data: torch.Tensor) -> None:
-        pass
-    
-    @abstractmethod
-    def transform(self, data: torch.Tensor) -> torch.Tensor:
-        pass
-    
-    @abstractmethod
-    def inverse_transform(self, data: torch.Tensor) -> torch.Tensor:
-        pass
-
-class FeatureNormalizer(BaseNormalizer):
-    """Implements various normalization strategies."""
-    
-    def __init__(self, method: NormalizationType, epsilon: float = 1e-8):
-        self.method = method
-        self.epsilon = epsilon
-        self.params: Dict[str, torch.Tensor] = {}
-        self._is_fitted = False
-    
-    def fit(self, data: torch.Tensor) -> None:
-        if self.method == NormalizationType.STANDARD:
-            self.params["mean"] = data.mean(dim=0)
-            self.params["std"] = data.std(dim=0)
-        elif self.method == NormalizationType.MINMAX:
-            self.params["min"] = data.min(dim=0)[0]
-            self.params["max"] = data.max(dim=0)[0]
-        elif self.method == NormalizationType.ROBUST:
-            q1 = torch.quantile(data, 0.25, dim=0)
-            q3 = torch.quantile(data, 0.75, dim=0)
-            self.params["median"] = torch.median(data, dim=0)[0]
-            self.params["iqr"] = q3 - q1
+        Create training batches and reward calculator
         
-        self._is_fitted = True
-    
-    def transform(self, data: torch.Tensor) -> torch.Tensor:
-        if not self._is_fitted and self.method != NormalizationType.NONE:
-            raise ProcessingError("Normalizer must be fitted before transform")
-            
-        if self.method == NormalizationType.STANDARD:
-            return (data - self.params["mean"]) / (self.params["std"] + self.epsilon)
-        elif self.method == NormalizationType.MINMAX:
-            denominator = self.params["max"] - self.params["min"]
-            denominator[denominator == 0] = 1
-            return (data - self.params["min"]) / denominator
-        elif self.method == NormalizationType.ROBUST:
-            return (data - self.params["median"]) / (self.params["iqr"] + self.epsilon)
-        
-        return data
-    
-    def inverse_transform(self, data: torch.Tensor) -> torch.Tensor:
-        if not self._is_fitted and self.method != NormalizationType.NONE:
-            raise ProcessingError("Normalizer must be fitted before inverse_transform")
-            
-        if self.method == NormalizationType.STANDARD:
-            return data * (self.params["std"] + self.epsilon) + self.params["mean"]
-        elif self.method == NormalizationType.MINMAX:
-            denominator = self.params["max"] - self.params["min"]
-            denominator[denominator == 0] = 1
-            return data * denominator + self.params["min"]
-        elif self.method == NormalizationType.ROBUST:
-            return data * (self.params["iqr"] + self.epsilon) + self.params["median"]
-            
-        return data
-
-// File: src\pipeline\pipeline.py
-# File: src/pipeline/pipeline.py
-
-from typing import Any, Optional, Tuple
-import torch
-from torch.utils.data import DataLoader
-from pathlib import Path
-import pandas as pd
-import logging
-
-from config.config import TradingConfig
-from pipeline.normalizers import FeatureNormalizer, NormalizationType
-from pipeline.augmenters import DataAugmenter
-from pipeline.datasets import SequencedMarketDataset
-from pipeline.handlers import RealTimeDataHandler, TargetCalculator, DirectionTargetCalculator
-from pipeline.metrics import PipelineMetrics
-from utils.logging import custom_logger
-from data.base_preprocessor import MarketDataPreprocessor
-from pipeline.market_indicators import IndicatorConfig, TechnicalIndicators
-
-
-class TradingDataPipeline:
-    """Orchestrates the complete trading data pipeline."""
-
-    def __init__(
-        self,
-        config: TradingConfig,
-        target_calculator: TargetCalculator,
-        device: torch.device = None
-    ):
-        """Initializes the trading pipeline.
-
         Args:
-            config: Trading configuration
-            target_calculator: Calculator for target values
-            device: Torch device to use
-        """
-        self.config = config
-        self.target_calculator = target_calculator
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        # Initialize components
-        self.feature_normalizer = FeatureNormalizer(
-            method=config.target_normalization,
-            epsilon=config.epsilon
-        )
-        self.data_augmenter = DataAugmenter(config) if config.use_augmentation else None
-
-        self.logger = custom_logger.logger
-
-        # Initialize technical indicators
-        self.technical_indicators = TechnicalIndicators(
-            IndicatorConfig()
-        )
-
-    def prepare_data(
-        self,
-        data_path: Path,
-        train_split: float = 0.8
-    ) -> Tuple[DataLoader, DataLoader]:
-        """Prepares training and validation data loaders.
-
-        Args:
-            data_path: Path to raw data file
-            train_split: Ratio of data to use for training
-
+            data: Market data DataFrame with timestamp index
+            batch_size: Size of training batches
+            
         Returns:
-            Tuple of (train_loader, val_loader)
+            DataLoader for training
+            RewardCalculator instance
         """
-        # Load and preprocess data
-        preprocessor = MarketDataPreprocessor(self.config, data_path, self.technical_indicators)
-        preprocessor.load_data()
-        preprocessor.clean_data()
-        preprocessor.normalize_features()
-        processed_data = preprocessor.get_processed_data()
-
-        # Split data
-        train_data, val_data = self._split_data(processed_data, train_split)
-
-        # Fit scaler on training data
-        feature_columns = self.config.feature_keys + self.config.technical_indicators
-        train_features = torch.tensor(train_data[feature_columns].values, dtype=torch.float32)
-        self.feature_normalizer.fit(train_features)
-
-        # Normalize both training and validation data
-        preprocessor.normalizer = self.feature_normalizer  # Ensure preprocessor uses the same scaler
-        preprocessor.normalize_features()
-        train_data = preprocessor.get_processed_data().iloc[:len(train_data)]
-        val_data = preprocessor.get_processed_data().iloc[len(train_data):]
-
-        # Create datasets
-        train_dataset = SequencedMarketDataset(
-            train_data,
-            self.config,
-            self.feature_normalizer,
-            self.target_calculator,
-            self.data_augmenter,
-            is_training=True
+        # Validate input data
+        if not isinstance(data.index, pd.DatetimeIndex):
+            raise ValueError("DataFrame must have DatetimeIndex")
+        
+        # Infer data frequency if not set
+        if data.index.freq is None:
+            freq = pd.infer_freq(data.index)
+            if freq is None:
+                raise ValueError("Cannot infer data frequency")
+            data.index.freq = freq
+        
+        # Create sequences
+        states = []
+        timestamps = pd.date_range(
+            start=data.index[0],
+            periods=len(data)-self.sequence_length+1,
+            freq=data.index.freq
         )
-
-        val_dataset = SequencedMarketDataset(
-            val_data,
-            self.config,
-            self.feature_normalizer,
-            self.target_calculator,
-            is_training=False
-        )
-
-        # Create data loaders
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=self.config.batch_size,
+        
+        for i in range(len(data) - self.sequence_length + 1):
+            sequence = data.iloc[i:i+self.sequence_length].values
+            state = self.encode_sequence(sequence, timestamps[i])
+            states.append(state)
+        
+        # Create dataset
+        encoded_states = torch.stack([s.encoded_state for s in states])
+        dataset = TensorDataset(encoded_states)
+        
+        # Create dataloader
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
             shuffle=True,
-            num_workers=self.config.num_workers,
-            pin_memory=self.config.pin_memory,
-            prefetch_factor=self.config.prefetch_factor
+            pin_memory=True
         )
-
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=self.config.batch_size,
-            shuffle=False,
-            num_workers=self.config.num_workers,
-            pin_memory=self.config.pin_memory,
-            prefetch_factor=self.config.prefetch_factor
-        )
-
-        self.logger.info(
-            f"Data split - Training: {len(train_data):,} samples, "
-            f"Validation: {len(val_data):,} samples"
-        )
-
-        return train_loader, val_loader
-
-    def create_realtime_handler(self, feature_extractor: Optional[Any] = None) -> RealTimeDataHandler:
-        """Creates a real-time data handler instance.
-
-        Args:
-            feature_extractor: Optional MarketFeatureExtractor instance
-
-        Returns:
-            Configured RealTimeDataHandler instance
-        """
-        if feature_extractor is None:
-            from pipeline.handlers import MarketFeatureExtractor
-            feature_extractor = MarketFeatureExtractor(self.config)
-
-        return RealTimeDataHandler(
-            config=self.config,
-            normalizer=self.feature_normalizer,
-            target_calculator=self.target_calculator,
-            feature_extractor=feature_extractor
-        )
-
-    def _split_data(
-        self,
-        data: pd.DataFrame,
-        train_split: float
-    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Splits data into training and validation sets.
-
-        Args:
-            data: Input DataFrame
-            train_split: Ratio of data to use for training
-
-        Returns:
-            Tuple of (train_data, val_data)
-        """
-        split_idx = int(len(data) * train_split)
-        train_data = data.iloc[:split_idx].copy()
-        val_data = data.iloc[split_idx:].copy()
-
-        return train_data, val_data
-
-    def save_pipeline_state(self, path: Path) -> None:
-        """Saves the pipeline state for later use.
-
-        Args:
-            path: Path to save state
-        """
-        state = {
-            'config': self.config.to_dict(),
-            'normalizer_params': self.feature_normalizer.params,
-            'normalizer_method': self.feature_normalizer.method.value
-        }
-
-        path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(state, path)
-        self.logger.info(f"Pipeline state saved to {path}")
-
-    def load_pipeline_state(self, path: Path) -> None:
-        """Loads a saved pipeline state.
-
-        Args:
-            path: Path to saved state
-        """
-        try:
-            state = torch.load(path)
-            self.config = TradingConfig(**state['config'])
-            self.feature_normalizer = FeatureNormalizer(
-                method=NormalizationType(state['normalizer_method']),
-                epsilon=self.config.epsilon
-            )
-            self.feature_normalizer.params = state['normalizer_params']
-            self.feature_normalizer._is_fitted = True
-
-            self.logger.info(f"Pipeline state loaded from {path}")
-
-        except Exception as e:
-            self.logger.error(f"Error loading pipeline state: {str(e)}")
-            raise
-
-
-// File: src\pipeline\__init__.py
-# File: src/pipeline/__init__.py
-
-from .normalizers import FeatureNormalizer, NormalizationType
-from .augmenters import DataAugmenter
-from .datasets import SequencedMarketDataset
-from .handlers import RealTimeDataHandler, TargetCalculator, DirectionTargetCalculator
-from .metrics import PipelineMetrics
-from .pipeline import TradingDataPipeline, PipelineMetrics
-from .feature_transformer import KlineFeatureTransformer, KlineTransformerConfig
-from .market_indicators import TechnicalIndicators, IndicatorConfig
-
-
-// File: src\shared\exceptions.py
-"""Custom exceptions used across modules"""
-
-class ValidationError(Exception):
-    """Raised when data validation fails"""
-    pass
-
-class ProcessingError(Exception):
-    """Raised when data processing fails"""
-    pass
-
-// File: src\shared\types.py
-# src/shared/types.py
-"""Common types and enums used across modules"""
-
-from enum import Enum
-from dataclasses import dataclass
-from typing import List, Dict, Any, Optional
-
-class TargetType(Enum):
-    """Enumeration of supported target types."""
-    DIRECTION = "direction"
-    PRICE = "price"
-    VOLATILITY = "volatility"
-    CUSTOM = "custom"
-
-class NormalizationType(Enum):
-    """Enumeration of supported normalization methods."""
-    STANDARD = "standard"
-    MINMAX = "minmax"
-    ROBUST = "robust"
-    NONE = "none"
-
-@dataclass
-class ProcessingMetrics:
-    """Metrics for monitoring processing performance"""
-    cpu_percent: float
-    memory_percent: float
-    gpu_utilization: List[float]
-    gpu_memory_percent: List[float]
-
-# src/shared/exceptions.py
-"""Custom exceptions used across modules"""
-
-class ValidationError(Exception):
-    """Raised when data validation fails"""
-    pass
-
-class ProcessingError(Exception):
-    """Raised when data processing fails"""
-    pass
-
-// File: src\utils\logging.py
-# File: src/utils/logging.py
-
-from loguru import logger
-import sys
-from pathlib import Path
-from datetime import datetime
-import json
-from typing import Dict, Any
-
-class CustomLogger:
-    def __init__(self, log_dir: str = "logs"):
-        self.log_dir = Path(log_dir)
-        self.log_dir.mkdir(exist_ok=True)
-
-        # Remove default logger and set up our custom configuration
-        logger.remove()
-
-        # Add file handler
-        log_file = self.log_dir / f"trading_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-        logger.add(
-            log_file,
-            format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
-            level="INFO",
-            rotation="1 day",
-            compression="zip"
-        )
-
-        # Add console handler
-        logger.add(
-            sys.stdout,
-            format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-            level="INFO"
-        )
-
-    def log_metrics(self, metrics: Dict[str, Any], step: int):
-        """Log metrics to both file and wandb if configured."""
-        metrics_str = json.dumps(metrics)
-        logger.info(f"Step {step} metrics: {metrics_str}")
-
-custom_logger = CustomLogger()  # Singleton instance
-
-
-// File: src\utils\system_monitor.py
-import psutil
-import GPUtil
-from dataclasses import dataclass
-from typing import List, Dict
-import numpy as np
-from loguru import logger
-
-@dataclass
-class SystemMetrics:
-    cpu_percent: float
-    memory_percent: float
-    gpu_utilization: List[float]
-    gpu_memory_utilization: List[float]
-
-class SystemMonitor:
-    def __init__(self):
-        self.metrics_history: List[SystemMetrics] = []
         
-    def get_metrics(self) -> SystemMetrics:
-        """Get current system metrics"""
-        try:
-            # CPU and Memory
-            cpu_percent = psutil.cpu_percent(interval=1)
-            memory_percent = psutil.virtual_memory().percent
-            
-            # GPU metrics
-            gpus = GPUtil.getGPUs()
-            gpu_utilization = [gpu.load * 100 for gpu in gpus]
-            gpu_memory_utilization = [gpu.memoryUtil * 100 for gpu in gpus]
-            
-            metrics = SystemMetrics(
-                cpu_percent=cpu_percent,
-                memory_percent=memory_percent,
-                gpu_utilization=gpu_utilization,
-                gpu_memory_utilization=gpu_memory_utilization
-            )
-            
-            self.metrics_history.append(metrics)
-            return metrics
-            
-        except Exception as e:
-            logger.error(f"Error getting system metrics: {str(e)}")
-            return SystemMetrics(0.0, 0.0, [], [])
-            
-    def get_metrics_summary(self) -> Dict[str, float]:
-        """Get summary statistics of system metrics"""
-        if not self.metrics_history:
+        # Create reward calculator with regime-specific multipliers
+        regime_multipliers = self._get_regime_multipliers()
+        reward_calc = RewardCalculator(regime_multipliers=regime_multipliers)
+        
+        return dataloader, reward_calc
+    
+    def _get_regime_multipliers(self) -> Dict[int, float]:
+        """Get reward multipliers based on regime characteristics"""
+        if not hasattr(self.regime_detector, 'get_regime_characteristics'):
             return {}
             
-        metrics_array = np.array([
-            [m.cpu_percent, m.memory_percent] +
-            m.gpu_utilization +
-            m.gpu_memory_utilization
-            for m in self.metrics_history
+        characteristics = self.regime_detector.get_regime_characteristics()
+        multipliers = {}
+        
+        for regime in characteristics:
+            regime_id = regime['regime_id']
+            chars = regime['characteristics']
+            
+            # Calculate multiplier based on regime characteristics
+            volatility = chars.get('volatility', 0)
+            trend = chars.get('trend', 0)
+            
+            # Reduce rewards in high volatility regimes
+            vol_factor = 1.0 - min(volatility, 0.5)
+            
+            # Increase rewards in trending regimes
+            trend_factor = 1.0 + abs(trend)
+            
+            multipliers[regime_id] = vol_factor * trend_factor
+            
+        return multipliers
+
+def process_training_data(
+    csv_path: str,
+    sequence_length: int = 60,
+    batch_size: int = 64
+) -> Dict:
+    """
+    Process market data for DRL training
+    
+    Args:
+        csv_path: Path to CSV file containing market data
+        sequence_length: Length of market sequences
+        batch_size: Size of training batches
+        
+    Returns:
+        Dictionary containing processed data and components
+    """
+    # Load and preprocess data
+    df = pd.read_csv(csv_path)
+    df['timestamp'] = pd.to_datetime(df['open_time'])
+    df.set_index('timestamp', inplace=True)
+    
+    # Initialize encoder
+    encoder = HypersphericalEncoder(sequence_length=sequence_length)
+    
+    # Prepare data for fitting scalers
+    num_samples_for_fit = min(10000, len(df) - sequence_length + 1)
+    data_for_fit = []
+    for i in range(num_samples_for_fit):
+        sequence = df.iloc[i:i+sequence_length].values
+        data_for_fit.append(sequence)
+    data_for_fit = np.array(data_for_fit)
+    
+    # Fit scalers before creating training batches
+    encoder.fit_scalers(data_for_fit)
+    
+    # Create training batches
+    dataloader, reward_calc = encoder.create_training_batch(df, batch_size)
+    
+    return {
+        'dataloader': dataloader,
+        'encoder': encoder,
+        'reward_calculator': reward_calc
+    }
+
+def main():
+    """Main entry point for data processing"""
+    # Process training data
+    results = process_training_data("data/raw/btc_usdt_1m_processed.csv")
+    
+    # Create output directory
+    output_dir = Path("data/processed")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save processed data
+    torch.save(results, output_dir / "drl_training_data.pt")
+    print(f"Processed data saved to {output_dir / 'drl_training_data.pt'}")
+
+if __name__ == "__main__":
+    main()
+
+// File: viz.py
+import numpy as np
+import pandas as pd
+import torch
+from pathlib import Path
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+import seaborn as sns
+from typing import Dict, List, Tuple, Optional
+import matplotlib.pyplot as plt
+
+from train import HypersphericalEncoder, process_training_data
+from market_base import MarketState
+from regime import MarketRegimeDetector
+
+class MarketVisualizer:
+    """Visualization tools for market data and encoded states"""
+    
+    def __init__(self, data_path: str = "data/raw/btc_usdt_1m_processed.csv"):
+        """
+        Initialize visualizer with data path
+        
+        Args:
+            data_path: Path to processed market data CSV
+        """
+        self.data_path = Path(data_path)
+        if not self.data_path.exists():
+            raise FileNotFoundError(f"Data file not found: {data_path}")
+        
+        # Load data
+        self.df = pd.read_csv(self.data_path)
+        self.df['timestamp'] = pd.to_datetime(self.df['open_time'])
+        self.df.set_index('timestamp', inplace=True)
+        
+        # Initialize encoder and process data
+        self.results = process_training_data(str(self.data_path))
+        self.encoder = self.results['encoder']
+        
+    def plot_market_overview(self, days: int = 30) -> go.Figure:
+        """
+        Create interactive overview of market data
+        
+        Args:
+            days: Number of recent days to display
+            
+        Returns:
+            Plotly figure with market overview
+        """
+        recent_data = self.df.tail(days * 1440)  # 1440 minutes per day
+        
+        fig = make_subplots(
+            rows=3, cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.05,
+            subplot_titles=('Price Action', 'Volume', 'Technical Indicators'),
+            row_heights=[0.5, 0.2, 0.3]
+        )
+        
+        # Candlestick chart
+        fig.add_trace(
+            go.Candlestick(
+                x=recent_data.index,
+                open=recent_data['open'],
+                high=recent_data['high'],
+                low=recent_data['low'],
+                close=recent_data['close'],
+                name='OHLC'
+            ),
+            row=1, col=1
+        )
+        
+        # Volume
+        fig.add_trace(
+            go.Bar(
+                x=recent_data.index,
+                y=recent_data['volume'],
+                name='Volume'
+            ),
+            row=2, col=1
+        )
+        
+        # Technical indicators
+        for indicator in ['rsi_14', 'macd', 'bb_upper', 'bb_lower']:
+            if indicator in recent_data.columns:
+                fig.add_trace(
+                    go.Scatter(
+                        x=recent_data.index,
+                        y=recent_data[indicator],
+                        name=indicator.upper()
+                    ),
+                    row=3, col=1
+                )
+        
+        fig.update_layout(
+            title='Market Data Overview',
+            height=1000,
+            xaxis3_title='Date',
+            showlegend=True
+        )
+        
+        return fig
+    
+    def visualize_hypersphere(
+        self,
+        n_samples: int = 1000,
+        projection_method: str = 'pca',
+        perplexity: int = 30
+    ) -> go.Figure:
+        """
+        Visualize encoded states in reduced dimensionality
+        
+        Args:
+            n_samples: Number of samples to visualize
+            projection_method: 'pca' or 'tsne'
+            perplexity: Perplexity parameter for t-SNE
+            
+        Returns:
+            Plotly figure with encoded states visualization
+        """
+        # Get encoded states
+        states = []
+        for i in range(min(n_samples, len(self.df) - self.encoder.sequence_length)):
+            sequence = self.df.iloc[i:i+self.encoder.sequence_length].values
+            timestamp = self.df.index[i+self.encoder.sequence_length-1]
+            state = self.encoder.encode_sequence(sequence, timestamp)
+            states.append(state)
+        
+        # Extract encoded tensors and regimes
+        encoded_states = torch.stack([s.encoded_state for s in states]).numpy()
+        regimes = [s.regime_label for s in states]
+        
+        # Reduce dimensionality
+        if projection_method == 'pca':
+            reducer = PCA(n_components=3)
+        else:  # t-SNE
+            reducer = TSNE(n_components=3, perplexity=perplexity)
+            
+        reduced_states = reducer.fit_transform(encoded_states)
+        
+        # Create 3D scatter plot
+        fig = go.Figure(data=[
+            go.Scatter3d(
+                x=reduced_states[:, 0],
+                y=reduced_states[:, 1],
+                z=reduced_states[:, 2],
+                mode='markers',
+                marker=dict(
+                    size=5,
+                    color=regimes,
+                    colorscale='Viridis',
+                    opacity=0.8
+                ),
+                text=[f"Regime: {r}" for r in regimes],
+                hoverinfo='text'
+            )
         ])
         
-        return {
-            'cpu_mean': np.mean(metrics_array[:, 0]),
-            'cpu_max': np.max(metrics_array[:, 0]),
-            'memory_mean': np.mean(metrics_array[:, 1]),
-            'memory_max': np.max(metrics_array[:, 1]),
-            'gpu_util_mean': np.mean(metrics_array[:, 2:2+len(self.metrics_history[0].gpu_utilization)]),
-            'gpu_memory_mean': np.mean(metrics_array[:, -len(self.metrics_history[0].gpu_memory_utilization):])
-        }
+        # Update layout
+        fig.update_layout(
+            title=f'Encoded States Visualization ({projection_method.upper()})',
+            scene=dict(
+                xaxis_title='Component 1',
+                yaxis_title='Component 2',
+                zaxis_title='Component 3'
+            ),
+            width=800,
+            height=800
+        )
+        
+        return fig
+    
+    def plot_regime_transitions(self, window_days: int = 30) -> go.Figure:
+        """
+        Visualize regime transitions over time
+        
+        Args:
+            window_days: Number of days to visualize
+            
+        Returns:
+            Plotly figure with regime transitions
+        """
+        recent_data = self.df.tail(window_days * 1440).copy()  # 1440 minutes per day
+        
+        # Get regime labels for recent data
+        states = []
+        for i in range(len(recent_data) - self.encoder.sequence_length):
+            sequence = recent_data.iloc[i:i+self.encoder.sequence_length].values
+            timestamp = recent_data.index[i+self.encoder.sequence_length-1]
+            state = self.encoder.encode_sequence(sequence, timestamp)
+            states.append(state)
+        
+        regimes = [s.regime_label for s in states]
+        timestamps = recent_data.index[self.encoder.sequence_length:]
+        
+        # Create figure
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True)
+        
+        # Price plot
+        fig.add_trace(
+            go.Scatter(
+                x=recent_data.index,
+                y=recent_data['close'],
+                name='Price'
+            ),
+            row=1, col=1
+        )
+        
+        # Regime plot
+        fig.add_trace(
+            go.Scatter(
+                x=timestamps,
+                y=regimes,
+                name='Regime',
+                mode='lines',
+                line=dict(width=2)
+            ),
+            row=2, col=1
+        )
+        
+        # Add regime characteristics if available
+        if hasattr(self.encoder.regime_detector, 'get_regime_characteristics'):
+            chars = self.encoder.regime_detector.get_regime_characteristics()
+            regime_desc = {
+                r['regime_id']: r['interpretation']
+                for r in chars
+            }
+            
+            for regime_id, desc in regime_desc.items():
+                fig.add_annotation(
+                    x=1.02,
+                    y=regime_id,
+                    xref='paper',
+                    yref='y2',
+                    text=f"Regime {regime_id}: {desc}",
+                    showarrow=False,
+                    align='left'
+                )
+        
+        fig.update_layout(
+            title='Market Regimes Over Time',
+            xaxis2_title='Date',
+            yaxis_title='Price',
+            yaxis2_title='Regime',
+            height=800,
+            showlegend=True
+        )
+        
+        return fig
+    
+    def visualize_regime_characteristics(self) -> go.Figure:
+        """
+        Create visualization of regime characteristics
+        
+        Returns:
+            Plotly figure with regime characteristics visualization
+        """
+        if not hasattr(self.encoder.regime_detector, 'get_regime_characteristics'):
+            raise NotImplementedError("Regime detector doesn't support characteristic analysis")
+            
+        chars = self.encoder.regime_detector.get_regime_characteristics()
+        
+        # Extract features and create DataFrame
+        features = []
+        for regime in chars:
+            features.append({
+                'Regime': f"Regime {regime['regime_id']}",
+                **regime['characteristics']
+            })
+        
+        df = pd.DataFrame(features)
+        
+        # Create heatmap using plotly
+        fig = go.Figure(data=go.Heatmap(
+            z=df.iloc[:, 1:].values,
+            x=df.columns[1:],
+            y=df['Regime'],
+            colorscale='Viridis',
+            hoverongaps=False
+        ))
+        
+        fig.update_layout(
+            title='Regime Characteristics Heatmap',
+            xaxis_title='Features',
+            yaxis_title='Regimes',
+            height=600,
+            width=1000
+        )
+        
+        return fig
 
-// File: src\utils\__init__.py
-# File: src/utils/__init__.py
+def main():
+    """Main visualization script"""
+    # Initialize visualizer
+    viz = MarketVisualizer()
+    
+    # Create visualizations
+    market_fig = viz.plot_market_overview()
+    hypersphere_fig_pca = viz.visualize_hypersphere(projection_method='pca')
+    hypersphere_fig_tsne = viz.visualize_hypersphere(projection_method='tsne')
+    regime_fig = viz.plot_regime_transitions()
+    characteristics_fig = viz.visualize_regime_characteristics()
+    
+    # Save figures
+    output_dir = Path("visualizations")
+    output_dir.mkdir(exist_ok=True)
+    
+    market_fig.write_html(output_dir / "market_overview.html")
+    hypersphere_fig_pca.write_html(output_dir / "hypersphere_pca.html")
+    hypersphere_fig_tsne.write_html(output_dir / "hypersphere_tsne.html")
+    regime_fig.write_html(output_dir / "regime_transitions.html")
+    characteristics_fig.write_html(output_dir / "regime_characteristics.html")
+    
+    print("Visualizations saved to 'visualizations' directory")
 
-from .logging import custom_logger
-from .system_monitor import SystemMonitor
+if __name__ == "__main__":
+    main()
 
+// File: data\raw\btc_usdt_1m_processed.csv
+// Snippet:
+                open_time    open    high     low   close  volume                       close_time  quote_asset_volume  number_of_trades  taker_buy_base_asset_volume  taker_buy_quote_asset_volume  ignore  rsi_6  rsi_14  rsi_24      macd  macd_signal  macd_hist  bb_upper  bb_lower       ema_5      ema_10      ema_20      ema_60     ema_120
+2020-01-01 00:00:00+00:00 7189.43 7190.52 7177.00 7182.44 246.092 2020-01-01 00:00:59.999000+00:00        1.767430e+06               336                       46.630                  334813.19820       0    0.0     0.0     0.0  0.000000     0.000000   0.000000       NaN       NaN 7182.440000 7182.440000 7182.440000 7182.440000 7182.440000
+2020-01-01 00:01:00+00:00 7182.43 7182.44 7178.75 7179.01  70.909 2020-01-01 00:01:59.999000+00:00        5.091458e+05               140                       32.597                  234063.27884       0    0.0     0.0     0.0 -0.273618    -0.054724  -0.218895       NaN       NaN 7181.296667 7181.816364 7182.113333 7182.327541 7182.383306
+2020-01-01 00:02:00+00:00 7179.01 7179.01 7175.25 7177.93  99.420 2020-01-01 00:02:59.999000+00:00        7.135396e+05               148                       16.311                  117066.92118       0    0.0     0.0     0.0 -0.571027    -0.157984  -0.413043       NaN       NaN 7180.174444 7181.109752 7181.714921 7182.183359 7182.309697
+2020-01-01 00:03:00+00:00 7177.77 7182.60 7177.00 7181.11  69.330 2020-01-01 00:03:59.999000+00:00        4.977934e+05               104                       43.723                  313920.02981       0    0.0     0.0     0.0 -0.543857    -0.235159  -0.308698       NaN       NaN 7180.486296 7181.109797 7181.657309 7182.148167 7182.289868
+2020-01-01 00:04:00+00:00 7179.10 7179.10 7172.94 7175.25  97.368 2020-01-01 00:04:59.999000+00:00        6.986274e+05               193                       36.616                  262734.68999       0    0.0     0.0     0.0 -0.983837    -0.384895  -0.598942       NaN       NaN 7178.740864 7180.044379 7181.047089 7181.921998 7182.173506
 
