@@ -1,81 +1,135 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import pandas as pd
-import torch
 from pathlib import Path
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
-from typing import Dict, List, Tuple, Optional
+from sklearn.preprocessing import StandardScaler, MinMaxScaler  # Add MinMaxScaler
+from typing import Dict, List, Optional, Literal
 import logging
 from tqdm import tqdm
+import plotly.express as px  # Import for interactive plots
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("market_visualizer.log"),
-        logging.StreamHandler()
-    ]
-)
+# Configure robust logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s',
+                    handlers=[logging.FileHandler("market_visualizer.log"), logging.StreamHandler()])
 logger = logging.getLogger(__name__)
 
-class HypersphericalEncoderFixed:
-    """Fixed version of the encoder with correct feature handling"""
+# Define the device
+if torch.cuda.is_available():
+    device = torch.device('cuda')
+    torch.backends.cudnn.benchmark = True  # Enable cuDNN auto-tuner
+    logger.info("CUDA is available. Running on GPU.")
+else:
+    device = torch.device('cpu')
+    logger.info("CUDA is not available. Running on CPU.")
+
+class HypersphericalEncoder(nn.Module):
+    """GPU-accelerated hyperspherical encoder with proper normalization"""
+    
     def __init__(
         self,
         projection_dim: int = 128,
         sequence_length: int = 60,
         n_price_features: int = 5,
-        n_indicator_features: int = 4
+        n_indicator_features: int = 4,
+        temperature: float = 0.07,
+        device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+        price_scaler: StandardScaler = None,
+        indicator_scaler: StandardScaler = None
     ):
+        super(HypersphericalEncoder, self).__init__()
         self.projection_dim = projection_dim
         self.sequence_length = sequence_length
         self.n_price_features = n_price_features
         self.n_indicator_features = n_indicator_features
+        self.temperature = temperature
+        self.device = device
         
-        # Initialize components
-        from sklearn.preprocessing import StandardScaler
-        self.price_scaler = StandardScaler()
-        self.indicator_scaler = StandardScaler()
+        # Assign scalers
+        self.price_scaler = price_scaler
+        self.indicator_scaler = indicator_scaler
         
         # Initialize neural network components
-        self.projection = torch.nn.Linear(
+        self.projection1 = nn.Linear(
             n_price_features + n_indicator_features, 
-            projection_dim
-        )
-        self.layer_norm = torch.nn.LayerNorm(projection_dim)
+            projection_dim * 2
+        ).to(device)
         
-    def encode_sequence(self, sequence: np.ndarray) -> torch.Tensor:
-        """Encode a sequence into the latent space"""
-        # Split features
-        price_data = sequence[:, :self.n_price_features]
-        indicator_data = sequence[:, self.n_price_features:]
+        # Replace BatchNorm with LayerNorm
+        self.layer_norm = nn.LayerNorm(projection_dim * 2).to(device)
+        self.projection2 = nn.Linear(projection_dim * 2, projection_dim).to(device)
         
-        # Scale features
-        price_scaled = self.price_scaler.transform(price_data)
-        indicator_scaled = self.indicator_scaler.transform(indicator_data)
+        # Set to eval mode and disable gradients
+        self.eval()
+        self._set_requires_grad(False)
+    
+    def _set_requires_grad(self, requires_grad: bool):
+        """Set requires_grad for all parameters"""
+        for param in self.parameters():
+            param.requires_grad_(requires_grad)
+    
+    @torch.no_grad()
+    def encode_batch(self, sequences: np.ndarray) -> torch.Tensor:
+        """Encode a batch of sequences"""
+        if sequences.ndim == 2:
+            sequences = sequences.reshape(1, *sequences.shape)
+            
+        # Split and scale features
+        price_data = sequences[:, :, :self.n_price_features]
+        indicator_data = sequences[:, :, self.n_price_features:self.n_price_features + self.n_indicator_features]
         
-        # Combine scaled features
-        combined = np.concatenate([price_scaled, indicator_scaled], axis=1)
+        if self.price_scaler is None or self.indicator_scaler is None:
+            raise ValueError("Scalers have not been fitted. Please fit scalers before encoding.")
         
-        # Convert to tensor and get last timestep
-        combined_tensor = torch.FloatTensor(combined[-1])
+        price_scaled = self.price_scaler.transform(price_data.reshape(-1, self.n_price_features))
+        indicator_scaled = self.indicator_scaler.transform(indicator_data.reshape(-1, self.n_indicator_features))
         
-        # Project and normalize
-        projected = self.projection(combined_tensor)
-        normalized = self.layer_norm(projected)
+        # Reshape back to batches
+        price_scaled = price_scaled.reshape(sequences.shape[0], sequences.shape[1], -1)
+        indicator_scaled = indicator_scaled.reshape(sequences.shape[0], sequences.shape[1], -1)
+        
+        # Get last timestep
+        price_last = torch.FloatTensor(price_scaled[:, -1, :]).to(self.device)
+        indicator_last = torch.FloatTensor(indicator_scaled[:, -1, :]).to(self.device)
+        
+        # Combine features
+        combined = torch.cat([price_last, indicator_last], dim=1)
+        
+        # Project through network
+        hidden = self.projection1(combined)
+        hidden = F.relu(self.layer_norm(hidden))
+        projected = self.projection2(hidden)
+        
+        # Apply temperature scaling and normalize
+        scaled = projected / self.temperature
+        normalized = F.normalize(scaled, p=2, dim=1)
         
         return normalized
 
 class MarketVisualizer:
     """Visualization tools for market data and encoded states"""
-    
-    def __init__(self, data_path: str = "data/raw/btc_usdt_1m_processed.csv"):
-        """Initialize visualizer with data path"""
+
+    def __init__(
+        self,
+        data_path: str = "data/raw/btc_usdt_1m_processed.csv",
+        batch_size: int = 256,  # Increased batch size for GPU utilization
+        sequence_length: int = 64, # Increased sequence length for more context, adjust as needed
+        hidden_size: int = 128,     # larger hypersphere embedding visualization
+        device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+        scaling_method: Literal["standard", "minmax"] = "standard"  # Add scaling method arg
+    ):
         logger.info(f"Initializing MarketVisualizer with data from {data_path}")
         self.data_path = Path(data_path)
+        self.batch_size = batch_size
+        self.device = device
+        self.sequence_length = sequence_length # Store sequence length
+        self.hidden_size = hidden_size  # larger hypersphere embedding visualization
+        self.scaling_method = scaling_method
+        
         if not self.data_path.exists():
             raise FileNotFoundError(f"Data file not found: {data_path}")
         
@@ -103,169 +157,118 @@ class MarketVisualizer:
         self.analysis_df = self.df[all_numeric_columns].copy()
         logger.info(f"Analysis dataframe shape: {self.analysis_df.shape}")
         
-        # Initialize encoder
-        self.encoder = HypersphericalEncoderFixed(
-            n_price_features=len(self.price_columns),
-            n_indicator_features=len(self.indicator_columns)
-        )
+        # Initialize scalers based on scaling_method
+        if self.scaling_method == "standard":
+            self.price_scaler = StandardScaler()
+            self.indicator_scaler = StandardScaler()
+        elif self.scaling_method == "minmax":
+            self.price_scaler = MinMaxScaler()
+            self.indicator_scaler = MinMaxScaler()
+        else:
+            raise ValueError("Invalid scaling_method. Choose 'standard' or 'minmax'.")
         
         # Fit scalers
         self._fit_scalers()
+        
+        # Initialize encoder with fitted scalers
+        self.encoder = HypersphericalEncoder(
+            n_price_features=len(self.price_columns),
+            n_indicator_features=len(self.indicator_columns),
+            projection_dim=self.hidden_size,  # Larger embedding size for visualization
+            sequence_length=self.sequence_length, # Pass sequence length to encoder
+            device=device,
+            price_scaler=self.price_scaler,
+            indicator_scaler=self.indicator_scaler
+        ).to(device)  # Move encoder to device
     
     def _fit_scalers(self):
-        """Fit scalers on numeric data"""
+        """Fit scalers on numeric data, handling NaN values"""
         logger.info("Creating sequences for scaler fitting...")
         
-        # Create sequences
         sequences = []
-        n_sequences = len(self.analysis_df) - self.encoder.sequence_length + 1
+        stride = 1000  # Use stride to reduce memory usage
+        n_sequences = (len(self.analysis_df) - self.sequence_length) // stride
         
-        for i in tqdm(range(0, n_sequences, 1000), desc="Building sequences"):  # Sample every 1000th sequence
-            sequence = self.analysis_df.iloc[i:i + self.encoder.sequence_length].values
+        for i in range(n_sequences):
+            idx = i * stride
+            sequence = self.analysis_df.iloc[idx:idx + self.sequence_length].values
             sequences.append(sequence)
         
-        # Convert to numpy array
         data_for_fit = np.array(sequences)
         logger.info(f"Created {len(sequences)} sequences of shape {sequences[0].shape}")
         
-        # Split data into price and indicator components
-        price_data = data_for_fit[:, :, :len(self.price_columns)]
-        indicator_data = data_for_fit[:, :, len(self.price_columns):]
-        
-        logger.info("Fitting scalers...")
         # Fit scalers
-        self.encoder.price_scaler.fit(price_data.reshape(-1, len(self.price_columns)))
-        self.encoder.indicator_scaler.fit(indicator_data.reshape(-1, len(self.indicator_columns)))
-        
+        price_data = self.analysis_df[self.price_columns].values.reshape(-1, len(self.price_columns))
+        indicator_data = self.analysis_df[self.indicator_columns].values.reshape(-1, len(self.indicator_columns))
+
+        self.price_scaler.fit(np.nan_to_num(price_data))
+        self.indicator_scaler.fit(np.nan_to_num(indicator_data))
         logger.info("Scalers fitted successfully")
     
-    def plot_market_overview(self, days: int = 30) -> go.Figure:
-        """Create interactive overview of market data"""
-        logger.info(f"Creating market overview for last {days} days")
-        recent_data = self.df.tail(days * 1440)  # 1440 minutes per day
-        
-        fig = make_subplots(
-            rows=2, cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.05,
-            subplot_titles=('Price Action', 'Volume'),
-            row_heights=[0.7, 0.3]
-        )
-        
-        # Candlestick chart
-        fig.add_trace(
-            go.Candlestick(
-                x=recent_data.index,
-                open=recent_data['open'],
-                high=recent_data['high'],
-                low=recent_data['low'],
-                close=recent_data['close'],
-                name='OHLC'
-            ),
-            row=1, col=1
-        )
-        
-        # Volume
-        fig.add_trace(
-            go.Bar(
-                x=recent_data.index,
-                y=recent_data['volume'],
-                name='Volume'
-            ),
-            row=2, col=1
-        )
-        
-        fig.update_layout(
-            title='Market Data Overview',
-            height=800,
-            xaxis2_title='Date',
-            yaxis_title='Price',
-            yaxis2_title='Volume',
-            showlegend=True
-        )
-        
-        logger.info("Market overview plot created successfully")
-        return fig
-    
-    def visualize_hypersphere(
-        self,
-        n_samples: int = 1000,
-        projection_method: str = 'pca',
-        perplexity: int = 30
-    ) -> go.Figure:
-        """Visualize encoded states in reduced dimensionality"""
+    def visualize_hypersphere(self, n_samples: int = 10000, projection_method: str = 'pca', perplexity: int = 50):
+        """Visualize encoded states in reduced dimensionality with hover information"""
         logger.info(f"Creating hypersphere visualization using {projection_method}")
         
-        # Get encoded states
-        states = []
+        # Calculate number of batches
         max_samples = min(n_samples, len(self.analysis_df) - self.encoder.sequence_length)
+        n_batches = (max_samples + self.batch_size - 1) // self.batch_size
         
-        logger.info(f"Encoding {max_samples} market states...")
-        for i in tqdm(range(max_samples), desc="Encoding states"):
-            sequence = self.analysis_df.iloc[i:i+self.encoder.sequence_length].values
+        encoded_states = []
+        logger.info(f"Encoding {max_samples} market states in batches...")
+        
+        for batch_idx in tqdm(range(n_batches), desc="Processing batches"):
+            start_idx = batch_idx * self.batch_size
+            end_idx = min(start_idx + self.batch_size, max_samples)
+            
+            # Prepare batch sequences
+            batch_sequences = []
+            for i in range(start_idx, end_idx):
+                sequence = self.analysis_df.iloc[i:i + self.encoder.sequence_length].values
+                batch_sequences.append(sequence)
+            
+            # Convert to numpy array and encode batch
+            batch_array = np.array(batch_sequences)
             try:
-                encoded_state = self.encoder.encode_sequence(sequence)
-                states.append(encoded_state)
+                batch_encoded = self.encoder.encode_batch(batch_array)
+                encoded_states.append(batch_encoded.cpu())
             except Exception as e:
-                logger.error(f"Error encoding sequence {i}: {str(e)}")
+                logger.error(f"Error encoding batch {batch_idx}: {str(e)}")
                 continue
         
-        if not states:
+        if not encoded_states:
             raise ValueError("No states were successfully encoded")
-            
-        # Stack encoded states
-        logger.info("Processing encoded states...")
-        encoded_states = torch.stack(states).numpy()
         
-        # Reduce dimensionality
-        logger.info(f"Reducing dimensionality using {projection_method}...")
+        # Combine all encoded states
+        all_states = torch.cat(encoded_states, dim=0).numpy()
+        logger.info(f"Successfully encoded {len(all_states)} states")
+        
+        # Dimensionality Reduction + Hover Info
         if projection_method == 'pca':
             reducer = PCA(n_components=3)
-        else:  # t-SNE
-            reducer = TSNE(n_components=3, perplexity=perplexity)
-            
-        reduced_states = reducer.fit_transform(encoded_states)
-        
-        # Create 3D scatter plot
-        fig = go.Figure(data=[
-            go.Scatter3d(
-                x=reduced_states[:, 0],
-                y=reduced_states[:, 1],
-                z=reduced_states[:, 2],
-                mode='markers',
-                marker=dict(
-                    size=5,
-                    color=np.arange(len(reduced_states)),  # Color by sequence order
-                    colorscale='Viridis',
-                    opacity=0.8
-                ),
-                text=[f"State {i}" for i in range(len(reduced_states))],
-                hoverinfo='text'
-            )
-        ])
-        
-        # Update layout
-        fig.update_layout(
-            title=f'Encoded States Visualization ({projection_method.upper()})',
-            scene=dict(
-                xaxis_title='Component 1',
-                yaxis_title='Component 2',
-                zaxis_title='Component 3'
-            ),
-            width=800,
-            height=800
+            reduced_states = reducer.fit_transform(all_states)
+            hover_data = {f"Feature {i+1}": all_states[:, i] for i in range(all_states.shape[1])}
+        elif projection_method == 'tsne':
+            reducer = TSNE(n_components=3, perplexity=perplexity, n_jobs=-1) # Use all CPU cores
+            reduced_states = reducer.fit_transform(all_states)
+            hover_data = {f"Feature {i+1}": all_states[:, i] for i in range(all_states.shape[1])}
+        else:
+            raise ValueError("Invalid projection method. Choose 'pca' or 'tsne'.")
+
+        # Interactive Plot with Plotly Express
+        fig = px.scatter_3d(
+            x=reduced_states[:, 0],
+            y=reduced_states[:, 1],
+            z=reduced_states[:, 2],
+            color=np.arange(len(reduced_states)),  # Color based on sample index
+            hover_data=hover_data, # Show high-dimensional encoded info as well
+            title=f'Encoded States Visualization ({projection_method.upper()})'
         )
-        
-        logger.info("Hypersphere visualization created successfully")
+
         return fig
 
 def main():
-    """Main visualization script"""
-    logger.info("Starting visualization process...")
-    
     try:
-        # Initialize visualizer
-        viz = MarketVisualizer()
+        viz = MarketVisualizer(sequence_length=128, hidden_size=256, scaling_method="minmax") # Example: Use MinMaxScaler
         
         # Create output directory
         output_dir = Path("visualizations")
@@ -273,17 +276,13 @@ def main():
         logger.info(f"Created output directory: {output_dir}")
         
         # Create and save visualizations
-        logger.info("Creating market overview visualization...")
-        market_fig = viz.plot_market_overview()
-        market_fig.write_html(output_dir / "market_overview.html")
-        
         logger.info("Creating hypersphere visualization...")
-        hypersphere_fig_pca = viz.visualize_hypersphere(projection_method='pca')
-        hypersphere_fig_pca.write_html(output_dir / "hypersphere_pca.html")
+        hypersphere_fig = viz.visualize_hypersphere(n_samples=10000, projection_method='tsne', perplexity=50)
+        hypersphere_fig.write_html(output_dir / "hypersphere_tsne.html")
         
         logger.info("Visualizations completed successfully")
         print("\nVisualizations saved to 'visualizations' directory")
-        
+    
     except Exception as e:
         logger.error(f"Error creating visualizations: {str(e)}", exc_info=True)
         raise

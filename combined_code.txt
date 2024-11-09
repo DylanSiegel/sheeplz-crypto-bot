@@ -1,1770 +1,141 @@
 **File Tree (Relevant Files Only)**
   .
-    - agent.py
-    - gym.py
-    - market_base.py
-    - optimized_market.py
-    - regime.py
-    - train.py
     - viz.py
   data\raw
     - btc_usdt_1m_processed.csv
-// File: agent.py
-# File: agent.py
-
-import torch
-import numpy as np
-from torch import nn
-from torch.optim import Adam
-from collections import deque
-import random
-
-class DQNAgent:
-    def __init__(
-        self,
-        state_dim,
-        action_dim,
-        hidden_dim=256,
-        gamma=0.99,
-        epsilon_start=1.0,
-        epsilon_end=0.01,
-        epsilon_decay=500,
-        lr=1e-4,
-        buffer_size=100000,
-        batch_size=64,
-        device='cuda' if torch.cuda.is_available() else 'cpu'
-    ):
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-        self.device = device
-
-        self.policy_net = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, action_dim)
-        ).to(device)
-
-        self.target_net = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, action_dim)
-        ).to(device)
-
-        self.optimizer = Adam(self.policy_net.parameters(), lr=lr)
-        self.gamma = gamma
-        self.epsilon = epsilon_start
-        self.epsilon_end = epsilon_end
-        self.epsilon_decay = epsilon_decay
-        self.buffer = deque(maxlen=buffer_size)
-        self.batch_size = batch_size
-        self.steps_done = 0
-
-        self.target_net.load_state_dict(self.policy_net.state_dict())
-        self.target_net.eval()
-
-    def select_action(self, state):
-        self.steps_done += 1
-        epsilon = self.epsilon_end + (self.epsilon - self.epsilon_end) * \
-                  np.exp(-1. * self.steps_done / self.epsilon_decay)
-        if random.random() < epsilon:
-            return random.randrange(self.action_dim)
-        else:
-            with torch.no_grad():
-                state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-                q_values = self.policy_net(state)
-                return q_values.argmax().item()
-
-    def store_transition(self, transition):
-        self.buffer.append(transition)
-
-    def update(self):
-        if len(self.buffer) < self.batch_size:
-            return
-        transitions = random.sample(self.buffer, self.batch_size)
-        batch = Transition(*zip(*transitions))
-
-        state_batch = torch.stack(batch.state).to(self.device)
-        action_batch = torch.tensor(batch.action, device=self.device).unsqueeze(1)
-        reward_batch = torch.tensor(batch.reward, device=self.device)
-        next_state_batch = torch.stack(batch.next_state).to(self.device)
-        done_batch = torch.tensor(batch.done, device=self.device)
-
-        state_action_values = self.policy_net(state_batch).gather(1, action_batch)
-
-        with torch.no_grad():
-            next_state_values = self.target_net(next_state_batch).max(1)[0]
-            expected_state_action_values = reward_batch + self.gamma * next_state_values * (1 - done_batch)
-
-        loss = nn.functional.mse_loss(state_action_values.squeeze(), expected_state_action_values)
-
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-
-    def update_target_net(self):
-        self.target_net.load_state_dict(self.policy_net.state_dict())
-
-from collections import namedtuple
-Transition = namedtuple('Transition', ('state', 'action', 'reward', 'next_state', 'done'))
-
-
-// File: gym.py
-import torch
-import numpy as np
-from typing import Tuple, Dict, List, Optional
-from dataclasses import dataclass
-from collections import deque
-import logging
-from torch.cuda import amp
-from market_base import Action, MarketState
-from optimized_market import OptimizedRewardCalculator
-
-logger = logging.getLogger(__name__)
-
-@dataclass
-class TradingEnvConfig:
-    """Configuration for trading environment"""
-    initial_balance: float = 10000.0
-    max_position_size: float = 1.0
-    transaction_cost: float = 0.001
-    history_length: int = 100
-    device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
-    use_amp: bool = True  # Use automatic mixed precision
-    batch_size: int = 512  # Optimized for 8GB VRAM
-
-class TradingEnvironment:
-    """GPU-accelerated trading environment with batched operations"""
-    
-    def __init__(
-        self,
-        market_states: List[MarketState],
-        config: Optional[TradingEnvConfig] = None
-    ):
-        self.config = config or TradingEnvConfig()
-        self.device = torch.device(self.config.device)
-        
-        # Initialize reward calculator
-        self.reward_calc = OptimizedRewardCalculator(
-            transaction_cost=self.config.transaction_cost,
-            device=self.config.device
-        )
-        
-        # Convert market states to tensors and move to GPU
-        self.states = self._prepare_market_states(market_states)
-        self.current_step = 0
-        self.history = deque(maxlen=self.config.history_length)
-        
-        # Initialize portfolio state
-        self._initialize_portfolio()
-        
-        # Enable automatic mixed precision if configured
-        self.scaler = amp.GradScaler() if self.config.use_amp else None
-        
-        logger.info(f"Trading environment initialized with {len(market_states)} states")
-    
-    def _prepare_market_states(self, market_states: List[MarketState]) -> Dict[str, torch.Tensor]:
-        """Prepare market states for GPU processing"""
-        encoded_states = []
-        prices = []
-        regime_labels = []
-        
-        # Process in batches to manage memory
-        for i in range(0, len(market_states), self.config.batch_size):
-            batch = market_states[i:i + self.config.batch_size]
-            encoded_states.extend([state.encoded_state for state in batch])
-            prices.extend([state.current_price for state in batch])
-            regime_labels.extend([state.regime_label for state in batch])
-        
-        return {
-            'encoded_states': torch.stack(encoded_states).to(self.device),
-            'prices': torch.tensor(prices, dtype=torch.float32).to(self.device),
-            'regime_labels': torch.tensor(regime_labels, dtype=torch.long).to(self.device)
-        }
-    
-    def _initialize_portfolio(self):
-        """Initialize portfolio state tensors on GPU"""
-        self.balance = torch.tensor(self.config.initial_balance, 
-                                  device=self.device, 
-                                  dtype=torch.float32)
-        self.position_size = torch.tensor(0.0, 
-                                        device=self.device, 
-                                        dtype=torch.float32)
-        self.position_value = torch.tensor(0.0, 
-                                         device=self.device, 
-                                         dtype=torch.float32)
-    
-    @torch.no_grad()
-    def step(self, action: int) -> Tuple[MarketState, float, bool, Dict]:
-        """Execute one environment step with GPU acceleration"""
-        if self.current_step >= len(self.states['encoded_states']) - 1:
-            return self._get_current_state(), 0.0, True, {}
-        
-        current_state = self._get_current_state()
-        next_state = self._get_next_state()
-        
-        # Use automatic mixed precision for calculations if configured
-        with amp.autocast() if self.config.use_amp else nullcontext():
-            # Calculate reward and execute trade
-            reward, metrics = self.reward_calc.calculate_reward(
-                current_state,
-                next_state,
-                action,
-                float(self.position_size)
-            )
-            
-            # Update portfolio based on action
-            self._execute_trade(action, current_state, next_state)
-        
-        # Update state
-        self.current_step += 1
-        
-        # Record state in history
-        self.history.append({
-            'step': self.current_step,
-            'action': action,
-            'reward': reward,
-            'balance': float(self.balance),
-            'position_size': float(self.position_size),
-            'price': float(self.states['prices'][self.current_step])
-        })
-        
-        done = self.current_step >= len(self.states['encoded_states']) - 1
-        info = {
-            'metrics': metrics,
-            'portfolio_value': float(self.balance + self.position_value)
-        }
-        
-        return next_state, reward, done, info
-    
-    @torch.no_grad()
-    def _execute_trade(
-        self,
-        action: int,
-        current_state: MarketState,
-        next_state: MarketState
-    ) -> None:
-        """Execute trading action with GPU-accelerated calculations"""
-        current_price = self.states['prices'][self.current_step]
-        
-        if action == Action.BUY.value and self.position_size < self.config.max_position_size:
-            # Calculate maximum purchasable amount
-            max_purchase = (self.balance * (1 - self.config.transaction_cost)) / current_price
-            purchase_size = min(
-                self.config.max_position_size - self.position_size,
-                max_purchase
-            )
-            
-            if purchase_size > 0:
-                cost = purchase_size * current_price * (1 + self.config.transaction_cost)
-                self.balance -= cost
-                self.position_size += purchase_size
-                
-        elif action == Action.SELL.value and self.position_size > 0:
-            # Calculate sale proceeds
-            sale_proceeds = (self.position_size * current_price * 
-                           (1 - self.config.transaction_cost))
-            self.balance += sale_proceeds
-            self.position_size = torch.tensor(0.0, device=self.device)
-        
-        # Update position value
-        self.position_value = self.position_size * self.states['prices'][self.current_step]
-    
-    def reset(self) -> MarketState:
-        """Reset the environment to initial state"""
-        self.current_step = 0
-        self._initialize_portfolio()
-        self.history.clear()
-        return self._get_current_state()
-    
-    def _get_current_state(self) -> MarketState:
-        """Get current market state"""
-        return MarketState(
-            encoded_state=self.states['encoded_states'][self.current_step],
-            regime_label=int(self.states['regime_labels'][self.current_step]),
-            current_price=float(self.states['prices'][self.current_step]),
-            timestamp=None,  # Timestamp not needed for training
-            metrics=self._get_state_metrics()
-        )
-    
-    def _get_next_state(self) -> MarketState:
-        """Get next market state"""
-        next_step = self.current_step + 1
-        return MarketState(
-            encoded_state=self.states['encoded_states'][next_step],
-            regime_label=int(self.states['regime_labels'][next_step]),
-            current_price=float(self.states['prices'][next_step]),
-            timestamp=None,
-            metrics=self._get_state_metrics()
-        )
-    
-    def _get_state_metrics(self) -> Dict[str, float]:
-        """Calculate current state metrics"""
-        return {
-            'portfolio_value': float(self.balance + self.position_value),
-            'position_size': float(self.position_size),
-            'balance': float(self.balance)
-        }
-
-class nullcontext:
-    """Context manager that does nothing"""
-    def __enter__(self): return None
-    def __exit__(self, *excinfo): pass
-
-// File: market_base.py
-from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional, Union, Any
-import torch
-import numpy as np
-import pandas as pd
-from enum import Enum
-
-class Action(Enum):
-    """Trading action enumeration"""
-    HOLD = 0
-    BUY = 1
-    SELL = 2
-
-@dataclass
-class MarketState:
-    """Container for market state information with validation"""
-    encoded_state: torch.Tensor
-    regime_label: int
-    current_price: float
-    timestamp: pd.Timestamp
-    metrics: Dict[str, float]
-    
-    def __post_init__(self):
-        """Validate state attributes after initialization"""
-        if not isinstance(self.encoded_state, torch.Tensor):
-            raise TypeError("encoded_state must be a torch.Tensor")
-        if not isinstance(self.regime_label, (int, np.integer)):
-            raise TypeError("regime_label must be an integer")
-        if not isinstance(self.current_price, (float, np.floating)):
-            raise TypeError("current_price must be a float")
-        if not isinstance(self.timestamp, pd.Timestamp):
-            raise TypeError("timestamp must be a pd.Timestamp")
-        if not isinstance(self.metrics, dict):
-            raise TypeError("metrics must be a dictionary")
-    
-    def to_tensor(self) -> torch.Tensor:
-        """Convert state to tensor format for DRL"""
-        return self.encoded_state
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert state to dictionary format"""
-        return {
-            'encoded_state': self.encoded_state.numpy(),
-            'regime_label': self.regime_label,
-            'current_price': self.current_price,
-            'timestamp': self.timestamp,
-            'metrics': self.metrics
-        }
-    
-    @classmethod
-    def from_dict(cls, state_dict: Dict[str, Any]) -> 'MarketState':
-        """Create MarketState from dictionary"""
-        return cls(
-            encoded_state=torch.tensor(state_dict['encoded_state']),
-            regime_label=state_dict['regime_label'],
-            current_price=state_dict['current_price'],
-            timestamp=pd.Timestamp(state_dict['timestamp']),
-            metrics=state_dict['metrics']
-        )
-
-class RewardCalculator:
-    """Calculate DRL rewards based on market state and actions with regime-aware adjustments"""
-    
-    def __init__(
-        self,
-        transaction_cost: float = 0.001,
-        holding_cost: float = 0.0001,
-        volatility_penalty: float = 0.1,
-        regime_multipliers: Optional[Dict[int, float]] = None
-    ):
-        """
-        Initialize reward calculator with costs and penalties
-        
-        Args:
-            transaction_cost: Cost per transaction as percentage
-            holding_cost: Cost of holding position per step
-            volatility_penalty: Penalty factor for volatility
-            regime_multipliers: Dict mapping regime IDs to reward multipliers
-        """
-        self._validate_costs(transaction_cost, holding_cost, volatility_penalty)
-        self.transaction_cost = transaction_cost
-        self.holding_cost = holding_cost
-        self.volatility_penalty = volatility_penalty
-        
-        # Set default regime multipliers if none provided
-        self.regime_multipliers = regime_multipliers or {
-            0: 0.8,  # High volatility - reduce reward
-            1: 1.0,  # Normal trading
-            2: 1.2,  # Trending market - increase reward
-        }
-        
-        # Initialize metrics tracking
-        self.reset_metrics()
-    
-    def _validate_costs(
-        self,
-        transaction_cost: float,
-        holding_cost: float,
-        volatility_penalty: float
-    ) -> None:
-        """Validate cost parameters"""
-        if not 0 <= transaction_cost <= 0.1:
-            raise ValueError("transaction_cost must be between 0 and 0.1")
-        if not 0 <= holding_cost <= 0.01:
-            raise ValueError("holding_cost must be between 0 and 0.01")
-        if not 0 <= volatility_penalty <= 1.0:
-            raise ValueError("volatility_penalty must be between 0 and 1.0")
-    
-    def reset_metrics(self) -> None:
-        """Reset accumulated metrics"""
-        self.total_rewards = 0.0
-        self.total_costs = 0.0
-        self.total_penalties = 0.0
-        self.rewards_by_regime = {}
-        self.action_counts = {action: 0 for action in Action}
-    
-    def calculate_reward(
-        self,
-        current_state: MarketState,
-        next_state: MarketState,
-        action: Union[Action, int],
-        position_size: float
-    ) -> Tuple[float, Dict[str, float]]:
-        """
-        Calculate reward for a single state transition
-        
-        Args:
-            current_state: Current market state
-            next_state: Next market state
-            action: Trading action (HOLD=0, BUY=1, SELL=2)
-            position_size: Size of position as percentage of portfolio
-            
-        Returns:
-            reward: Calculated reward
-            metrics: Dictionary of reward components
-        """
-        # Validate inputs
-        if isinstance(action, int):
-            action = Action(action)
-        if not isinstance(action, Action):
-            raise ValueError(f"Invalid action: {action}")
-        if not 0 <= position_size <= 1:
-            raise ValueError("position_size must be between 0 and 1")
-        
-        # Calculate price change
-        price_change = (next_state.current_price - current_state.current_price) / current_state.current_price
-        
-        # Calculate base reward
-        if action == Action.BUY:
-            base_reward = price_change * position_size
-            costs = self.transaction_cost * position_size
-        elif action == Action.SELL:
-            base_reward = -price_change * position_size
-            costs = self.transaction_cost * position_size
-        else:  # HOLD
-            base_reward = 0
-            costs = self.holding_cost * position_size
-        
-        # Apply volatility penalty
-        volatility = current_state.metrics.get('volatility', 0)
-        vol_penalty = -self.volatility_penalty * volatility * position_size
-        
-        # Get regime multiplier
-        regime_multiplier = self.regime_multipliers.get(
-            current_state.regime_label,
-            1.0
-        )
-        
-        # Calculate final reward
-        reward = (base_reward - costs + vol_penalty) * regime_multiplier
-        
-        # Update metrics
-        self.total_rewards += reward
-        self.total_costs += costs
-        self.total_penalties += abs(vol_penalty)
-        self.action_counts[action] += 1
-        
-        if current_state.regime_label not in self.rewards_by_regime:
-            self.rewards_by_regime[current_state.regime_label] = []
-        self.rewards_by_regime[current_state.regime_label].append(reward)
-        
-        metrics = {
-            'base_reward': base_reward,
-            'costs': costs,
-            'vol_penalty': vol_penalty,
-            'regime_multiplier': regime_multiplier,
-            'total_reward': reward,
-            'price_change': price_change,
-            'volatility': volatility
-        }
-        
-        return reward, metrics
-    
-    def get_metrics_summary(self) -> Dict[str, Any]:
-        """Get summary of accumulated metrics"""
-        summary = {
-            'total_rewards': self.total_rewards,
-            'total_costs': self.total_costs,
-            'total_penalties': self.total_penalties,
-            'action_counts': {action.name: count for action, count in self.action_counts.items()},
-            'rewards_by_regime': {
-                regime: {
-                    'mean': np.mean(rewards),
-                    'std': np.std(rewards),
-                    'count': len(rewards)
-                }
-                for regime, rewards in self.rewards_by_regime.items()
-            }
-        }
-        return summary
-
-class DataValidationMixin:
-    """Mixin class for data validation methods"""
-    
-    @staticmethod
-    def validate_market_data(
-        data: np.ndarray,
-        min_sequence_length: int,
-        expected_features: int
-    ) -> None:
-        """Validate market data array"""
-        if not isinstance(data, np.ndarray):
-            raise TypeError("data must be a numpy array")
-        
-        if data.ndim != 3:
-            raise ValueError(f"data must be 3D, got shape {data.shape}")
-            
-        if data.shape[1] < min_sequence_length:
-            raise ValueError(
-                f"Sequence length must be at least {min_sequence_length}, "
-                f"got {data.shape[1]}"
-            )
-            
-        if data.shape[2] < expected_features:
-            raise ValueError(
-                f"Expected at least {expected_features} features, "
-                f"got {data.shape[2]}"
-            )
-    
-    @staticmethod
-    def validate_timestamps(
-        timestamps: pd.DatetimeIndex,
-        n_samples: int
-    ) -> None:
-        """Validate timestamp index"""
-        if not isinstance(timestamps, pd.DatetimeIndex):
-            raise TypeError("timestamps must be a pandas DatetimeIndex")
-            
-        if len(timestamps) != n_samples:
-            raise ValueError(
-                f"Number of timestamps ({len(timestamps)}) must match "
-                f"number of samples ({n_samples})"
-            )
-        
-        if timestamps.freq is None:
-            if pd.infer_freq(timestamps) is None:
-                raise ValueError(
-                    "timestamps must have a frequency or regular interval"
-                )
-
-// File: optimized_market.py
-import torch
-import numpy as np
-import pandas as pd
-from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Union, Any
-from sklearn.preprocessing import StandardScaler
-from sklearn.cluster import KMeans
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
-from functools import lru_cache
-import logging
-from tqdm import tqdm
-from torch.cuda import amp
-from dataclasses import dataclass
-from enum import Enum
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("market_analysis.log"),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
-
-class Action(Enum):
-    """Trading action enumeration"""
-    HOLD = 0
-    BUY = 1
-    SELL = 2
-
-@dataclass
-class MarketState:
-    """Container for market state information with validation"""
-    encoded_state: torch.Tensor
-    regime_label: int
-    current_price: float
-    timestamp: pd.Timestamp
-    metrics: Dict[str, float]
-    
-    def __post_init__(self):
-        """Validate state attributes after initialization"""
-        if not isinstance(self.encoded_state, torch.Tensor):
-            raise TypeError("encoded_state must be a torch.Tensor")
-        if not isinstance(self.regime_label, (int, np.integer)):
-            raise TypeError("regime_label must be an integer")
-        if not isinstance(self.current_price, (float, np.floating)):
-            raise TypeError("current_price must be a float")
-        if not isinstance(self.timestamp, pd.Timestamp):
-            raise TypeError("timestamp must be a pd.Timestamp")
-        if not isinstance(self.metrics, dict):
-            raise TypeError("metrics must be a dictionary")
-
-class OptimizedMarketRegimeDetector:
-    """Optimized market regime detector with GPU acceleration"""
-    
-    def __init__(
-        self,
-        n_regimes: int = 8,
-        feature_window: int = 20,
-        clustering_method: str = 'kmeans',
-        random_state: int = 42,
-        device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
-    ):
-        self.n_regimes = n_regimes
-        self.feature_window = feature_window
-        self.device = device
-        self.scaler = StandardScaler()
-        self.is_fitted = False
-        
-        # Initialize clustering
-        self._init_clustering(clustering_method, random_state)
-        
-        # Batch size based on GPU memory (8GB VRAM)
-        self.batch_size = 4096 if device == 'cuda' else 1024
-        
-        self.feature_names = [
-            'volatility', 'trend', 'volume_ratio', 'momentum',
-            'hour_sin', 'hour_cos', 'weekday_0', 'weekday_1', 
-            'weekday_2', 'weekday_3', 'weekday_4', 'weekday_5', 'weekday_6'
-        ]
-        
-    def _init_clustering(self, method: str, random_state: int) -> None:
-        """Initialize clustering algorithm with GPU support"""
-        if method == 'kmeans':
-            self.cluster_model = KMeans(
-                n_clusters=self.n_regimes,
-                random_state=random_state,
-                n_init='auto'
-            )
-    
-    def _encode_cyclical_time(self, hour: int) -> Tuple[float, float]:
-        """Encode hour using sine and cosine transformation"""
-        hour_rad = 2 * np.pi * hour / 24.0
-        return np.sin(hour_rad), np.cos(hour_rad)
-    
-    @lru_cache(maxsize=1024)
-    def _extract_features(self, data_key: Tuple[float, ...], timestamp: pd.Timestamp) -> np.ndarray:
-        """Cached feature extraction for repeated sequences"""
-        data = np.array(data_key).reshape(-1, 5)  # Reshape for OHLCV
-        
-        # Move data to GPU if available
-        if self.device == 'cuda':
-            data_tensor = torch.from_numpy(data).to(self.device)
-            
-            # Perform calculations on GPU
-            close_prices = data_tensor[:, 3]
-            returns = torch.diff(torch.log(close_prices))
-            volatility = returns[-self.feature_window:].std().item()
-            
-            # Calculate trend
-            x = torch.arange(self.feature_window, device=self.device, dtype=torch.float32)
-            y = close_prices[-self.feature_window:]
-            trend = torch.polyfit(x, y, 1)[0].item()
-            
-            # Move back to CPU for remaining calculations
-            data = data_tensor.cpu().numpy()
-        else:
-            # Perform calculations on CPU
-            returns = np.diff(np.log(data[:, 3]))
-            volatility = np.std(returns[-self.feature_window:])
-            trend = np.polyfit(np.arange(self.feature_window), data[-self.feature_window:, 3], 1)[0]
-        
-        volume_ratio = np.mean(data[-5:, 4]) / np.mean(data[-self.feature_window:, 4])
-        momentum = data[-1, 3] / data[-self.feature_window, 3] - 1
-        hour_sin, hour_cos = self._encode_cyclical_time(timestamp.hour)
-        weekday_onehot = np.eye(7)[timestamp.weekday()]
-        
-        features = np.array([
-            volatility,
-            trend,
-            volume_ratio,
-            momentum,
-            hour_sin,
-            hour_cos,
-            *weekday_onehot
-        ])
-        
-        return features.reshape(1, -1)
-    
-    def fit(self, data: np.ndarray, timestamps: pd.DatetimeIndex) -> None:
-        """Fit the regime detector on historical data"""
-        # Extract features for all samples
-        all_features = []
-        for i in tqdm(range(len(data)), desc="Extracting features"):
-            features = self._extract_features(tuple(data[i].flatten()), timestamps[i])
-            all_features.append(features)
-        
-        features_array = np.vstack(all_features)
-        
-        # Scale features
-        scaled_features = self.scaler.fit_transform(features_array)
-        
-        # Fit clustering model
-        self.cluster_model.fit(scaled_features)
-        self.is_fitted = True
-        
-        # Store cluster centers
-        self.cluster_centers_ = self.cluster_model.cluster_centers_
-    
-    def predict(self, data: np.ndarray, timestamps: pd.DatetimeIndex) -> np.ndarray:
-        """Predict market regimes for new data"""
-        if not self.is_fitted:
-            raise ValueError("MarketRegimeDetector must be fitted before making predictions")
-        
-        # Extract features
-        all_features = []
-        for i in range(len(data)):
-            features = self._extract_features(tuple(data[i].flatten()), timestamps[i])
-            all_features.append(features)
-        
-        features_array = np.vstack(all_features)
-        
-        # Scale features
-        scaled_features = self.scaler.transform(features_array)
-        
-        # Predict regimes
-        predictions = self.cluster_model.predict(scaled_features)
-        
-        return predictions
-
-class OptimizedHypersphericalEncoder:
-    """GPU-accelerated hyperspherical encoder with mixed precision training"""
-    
-    def __init__(
-        self,
-        projection_dim: int = 128,
-        n_regimes: int = 8,
-        sequence_length: int = 60,
-        min_features: int = 17,
-        device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
-    ):
-        self.device = torch.device(device)
-        self.projection_dim = projection_dim
-        self.sequence_length = sequence_length
-        self.min_features = min_features
-        
-        # Initialize components
-        self.regime_detector = OptimizedMarketRegimeDetector(
-            n_regimes=n_regimes,
-            device=device
-        )
-        
-        # Move models to GPU
-        self.projection = torch.nn.Linear(min_features, projection_dim).to(self.device)
-        self.layer_norm = torch.nn.LayerNorm(projection_dim).to(self.device)
-        
-        # Initialize scalers
-        self.price_scaler = StandardScaler()
-        self.indicator_scaler = StandardScaler()
-        
-        # Enable automatic mixed precision
-        self.scaler = amp.GradScaler()
-    
-    def _encode_market_data(self, data: np.ndarray) -> torch.Tensor:
-        """Encode raw market data into latent representation"""
-        # Split data into components
-        price_data = data[:, :, :5]  # OHLCV
-        indicator_data = data[:, :, 5:self.min_features]  # Technical indicators
-        
-        # Scale components
-        price_scaled = self.price_scaler.transform(price_data.reshape(-1, 5))
-        price_scaled = price_scaled.reshape(data.shape[0], self.sequence_length, 5)
-        
-        indicator_scaled = self.indicator_scaler.transform(indicator_data.reshape(-1, 12))
-        indicator_scaled = indicator_scaled.reshape(data.shape[0], self.sequence_length, 12)
-        
-        # Convert to tensors and move to GPU if available
-        price_tensor = torch.FloatTensor(price_scaled[:, -1, :]).to(self.device)
-        indicator_tensor = torch.FloatTensor(indicator_scaled[:, -1, :]).to(self.device)
-        
-        # Combine features
-        combined = torch.cat([price_tensor, indicator_tensor], dim=1)
-        
-        # Project and normalize with mixed precision
-        with amp.autocast():
-            projected = self.projection(combined)
-            normalized = self.layer_norm(projected)
-        
-        return normalized
-    
-    def encode_sequence(
-        self,
-        data: Union[np.ndarray, torch.Tensor],
-        timestamp: pd.Timestamp
-    ) -> MarketState:
-        """Encode a single market sequence into a MarketState"""
-        # Convert to numpy if tensor
-        if isinstance(data, torch.Tensor):
-            data = data.cpu().numpy()
-        
-        # Reshape for batch processing
-        data_batch = data.reshape(1, *data.shape)
-        
-        # Encode market data
-        market_encoded = self._encode_market_data(data_batch)
-        
-        # Get regime
-        regime = self.regime_detector.predict(
-            data_batch,
-            pd.DatetimeIndex([timestamp])
-        )[0]
-        
-        # Calculate metrics
-        metrics = self._calculate_metrics(data_batch)
-        
-        # Create market state
-        state = MarketState(
-            encoded_state=market_encoded[0],
-            regime_label=regime,
-            current_price=float(data[-1, 3]),  # Latest close price
-            timestamp=timestamp,
-            metrics=metrics
-        )
-        
-        return state
-    
-    def _calculate_metrics(self, data: np.ndarray) -> Dict[str, float]:
-        """Calculate market metrics from sequence data"""
-        close_prices = data[:, :, 3]  # Close price is 4th column
-        volume = data[:, :, 4]        # Volume is 5th column
-        
-        # Calculate returns and volatility
-        returns = np.diff(np.log(close_prices), axis=1)
-        volatility = np.std(returns, axis=1)[-1]
-        
-        # Volume metrics
-        rel_volume = volume[:, -1] / np.mean(volume, axis=1)
-        
-        # Additional metrics
-        price_momentum = (close_prices[:, -1] / close_prices[:, -20] - 1)[-1]
-        volume_momentum = (volume[:, -1] / volume[:, -20] - 1)[-1]
-        
-        return {
-            'volatility': float(volatility),
-            'relative_volume': float(rel_volume[-1]),
-            'price_momentum': float(price_momentum),
-            'volume_momentum': float(volume_momentum)
-        }
-
-class OptimizedMarketVisualizer:
-    """Multi-threaded market visualizer with GPU acceleration"""
-    
-    def __init__(
-        self,
-        data_path: str,
-        num_workers: int = 12,  # Optimized for Ryzen 9 7900X
-        device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
-    ):
-        self.device = device
-        self.num_workers = num_workers
-        self.data_path = Path(data_path)
-        
-        # Load data efficiently
-        self._load_data()
-        
-        # Initialize encoder
-        self.encoder = OptimizedHypersphericalEncoder(device=device)
-        
-    def _load_data(self) -> None:
-        """Efficient data loading with parallel processing"""
-        chunks = np.array_split(pd.read_csv(self.data_path), self.num_workers)
-        
-        with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
-            results = list(executor.map(self._process_chunk, chunks))
-            
-        self.df = pd.concat(results)
-        self.df['timestamp'] = pd.to_datetime(self.df['open_time'])
-        self.df.set_index('timestamp', inplace=True)
-        
-    @staticmethod
-    def _process_chunk(chunk: pd.DataFrame) -> pd.DataFrame:
-        """Process a single data chunk"""
-        return chunk
-    
-    def visualize_parallel(self, n_samples: int = 1000) -> List[MarketState]:
-        """Parallel visualization processing"""
-        max_samples = len(self.df) - self.encoder.sequence_length
-        n_samples = min(n_samples, max_samples)
-        
-        # Split work across threads
-        batch_size = n_samples // self.num_workers
-        batches = [(i * batch_size, min((i + 1) * batch_size, n_samples)) 
-                  for i in range(self.num_workers)]
-        
-        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-            futures = [
-                executor.submit(self._process_batch, start, end)
-                for start, end in batches
-            ]
-            
-            results = []
-            for future in tqdm(futures, desc="Processing batches"):
-                results.extend(future.result())
-                
-        return results
-    
-    def _process_batch(self, start: int, end: int) -> List[MarketState]:
-        """Process a batch of visualizations"""
-        results = []
-        for i in range(start, end):
-            sequence = self.df.iloc[i:i + self.encoder.sequence_length].values
-            timestamp = self.df.index[i + self.encoder.sequence_length - 1]
-            
-            # Move data to GPU if available
-            if self.device == 'cuda':
-                sequence_tensor = torch.tensor(sequence, device='cuda')
-            else:
-                sequence_tensor = torch.tensor(sequence)
-                
-            state = self.encoder.encode_sequence(sequence_tensor, timestamp)
-            results.append(state)
-            
-        return results
-
-def optimize_system():
-   
-    if torch.cuda.is_available():
-        # Set GPU memory allocation strategy
-        torch.cuda.set_per_process_memory_fraction(0.8)  # Reserve 20% for system
-        torch.backends.cudnn.benchmark = True  # Optimize CUDA operations
-        
-    # Set number of threads for parallel processing
-    torch.set_num_threads(24)  # Optimize for 24 logical processors
-    
-    # Configure numpy to use multiple threads
-    np.set_num_threads(24)
-    
-    logger.info("System optimized for parallel processing and GPU acceleration")
-
-class OptimizedRewardCalculator:
-    """Calculate DRL rewards based on market state and actions with regime-aware adjustments"""
-    
-    def __init__(
-        self,
-        transaction_cost: float = 0.001,
-        holding_cost: float = 0.0001,
-        volatility_penalty: float = 0.1,
-        regime_multipliers: Optional[Dict[int, float]] = None,
-        device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
-    ):
-        """Initialize reward calculator with costs and penalties"""
-        self._validate_costs(transaction_cost, holding_cost, volatility_penalty)
-        self.transaction_cost = transaction_cost
-        self.holding_cost = holding_cost
-        self.volatility_penalty = volatility_penalty
-        self.device = device
-        
-        # Set default regime multipliers if none provided
-        self.regime_multipliers = regime_multipliers or {
-            0: 0.8,  # High volatility - reduce reward
-            1: 1.0,  # Normal trading
-            2: 1.2,  # Trending market - increase reward
-        }
-        
-        # Initialize metrics tracking
-        self.reset_metrics()
-        
-        # Move multipliers to GPU if available
-        if self.device == 'cuda':
-            self.regime_multipliers_tensor = {
-                k: torch.tensor(v, device='cuda')
-                for k, v in self.regime_multipliers.items()
-            }
-    
-    def _validate_costs(
-        self,
-        transaction_cost: float,
-        holding_cost: float,
-        volatility_penalty: float
-    ) -> None:
-        """Validate cost parameters"""
-        if not 0 <= transaction_cost <= 0.1:
-            raise ValueError("transaction_cost must be between 0 and 0.1")
-        if not 0 <= holding_cost <= 0.01:
-            raise ValueError("holding_cost must be between 0 and 0.01")
-        if not 0 <= volatility_penalty <= 1.0:
-            raise ValueError("volatility_penalty must be between 0 and 1.0")
-    
-    def reset_metrics(self) -> None:
-        """Reset accumulated metrics"""
-        self.total_rewards = 0.0
-        self.total_costs = 0.0
-        self.total_penalties = 0.0
-        self.rewards_by_regime = {}
-        self.action_counts = {action: 0 for action in Action}
-    
-    def calculate_reward(
-        self,
-        current_state: MarketState,
-        next_state: MarketState,
-        action: Union[Action, int],
-        position_size: float
-    ) -> Tuple[float, Dict[str, float]]:
-        """Calculate reward for a single state transition with GPU acceleration"""
-        # Validate inputs
-        if isinstance(action, int):
-            action = Action(action)
-        if not isinstance(action, Action):
-            raise ValueError(f"Invalid action: {action}")
-        if not 0 <= position_size <= 1:
-            raise ValueError("position_size must be between 0 and 1")
-        
-        # Move calculations to GPU if available
-        if self.device == 'cuda':
-            current_price = torch.tensor(current_state.current_price, device='cuda')
-            next_price = torch.tensor(next_state.current_price, device='cuda')
-            position_size_tensor = torch.tensor(position_size, device='cuda')
-            
-            # Calculate price change
-            price_change = (next_price - current_price) / current_price
-            
-            # Calculate base reward
-            if action == Action.BUY:
-                base_reward = price_change * position_size_tensor
-                costs = self.transaction_cost * position_size_tensor
-            elif action == Action.SELL:
-                base_reward = -price_change * position_size_tensor
-                costs = self.transaction_cost * position_size_tensor
-            else:  # HOLD
-                base_reward = torch.tensor(0.0, device='cuda')
-                costs = self.holding_cost * position_size_tensor
-            
-            # Apply volatility penalty
-            volatility = torch.tensor(
-                current_state.metrics['volatility'],
-                device='cuda'
-            )
-            vol_penalty = -self.volatility_penalty * volatility * position_size_tensor
-            
-            # Get regime multiplier
-            regime_multiplier = self.regime_multipliers_tensor.get(
-                current_state.regime_label,
-                torch.tensor(1.0, device='cuda')
-            )
-            
-            # Calculate final reward
-            reward = (base_reward - costs + vol_penalty) * regime_multiplier
-            
-            # Move results back to CPU
-            reward = reward.item()
-            metrics = {
-                'base_reward': base_reward.item(),
-                'costs': costs.item(),
-                'vol_penalty': vol_penalty.item(),
-                'regime_multiplier': regime_multiplier.item(),
-                'total_reward': reward,
-                'price_change': price_change.item(),
-                'volatility': volatility.item()
-            }
-        else:
-            # CPU calculations (original implementation)
-            price_change = (next_state.current_price - current_state.current_price) / current_state.current_price
-            
-            if action == Action.BUY:
-                base_reward = price_change * position_size
-                costs = self.transaction_cost * position_size
-            elif action == Action.SELL:
-                base_reward = -price_change * position_size
-                costs = self.transaction_cost * position_size
-            else:  # HOLD
-                base_reward = 0
-                costs = self.holding_cost * position_size
-            
-            volatility = current_state.metrics['volatility']
-            vol_penalty = -self.volatility_penalty * volatility * position_size
-            
-            regime_multiplier = self.regime_multipliers.get(
-                current_state.regime_label,
-                1.0
-            )
-            
-            reward = (base_reward - costs + vol_penalty) * regime_multiplier
-            
-            metrics = {
-                'base_reward': base_reward,
-                'costs': costs,
-                'vol_penalty': vol_penalty,
-                'regime_multiplier': regime_multiplier,
-                'total_reward': reward,
-                'price_change': price_change,
-                'volatility': volatility
-            }
-        
-        # Update metrics
-        self.total_rewards += reward
-        self.total_costs += metrics['costs']
-        self.total_penalties += abs(metrics['vol_penalty'])
-        self.action_counts[action] += 1
-        
-        if current_state.regime_label not in self.rewards_by_regime:
-            self.rewards_by_regime[current_state.regime_label] = []
-        self.rewards_by_regime[current_state.regime_label].append(reward)
-        
-        return reward, metrics
-    
-    def get_metrics_summary(self) -> Dict[str, Any]:
-        """Get summary of accumulated metrics"""
-        summary = {
-            'total_rewards': self.total_rewards,
-            'total_costs': self.total_costs,
-            'total_penalties': self.total_penalties,
-            'action_counts': {action.name: count for action, count in self.action_counts.items()},
-            'rewards_by_regime': {
-                regime: {
-                    'mean': np.mean(rewards),
-                    'std': np.std(rewards),
-                    'count': len(rewards)
-                }
-                for regime, rewards in self.rewards_by_regime.items()
-            }
-        }
-        return summary
-
-def main():
-    """Main entry point for optimized market analysis"""
-    # Configure system
-    optimize_system()
-    
-    # Initialize components
-    data_path = "data/raw/btc_usdt_1m_processed.csv"
-    visualizer = OptimizedMarketVisualizer(data_path)
-    
-    # Process some sample data
-    n_samples = 1000
-    results = visualizer.visualize_parallel(n_samples)
-    
-    logger.info(f"Processed {len(results)} market states")
-    
-    # Test reward calculation
-    reward_calc = OptimizedRewardCalculator()
-    if len(results) >= 2:
-        reward, metrics = reward_calc.calculate_reward(
-            results[0],
-            results[1],
-            Action.BUY,
-            0.5
-        )
-        logger.info(f"Sample reward calculation: {reward:.4f}")
-        logger.info(f"Reward metrics: {metrics}")
-
-if __name__ == "__main__":
-    main()
-
-// File: regime.py
-import numpy as np
-from sklearn.preprocessing import StandardScaler
-from sklearn.cluster import KMeans, DBSCAN
-from sklearn.mixture import GaussianMixture
-from typing import Optional, List, Union, Tuple, Dict
-import pandas as pd
-
-class MarketRegimeDetector:
-    """
-    Enhanced market regime detector with time-based features and flexible clustering
-    """
-    def __init__(
-        self,
-        n_regimes: int = 8,
-        feature_window: int = 20,
-        clustering_method: str = 'kmeans',
-        random_state: int = 42
-    ):
-        """
-        Initialize the market regime detector
-        
-        Args:
-            n_regimes: Number of distinct market regimes to detect
-            feature_window: Window size for calculating features
-            clustering_method: One of ['kmeans', 'dbscan', 'gmm']
-            random_state: Random seed for reproducibility
-        """
-        self.n_regimes = n_regimes
-        self.feature_window = feature_window
-        self.random_state = random_state
-        self.clustering_method = clustering_method
-        
-        # Initialize clustering algorithm
-        if clustering_method == 'kmeans':
-            self.cluster_model = KMeans(
-                n_clusters=n_regimes,
-                random_state=random_state,
-                n_init='auto'
-            )
-        elif clustering_method == 'dbscan':
-            self.cluster_model = DBSCAN(
-                eps=0.3,
-                min_samples=5
-            )
-        elif clustering_method == 'gmm':
-            self.cluster_model = GaussianMixture(
-                n_components=n_regimes,
-                random_state=random_state
-            )
-        else:
-            raise ValueError(f"Unknown clustering method: {clustering_method}")
-            
-        self.scaler = StandardScaler()
-        self.is_fitted = False
-        self.feature_names = [
-            'volatility', 'trend', 'volume_ratio', 'momentum',
-            'hour_sin', 'hour_cos', 'weekday_0', 'weekday_1', 
-            'weekday_2', 'weekday_3', 'weekday_4', 'weekday_5', 'weekday_6'
-        ]
-    
-    def _encode_cyclical_time(self, hour: int) -> Tuple[float, float]:
-        """Encode hour using sine and cosine transformation"""
-        hour_rad = 2 * np.pi * hour / 24.0
-        return np.sin(hour_rad), np.cos(hour_rad)
-    
-    def _extract_features(self, data: np.ndarray, timestamp: pd.Timestamp) -> np.ndarray:
-        """
-        Extract market and time-based features (vectorized)
-        
-        Args:
-            data: Market data array of shape (sequence_length, features)
-            timestamp: Timestamp for time-based features
-            
-        Returns:
-            features: Array of extracted features
-        """
-        # Market features (vectorized calculations)
-        close_prices = data[:, 3]
-        volume = data[:, 4]
-        
-        # Calculate returns and features
-        returns = np.diff(np.log(close_prices))
-        volatility = np.std(returns[-self.feature_window:])
-        
-        # Trend calculation
-        x = np.arange(self.feature_window)
-        slope, _ = np.polyfit(x, close_prices[-self.feature_window:], 1)
-        
-        # Volume profile
-        volume_ratio = np.mean(volume[-5:]) / np.mean(volume[-self.feature_window:])
-        
-        # Momentum
-        momentum = (close_prices[-1] / close_prices[-self.feature_window] - 1)
-        
-        # Time-based features
-        hour_sin, hour_cos = self._encode_cyclical_time(timestamp.hour)
-        weekday = timestamp.weekday()
-        weekday_onehot = np.zeros(7)
-        weekday_onehot[weekday] = 1
-        
-        # Combine all features
-        features = np.concatenate([
-            [volatility, slope, volume_ratio, momentum],
-            [hour_sin, hour_cos],
-            weekday_onehot
-        ])
-        
-        return features.reshape(1, -1)
-    
-    def fit(self, data: np.ndarray, timestamps: pd.DatetimeIndex) -> None:
-        """
-        Fit the regime detector on historical data
-        
-        Args:
-            data: Historical market data of shape (n_samples, sequence_length, features)
-            timestamps: Corresponding timestamps for each sample
-        """
-        # Extract features for all samples
-        all_features = []
-        for i in range(len(data)):
-            features = self._extract_features(data[i], timestamps[i])
-            all_features.append(features)
-        
-        features_array = np.vstack(all_features)
-        
-        # Scale features
-        scaled_features = self.scaler.fit_transform(features_array)
-        
-        # Fit clustering model
-        self.cluster_model.fit(scaled_features)
-        self.is_fitted = True
-        
-        # Store cluster characteristics
-        if self.clustering_method != 'dbscan':
-            if hasattr(self.cluster_model, 'cluster_centers_'):
-                self.cluster_centers_ = self.cluster_model.cluster_centers_
-            else:
-                self.cluster_centers_ = self.cluster_model.means_
-    
-    def predict(self, data: np.ndarray, timestamps: pd.DatetimeIndex) -> np.ndarray:
-        """
-        Predict market regimes for new data
-        
-        Args:
-            data: Market data of shape (n_samples, sequence_length, features)
-            timestamps: Corresponding timestamps for each sample
-            
-        Returns:
-            predictions: Array of regime labels
-        """
-        if not self.is_fitted:
-            raise ValueError("MarketRegimeDetector must be fitted before making predictions")
-        
-        # Extract features
-        all_features = []
-        for i in range(len(data)):
-            features = self._extract_features(data[i], timestamps[i])
-            all_features.append(features)
-        
-        features_array = np.vstack(all_features)
-        
-        # Scale features
-        scaled_features = self.scaler.transform(features_array)
-        
-        # Predict regimes
-        if self.clustering_method in ['kmeans', 'dbscan']:
-            predictions = self.cluster_model.predict(scaled_features)
-        else:  # GMM
-            predictions = self.cluster_model.predict(scaled_features)
-        
-        return predictions
-    
-    def get_regime_characteristics(self) -> List[Dict]:
-        """
-        Get characteristics of each regime based on cluster centers
-        
-        Returns:
-            List of dictionaries containing regime characteristics
-        """
-        if not self.is_fitted:
-            raise ValueError("MarketRegimeDetector must be fitted before getting characteristics")
-        
-        if self.clustering_method == 'dbscan':
-            raise ValueError("Regime characteristics not available for DBSCAN")
-            
-        characteristics = []
-        centers = self.scaler.inverse_transform(self.cluster_centers_)
-        
-        for i, center in enumerate(centers):
-            regime_dict = {
-                'regime_id': i,
-                'characteristics': {
-                    name: value for name, value in zip(self.feature_names, center)
-                },
-                'interpretation': self._interpret_regime(center)
-            }
-            characteristics.append(regime_dict)
-            
-        return characteristics
-    
-    def _interpret_regime(self, center: np.ndarray) -> str:
-        """
-        Generate human-readable interpretation of regime characteristics
-        
-        Args:
-            center: Cluster center array
-            
-        Returns:
-            interpretation: String describing the regime
-        """
-        volatility, trend, volume_ratio, momentum = center[:4]
-        
-        descriptions = []
-        
-        # Volatility interpretation
-        if volatility > 1.5:
-            descriptions.append("High volatility")
-        elif volatility < 0.5:
-            descriptions.append("Low volatility")
-        
-        # Trend interpretation
-        if trend > 0.01:
-            descriptions.append("Upward trending")
-        elif trend < -0.01:
-            descriptions.append("Downward trending")
-        else:
-            descriptions.append("Range-bound")
-            
-        # Volume interpretation
-        if volume_ratio > 1.2:
-            descriptions.append("High volume")
-        elif volume_ratio < 0.8:
-            descriptions.append("Low volume")
-            
-        # Momentum interpretation
-        if momentum > 0.02:
-            descriptions.append("Strong momentum")
-        elif momentum < -0.02:
-            descriptions.append("Weak momentum")
-        
-        return ", ".join(descriptions)
-
-// File: train.py
-import torch
-import numpy as np
-import pandas as pd
-from pathlib import Path
-from typing import Tuple, Dict, Optional, List
-from sklearn.preprocessing import StandardScaler
-from torch.utils.data import DataLoader, TensorDataset
-
-from market_base import MarketState, RewardCalculator, DataValidationMixin
-from regime import MarketRegimeDetector
-
-class HypersphericalEncoder(DataValidationMixin):
-    """
-    Encodes market sequences into hyperspherical latent space with regime awareness
-    """
-    def __init__(
-        self,
-        projection_dim: int = 128,
-        n_regimes: int = 8,
-        sequence_length: int = 60,
-        min_features: int = 17  # OHLCV(5) + Indicators(12)
-    ):
-        self.projection_dim = projection_dim
-        self.n_regimes = n_regimes
-        self.sequence_length = sequence_length
-        self.min_features = min_features
-        
-        # Initialize components
-        self.regime_detector = MarketRegimeDetector(n_regimes=n_regimes)
-        self.price_scaler = StandardScaler()
-        self.indicator_scaler = StandardScaler()
-        self.layer_norm = torch.nn.LayerNorm(projection_dim)
-        
-        # Initialize projection layer after feature dimension is determined
-        self.projection = None
-        
-    def fit_scalers(self, data: np.ndarray):
-        """Fits the scalers to the input data."""
-        price_data = data[:, :, :5]  # OHLCV
-        indicator_data = data[:, :, 5:self.min_features]  # Technical indicators
-        
-        # Fit scalers
-        self.price_scaler.fit(price_data.reshape(-1, 5))
-        self.indicator_scaler.fit(indicator_data.reshape(-1, self.min_features - 5))
-    
-    def _init_projection(self, total_features: int) -> None:
-        """Initialize the projection layer with correct input dimension"""
-        self.projection = torch.nn.Linear(total_features, self.projection_dim)
-        
-    def _calculate_metrics(self, data: np.ndarray) -> Dict[str, float]:
-        """
-        Calculate market metrics from sequence data
-        
-        Args:
-            data: Market data array of shape (batch_size, sequence_length, features)
-            
-        Returns:
-            Dict of computed metrics
-        """
-        close_prices = data[:, :, 3]  # Close price is 4th column
-        volume = data[:, :, 4]        # Volume is 5th column
-        
-        # Calculate returns and volatility
-        returns = np.diff(np.log(close_prices), axis=1)
-        volatility = np.std(returns, axis=1)[-1]
-        
-        # Volume metrics
-        rel_volume = volume[:, -1] / np.mean(volume, axis=1)
-        
-        # Additional metrics
-        price_momentum = (close_prices[:, -1] / close_prices[:, -20] - 1)[-1]
-        volume_momentum = (volume[:, -1] / volume[:, -20] - 1)[-1]
-        
-        return {
-            'volatility': float(volatility),
-            'relative_volume': float(rel_volume[-1]),
-            'price_momentum': float(price_momentum),
-            'volume_momentum': float(volume_momentum)
-        }
-    
-    def _encode_market_data(self, data: np.ndarray) -> torch.Tensor:
-        """
-        Encode raw market data into latent representation
-        
-        Args:
-            data: Market data array of shape (batch_size, sequence_length, features)
-            
-        Returns:
-            Encoded tensor of shape (batch_size, projection_dim)
-        """
-        # Split data into components
-        price_data = data[:, :, :5]  # OHLCV
-        indicator_data = data[:, :, 5:self.min_features]  # Technical indicators
-        
-        # Scale components
-        price_scaled = self.price_scaler.transform(price_data.reshape(-1, 5))
-        price_scaled = price_scaled.reshape(data.shape[0], self.sequence_length, 5)
-        
-        indicator_scaled = self.indicator_scaler.transform(indicator_data.reshape(-1, 12))
-        indicator_scaled = indicator_scaled.reshape(data.shape[0], self.sequence_length, 12)
-        
-        # Convert to tensors
-        price_tensor = torch.FloatTensor(price_scaled[:, -1, :])
-        indicator_tensor = torch.FloatTensor(indicator_scaled[:, -1, :])
-        
-        # Initialize projection if needed
-        if self.projection is None:
-            total_features = price_tensor.shape[1] + indicator_tensor.shape[1]
-            self._init_projection(total_features)
-        
-        # Combine features
-        combined = torch.cat([price_tensor, indicator_tensor], dim=1)
-        
-        # Project and normalize
-        projected = self.projection(combined)
-        normalized = self.layer_norm(projected)
-        
-        return normalized
-    
-    def encode_sequence(
-        self,
-        data: np.ndarray,
-        timestamp: pd.Timestamp
-    ) -> MarketState:
-        """
-        Encode a single market sequence into a MarketState
-        
-        Args:
-            data: Market sequence of shape (sequence_length, features)
-            timestamp: Timestamp for the sequence
-            
-        Returns:
-            MarketState object containing encoded state and metadata
-        """
-        # Validate input
-        self.validate_market_data(
-            data.reshape(1, *data.shape), 
-            self.sequence_length, 
-            self.min_features
-        )
-        
-        # Reshape for batch processing
-        data_batch = data.reshape(1, *data.shape)
-        
-        # Encode market data
-        market_encoded = self._encode_market_data(data_batch)
-        
-        # Get regime
-        regime = self.regime_detector.predict(
-            data_batch, 
-            pd.DatetimeIndex([timestamp])
-        )[0]
-        
-        # Calculate metrics
-        metrics = self._calculate_metrics(data_batch)
-        
-        # Create market state
-        state = MarketState(
-            encoded_state=market_encoded[0],
-            regime_label=regime,
-            current_price=float(data[-1, 3]),  # Latest close price
-            timestamp=timestamp,
-            metrics=metrics
-        )
-        
-        return state
-    
-    def create_training_batch(
-        self,
-        data: pd.DataFrame,
-        batch_size: int = 64
-    ) -> Tuple[DataLoader, RewardCalculator]:
-        """
-        Create training batches and reward calculator
-        
-        Args:
-            data: Market data DataFrame with timestamp index
-            batch_size: Size of training batches
-            
-        Returns:
-            DataLoader for training
-            RewardCalculator instance
-        """
-        # Validate input data
-        if not isinstance(data.index, pd.DatetimeIndex):
-            raise ValueError("DataFrame must have DatetimeIndex")
-        
-        # Infer data frequency if not set
-        if data.index.freq is None:
-            freq = pd.infer_freq(data.index)
-            if freq is None:
-                raise ValueError("Cannot infer data frequency")
-            data.index.freq = freq
-        
-        # Create sequences
-        states = []
-        timestamps = pd.date_range(
-            start=data.index[0],
-            periods=len(data)-self.sequence_length+1,
-            freq=data.index.freq
-        )
-        
-        for i in range(len(data) - self.sequence_length + 1):
-            sequence = data.iloc[i:i+self.sequence_length].values
-            state = self.encode_sequence(sequence, timestamps[i])
-            states.append(state)
-        
-        # Create dataset
-        encoded_states = torch.stack([s.encoded_state for s in states])
-        dataset = TensorDataset(encoded_states)
-        
-        # Create dataloader
-        dataloader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            pin_memory=True
-        )
-        
-        # Create reward calculator with regime-specific multipliers
-        regime_multipliers = self._get_regime_multipliers()
-        reward_calc = RewardCalculator(regime_multipliers=regime_multipliers)
-        
-        return dataloader, reward_calc
-    
-    def _get_regime_multipliers(self) -> Dict[int, float]:
-        """Get reward multipliers based on regime characteristics"""
-        if not hasattr(self.regime_detector, 'get_regime_characteristics'):
-            return {}
-            
-        characteristics = self.regime_detector.get_regime_characteristics()
-        multipliers = {}
-        
-        for regime in characteristics:
-            regime_id = regime['regime_id']
-            chars = regime['characteristics']
-            
-            # Calculate multiplier based on regime characteristics
-            volatility = chars.get('volatility', 0)
-            trend = chars.get('trend', 0)
-            
-            # Reduce rewards in high volatility regimes
-            vol_factor = 1.0 - min(volatility, 0.5)
-            
-            # Increase rewards in trending regimes
-            trend_factor = 1.0 + abs(trend)
-            
-            multipliers[regime_id] = vol_factor * trend_factor
-            
-        return multipliers
-
-def process_training_data(
-    csv_path: str,
-    sequence_length: int = 60,
-    batch_size: int = 64
-) -> Dict:
-    """
-    Process market data for DRL training
-    
-    Args:
-        csv_path: Path to CSV file containing market data
-        sequence_length: Length of market sequences
-        batch_size: Size of training batches
-        
-    Returns:
-        Dictionary containing processed data and components
-    """
-    # Load and preprocess data
-    df = pd.read_csv(csv_path)
-    df['timestamp'] = pd.to_datetime(df['open_time'])
-    df.set_index('timestamp', inplace=True)
-    
-    # Initialize encoder
-    encoder = HypersphericalEncoder(sequence_length=sequence_length)
-    
-    # Prepare data for fitting scalers
-    num_samples_for_fit = min(10000, len(df) - sequence_length + 1)
-    data_for_fit = []
-    for i in range(num_samples_for_fit):
-        sequence = df.iloc[i:i+sequence_length].values
-        data_for_fit.append(sequence)
-    data_for_fit = np.array(data_for_fit)
-    
-    # Fit scalers before creating training batches
-    encoder.fit_scalers(data_for_fit)
-    
-    # Create training batches
-    dataloader, reward_calc = encoder.create_training_batch(df, batch_size)
-    
-    return {
-        'dataloader': dataloader,
-        'encoder': encoder,
-        'reward_calculator': reward_calc
-    }
-
-def main():
-    """Main entry point for data processing"""
-    # Process training data
-    results = process_training_data("data/raw/btc_usdt_1m_processed.csv")
-    
-    # Create output directory
-    output_dir = Path("data/processed")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Save processed data
-    torch.save(results, output_dir / "drl_training_data.pt")
-    print(f"Processed data saved to {output_dir / 'drl_training_data.pt'}")
-
-if __name__ == "__main__":
-    main()
-
 // File: viz.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import pandas as pd
-import torch
 from pathlib import Path
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
-from typing import Dict, List, Tuple, Optional
+from sklearn.preprocessing import StandardScaler, MinMaxScaler  # Add MinMaxScaler
+from typing import Dict, List, Optional, Literal
 import logging
 from tqdm import tqdm
+import plotly.express as px  # Import for interactive plots
 
-from train import HypersphericalEncoder
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("market_visualizer.log"),
-        logging.StreamHandler()
-    ]
-)
+# Configure robust logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s',
+                    handlers=[logging.FileHandler("market_visualizer.log"), logging.StreamHandler()])
 logger = logging.getLogger(__name__)
+
+# Define the device
+if torch.cuda.is_available():
+    device = torch.device('cuda')
+    torch.backends.cudnn.benchmark = True  # Enable cuDNN auto-tuner
+    logger.info("CUDA is available. Running on GPU.")
+else:
+    device = torch.device('cpu')
+    logger.info("CUDA is not available. Running on CPU.")
+
+class HypersphericalEncoder(nn.Module):
+    """GPU-accelerated hyperspherical encoder with proper normalization"""
+    
+    def __init__(
+        self,
+        projection_dim: int = 128,
+        sequence_length: int = 60,
+        n_price_features: int = 5,
+        n_indicator_features: int = 4,
+        temperature: float = 0.07,
+        device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+        price_scaler: StandardScaler = None,
+        indicator_scaler: StandardScaler = None
+    ):
+        super(HypersphericalEncoder, self).__init__()
+        self.projection_dim = projection_dim
+        self.sequence_length = sequence_length
+        self.n_price_features = n_price_features
+        self.n_indicator_features = n_indicator_features
+        self.temperature = temperature
+        self.device = device
+        
+        # Assign scalers
+        self.price_scaler = price_scaler
+        self.indicator_scaler = indicator_scaler
+        
+        # Initialize neural network components
+        self.projection1 = nn.Linear(
+            n_price_features + n_indicator_features, 
+            projection_dim * 2
+        ).to(device)
+        
+        # Replace BatchNorm with LayerNorm
+        self.layer_norm = nn.LayerNorm(projection_dim * 2).to(device)
+        self.projection2 = nn.Linear(projection_dim * 2, projection_dim).to(device)
+        
+        # Set to eval mode and disable gradients
+        self.eval()
+        self._set_requires_grad(False)
+    
+    def _set_requires_grad(self, requires_grad: bool):
+        """Set requires_grad for all parameters"""
+        for param in self.parameters():
+            param.requires_grad_(requires_grad)
+    
+    @torch.no_grad()
+    def encode_batch(self, sequences: np.ndarray) -> torch.Tensor:
+        """Encode a batch of sequences"""
+        if sequences.ndim == 2:
+            sequences = sequences.reshape(1, *sequences.shape)
+            
+        # Split and scale features
+        price_data = sequences[:, :, :self.n_price_features]
+        indicator_data = sequences[:, :, self.n_price_features:self.n_price_features + self.n_indicator_features]
+        
+        if self.price_scaler is None or self.indicator_scaler is None:
+            raise ValueError("Scalers have not been fitted. Please fit scalers before encoding.")
+        
+        price_scaled = self.price_scaler.transform(price_data.reshape(-1, self.n_price_features))
+        indicator_scaled = self.indicator_scaler.transform(indicator_data.reshape(-1, self.n_indicator_features))
+        
+        # Reshape back to batches
+        price_scaled = price_scaled.reshape(sequences.shape[0], sequences.shape[1], -1)
+        indicator_scaled = indicator_scaled.reshape(sequences.shape[0], sequences.shape[1], -1)
+        
+        # Get last timestep
+        price_last = torch.FloatTensor(price_scaled[:, -1, :]).to(self.device)
+        indicator_last = torch.FloatTensor(indicator_scaled[:, -1, :]).to(self.device)
+        
+        # Combine features
+        combined = torch.cat([price_last, indicator_last], dim=1)
+        
+        # Project through network
+        hidden = self.projection1(combined)
+        hidden = F.relu(self.layer_norm(hidden))
+        projected = self.projection2(hidden)
+        
+        # Apply temperature scaling and normalize
+        scaled = projected / self.temperature
+        normalized = F.normalize(scaled, p=2, dim=1)
+        
+        return normalized
 
 class MarketVisualizer:
     """Visualization tools for market data and encoded states"""
-    
-    def __init__(self, data_path: str = "data/raw/btc_usdt_1m_processed.csv"):
-        """Initialize visualizer with data path"""
+
+    def __init__(
+        self,
+        data_path: str = "data/raw/btc_usdt_1m_processed.csv",
+        batch_size: int = 256,  # Increased batch size for GPU utilization
+        sequence_length: int = 64, # Increased sequence length for more context, adjust as needed
+        hidden_size: int = 128,     # larger hypersphere embedding visualization
+        device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+        scaling_method: Literal["standard", "minmax"] = "standard"  # Add scaling method arg
+    ):
         logger.info(f"Initializing MarketVisualizer with data from {data_path}")
         self.data_path = Path(data_path)
+        self.batch_size = batch_size
+        self.device = device
+        self.sequence_length = sequence_length # Store sequence length
+        self.hidden_size = hidden_size  # larger hypersphere embedding visualization
+        self.scaling_method = scaling_method
+        
         if not self.data_path.exists():
             raise FileNotFoundError(f"Data file not found: {data_path}")
         
@@ -1792,183 +163,118 @@ class MarketVisualizer:
         self.analysis_df = self.df[all_numeric_columns].copy()
         logger.info(f"Analysis dataframe shape: {self.analysis_df.shape}")
         
-        # Initialize encoder with correct feature dimensions
-        self.encoder = self._initialize_encoder()
+        # Initialize scalers based on scaling_method
+        if self.scaling_method == "standard":
+            self.price_scaler = StandardScaler()
+            self.indicator_scaler = StandardScaler()
+        elif self.scaling_method == "minmax":
+            self.price_scaler = MinMaxScaler()
+            self.indicator_scaler = MinMaxScaler()
+        else:
+            raise ValueError("Invalid scaling_method. Choose 'standard' or 'minmax'.")
         
         # Fit scalers
         self._fit_scalers()
         
-    def _initialize_encoder(self):
-        """Initialize encoder with correct dimensions"""
-        n_price_features = len(self.price_columns)
-        n_indicator_features = len(self.indicator_columns)
-        
-        logger.info(f"Initializing encoder with {n_price_features} price features "
-                   f"and {n_indicator_features} indicator features")
-        
-        return HypersphericalEncoder(
-            sequence_length=60,
-            min_features=n_price_features + n_indicator_features
-        )
+        # Initialize encoder with fitted scalers
+        self.encoder = HypersphericalEncoder(
+            n_price_features=len(self.price_columns),
+            n_indicator_features=len(self.indicator_columns),
+            projection_dim=self.hidden_size,  # Larger embedding size for visualization
+            sequence_length=self.sequence_length, # Pass sequence length to encoder
+            device=device,
+            price_scaler=self.price_scaler,
+            indicator_scaler=self.indicator_scaler
+        ).to(device)  # Move encoder to device
     
     def _fit_scalers(self):
-        """Fit scalers on numeric data"""
+        """Fit scalers on numeric data, handling NaN values"""
         logger.info("Creating sequences for scaler fitting...")
         
-        # Create sequences
         sequences = []
-        n_sequences = len(self.analysis_df) - self.encoder.sequence_length + 1
+        stride = 1000  # Use stride to reduce memory usage
+        n_sequences = (len(self.analysis_df) - self.sequence_length) // stride
         
-        for i in tqdm(range(n_sequences), desc="Building sequences"):
-            sequence = self.analysis_df.iloc[i:i + self.encoder.sequence_length].values
+        for i in range(n_sequences):
+            idx = i * stride
+            sequence = self.analysis_df.iloc[idx:idx + self.sequence_length].values
             sequences.append(sequence)
         
-        # Convert to numpy array
         data_for_fit = np.array(sequences)
         logger.info(f"Created {len(sequences)} sequences of shape {sequences[0].shape}")
         
-        # Split data into price and indicator components
-        price_data = data_for_fit[:, :, :len(self.price_columns)]
-        indicator_data = data_for_fit[:, :, len(self.price_columns):]
-        
-        logger.info("Fitting scalers...")
-        # Fit price scaler
-        self.encoder.price_scaler.fit(price_data.reshape(-1, len(self.price_columns)))
-        
-        # Fit indicator scaler
-        if indicator_data.shape[2] > 0:
-            self.encoder.indicator_scaler.fit(
-                indicator_data.reshape(-1, indicator_data.shape[2])
-            )
-        
+        # Fit scalers
+        price_data = self.analysis_df[self.price_columns].values.reshape(-1, len(self.price_columns))
+        indicator_data = self.analysis_df[self.indicator_columns].values.reshape(-1, len(self.indicator_columns))
+
+        self.price_scaler.fit(np.nan_to_num(price_data))
+        self.indicator_scaler.fit(np.nan_to_num(indicator_data))
         logger.info("Scalers fitted successfully")
     
-    def plot_market_overview(self, days: int = 30) -> go.Figure:
-        """Create interactive overview of market data"""
-        logger.info(f"Creating market overview for last {days} days")
-        recent_data = self.df.tail(days * 1440)  # 1440 minutes per day
-        
-        fig = make_subplots(
-            rows=2, cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.05,
-            subplot_titles=('Price Action', 'Volume'),
-            row_heights=[0.7, 0.3]
-        )
-        
-        # Candlestick chart
-        fig.add_trace(
-            go.Candlestick(
-                x=recent_data.index,
-                open=recent_data['open'],
-                high=recent_data['high'],
-                low=recent_data['low'],
-                close=recent_data['close'],
-                name='OHLC'
-            ),
-            row=1, col=1
-        )
-        
-        # Volume
-        fig.add_trace(
-            go.Bar(
-                x=recent_data.index,
-                y=recent_data['volume'],
-                name='Volume'
-            ),
-            row=2, col=1
-        )
-        
-        fig.update_layout(
-            title='Market Data Overview',
-            height=800,
-            xaxis2_title='Date',
-            yaxis_title='Price',
-            yaxis2_title='Volume',
-            showlegend=True
-        )
-        
-        logger.info("Market overview plot created successfully")
-        return fig
-    
-    def visualize_hypersphere(
-        self,
-        n_samples: int = 1000,
-        projection_method: str = 'pca',
-        perplexity: int = 30
-    ) -> go.Figure:
-        """Visualize encoded states in reduced dimensionality"""
+    def visualize_hypersphere(self, n_samples: int = 10000, projection_method: str = 'pca', perplexity: int = 50):
+        """Visualize encoded states in reduced dimensionality with hover information"""
         logger.info(f"Creating hypersphere visualization using {projection_method}")
         
-        # Get encoded states
-        states = []
+        # Calculate number of batches
         max_samples = min(n_samples, len(self.analysis_df) - self.encoder.sequence_length)
+        n_batches = (max_samples + self.batch_size - 1) // self.batch_size
         
-        logger.info(f"Encoding {max_samples} market states...")
-        for i in tqdm(range(max_samples), desc="Encoding states"):
-            sequence = self.analysis_df.iloc[i:i+self.encoder.sequence_length].values
-            timestamp = self.analysis_df.index[i+self.encoder.sequence_length-1]
+        encoded_states = []
+        logger.info(f"Encoding {max_samples} market states in batches...")
+        
+        for batch_idx in tqdm(range(n_batches), desc="Processing batches"):
+            start_idx = batch_idx * self.batch_size
+            end_idx = min(start_idx + self.batch_size, max_samples)
+            
+            # Prepare batch sequences
+            batch_sequences = []
+            for i in range(start_idx, end_idx):
+                sequence = self.analysis_df.iloc[i:i + self.encoder.sequence_length].values
+                batch_sequences.append(sequence)
+            
+            # Convert to numpy array and encode batch
+            batch_array = np.array(batch_sequences)
             try:
-                state = self.encoder.encode_sequence(sequence, timestamp)
-                states.append(state)
+                batch_encoded = self.encoder.encode_batch(batch_array)
+                encoded_states.append(batch_encoded.cpu())
             except Exception as e:
-                logger.error(f"Error encoding sequence {i}: {str(e)}")
+                logger.error(f"Error encoding batch {batch_idx}: {str(e)}")
                 continue
         
-        # Extract encoded tensors and regimes
-        logger.info("Processing encoded states...")
-        encoded_states = torch.stack([s.encoded_state for s in states]).numpy()
-        regimes = [s.regime_label for s in states]
+        if not encoded_states:
+            raise ValueError("No states were successfully encoded")
         
-        # Reduce dimensionality
-        logger.info(f"Reducing dimensionality using {projection_method}...")
+        # Combine all encoded states
+        all_states = torch.cat(encoded_states, dim=0).numpy()
+        logger.info(f"Successfully encoded {len(all_states)} states")
+        
+        # Dimensionality Reduction + Hover Info
         if projection_method == 'pca':
             reducer = PCA(n_components=3)
-        else:  # t-SNE
-            reducer = TSNE(n_components=3, perplexity=perplexity)
-            
-        reduced_states = reducer.fit_transform(encoded_states)
-        
-        # Create 3D scatter plot
-        fig = go.Figure(data=[
-            go.Scatter3d(
-                x=reduced_states[:, 0],
-                y=reduced_states[:, 1],
-                z=reduced_states[:, 2],
-                mode='markers',
-                marker=dict(
-                    size=5,
-                    color=regimes,
-                    colorscale='Viridis',
-                    opacity=0.8
-                ),
-                text=[f"Regime: {r}" for r in regimes],
-                hoverinfo='text'
-            )
-        ])
-        
-        # Update layout
-        fig.update_layout(
-            title=f'Encoded States Visualization ({projection_method.upper()})',
-            scene=dict(
-                xaxis_title='Component 1',
-                yaxis_title='Component 2',
-                zaxis_title='Component 3'
-            ),
-            width=800,
-            height=800
+            reduced_states = reducer.fit_transform(all_states)
+            hover_data = {f"Feature {i+1}": all_states[:, i] for i in range(all_states.shape[1])}
+        elif projection_method == 'tsne':
+            reducer = TSNE(n_components=3, perplexity=perplexity, n_jobs=-1) # Use all CPU cores
+            reduced_states = reducer.fit_transform(all_states)
+            hover_data = {f"Feature {i+1}": all_states[:, i] for i in range(all_states.shape[1])}
+        else:
+            raise ValueError("Invalid projection method. Choose 'pca' or 'tsne'.")
+
+        # Interactive Plot with Plotly Express
+        fig = px.scatter_3d(
+            x=reduced_states[:, 0],
+            y=reduced_states[:, 1],
+            z=reduced_states[:, 2],
+            color=np.arange(len(reduced_states)),  # Color based on sample index
+            hover_data=hover_data, # Show high-dimensional encoded info as well
+            title=f'Encoded States Visualization ({projection_method.upper()})'
         )
-        
-        logger.info("Hypersphere visualization created successfully")
+
         return fig
 
 def main():
-    """Main visualization script"""
-    logger.info("Starting visualization process...")
-    
     try:
-        # Initialize visualizer
-        viz = MarketVisualizer()
+        viz = MarketVisualizer(sequence_length=128, hidden_size=256, scaling_method="minmax") # Example: Use MinMaxScaler
         
         # Create output directory
         output_dir = Path("visualizations")
@@ -1976,23 +282,20 @@ def main():
         logger.info(f"Created output directory: {output_dir}")
         
         # Create and save visualizations
-        logger.info("Creating market overview visualization...")
-        market_fig = viz.plot_market_overview()
-        market_fig.write_html(output_dir / "market_overview.html")
-        
         logger.info("Creating hypersphere visualization...")
-        hypersphere_fig_pca = viz.visualize_hypersphere(projection_method='pca')
-        hypersphere_fig_pca.write_html(output_dir / "hypersphere_pca.html")
+        hypersphere_fig = viz.visualize_hypersphere(n_samples=10000, projection_method='tsne', perplexity=50)
+        hypersphere_fig.write_html(output_dir / "hypersphere_tsne.html")
         
         logger.info("Visualizations completed successfully")
         print("\nVisualizations saved to 'visualizations' directory")
-        
+    
     except Exception as e:
         logger.error(f"Error creating visualizations: {str(e)}", exc_info=True)
         raise
 
 if __name__ == "__main__":
     main()
+
 
 // File: data\raw\btc_usdt_1m_processed.csv
 // Snippet:
