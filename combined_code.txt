@@ -1738,59 +1738,122 @@ import pandas as pd
 import torch
 from pathlib import Path
 import plotly.graph_objects as go
-import plotly.express as px
 from plotly.subplots import make_subplots
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
-import seaborn as sns
 from typing import Dict, List, Tuple, Optional
-import matplotlib.pyplot as plt
+import logging
+from tqdm import tqdm
 
-from train import HypersphericalEncoder, process_training_data
-from market_base import MarketState
-from regime import MarketRegimeDetector
+from train import HypersphericalEncoder
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("market_visualizer.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 class MarketVisualizer:
     """Visualization tools for market data and encoded states"""
     
     def __init__(self, data_path: str = "data/raw/btc_usdt_1m_processed.csv"):
-        """
-        Initialize visualizer with data path
-        
-        Args:
-            data_path: Path to processed market data CSV
-        """
+        """Initialize visualizer with data path"""
+        logger.info(f"Initializing MarketVisualizer with data from {data_path}")
         self.data_path = Path(data_path)
         if not self.data_path.exists():
             raise FileNotFoundError(f"Data file not found: {data_path}")
         
         # Load data
+        logger.info("Loading and preprocessing market data...")
         self.df = pd.read_csv(self.data_path)
         self.df['timestamp'] = pd.to_datetime(self.df['open_time'])
         self.df.set_index('timestamp', inplace=True)
         
-        # Initialize encoder and process data
-        self.results = process_training_data(str(self.data_path))
-        self.encoder = self.results['encoder']
+        # Define price and additional feature columns
+        self.price_columns = ['open', 'high', 'low', 'close', 'volume']
+        self.indicator_columns = [
+            'quote_asset_volume', 'number_of_trades',
+            'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume'
+        ]
         
+        # Convert columns to numeric
+        logger.info("Converting data to numeric format...")
+        all_numeric_columns = self.price_columns + self.indicator_columns
+        for col in tqdm(all_numeric_columns, desc="Processing columns"):
+            if col in self.df.columns:
+                self.df[col] = pd.to_numeric(self.df[col], errors='coerce')
+        
+        # Create analysis dataframe
+        self.analysis_df = self.df[all_numeric_columns].copy()
+        logger.info(f"Analysis dataframe shape: {self.analysis_df.shape}")
+        
+        # Initialize encoder with correct feature dimensions
+        self.encoder = self._initialize_encoder()
+        
+        # Fit scalers
+        self._fit_scalers()
+        
+    def _initialize_encoder(self):
+        """Initialize encoder with correct dimensions"""
+        n_price_features = len(self.price_columns)
+        n_indicator_features = len(self.indicator_columns)
+        
+        logger.info(f"Initializing encoder with {n_price_features} price features "
+                   f"and {n_indicator_features} indicator features")
+        
+        return HypersphericalEncoder(
+            sequence_length=60,
+            min_features=n_price_features + n_indicator_features
+        )
+    
+    def _fit_scalers(self):
+        """Fit scalers on numeric data"""
+        logger.info("Creating sequences for scaler fitting...")
+        
+        # Create sequences
+        sequences = []
+        n_sequences = len(self.analysis_df) - self.encoder.sequence_length + 1
+        
+        for i in tqdm(range(n_sequences), desc="Building sequences"):
+            sequence = self.analysis_df.iloc[i:i + self.encoder.sequence_length].values
+            sequences.append(sequence)
+        
+        # Convert to numpy array
+        data_for_fit = np.array(sequences)
+        logger.info(f"Created {len(sequences)} sequences of shape {sequences[0].shape}")
+        
+        # Split data into price and indicator components
+        price_data = data_for_fit[:, :, :len(self.price_columns)]
+        indicator_data = data_for_fit[:, :, len(self.price_columns):]
+        
+        logger.info("Fitting scalers...")
+        # Fit price scaler
+        self.encoder.price_scaler.fit(price_data.reshape(-1, len(self.price_columns)))
+        
+        # Fit indicator scaler
+        if indicator_data.shape[2] > 0:
+            self.encoder.indicator_scaler.fit(
+                indicator_data.reshape(-1, indicator_data.shape[2])
+            )
+        
+        logger.info("Scalers fitted successfully")
+    
     def plot_market_overview(self, days: int = 30) -> go.Figure:
-        """
-        Create interactive overview of market data
-        
-        Args:
-            days: Number of recent days to display
-            
-        Returns:
-            Plotly figure with market overview
-        """
+        """Create interactive overview of market data"""
+        logger.info(f"Creating market overview for last {days} days")
         recent_data = self.df.tail(days * 1440)  # 1440 minutes per day
         
         fig = make_subplots(
-            rows=3, cols=1,
+            rows=2, cols=1,
             shared_xaxes=True,
             vertical_spacing=0.05,
-            subplot_titles=('Price Action', 'Volume', 'Technical Indicators'),
-            row_heights=[0.5, 0.2, 0.3]
+            subplot_titles=('Price Action', 'Volume'),
+            row_heights=[0.7, 0.3]
         )
         
         # Candlestick chart
@@ -1816,25 +1879,16 @@ class MarketVisualizer:
             row=2, col=1
         )
         
-        # Technical indicators
-        for indicator in ['rsi_14', 'macd', 'bb_upper', 'bb_lower']:
-            if indicator in recent_data.columns:
-                fig.add_trace(
-                    go.Scatter(
-                        x=recent_data.index,
-                        y=recent_data[indicator],
-                        name=indicator.upper()
-                    ),
-                    row=3, col=1
-                )
-        
         fig.update_layout(
             title='Market Data Overview',
-            height=1000,
-            xaxis3_title='Date',
+            height=800,
+            xaxis2_title='Date',
+            yaxis_title='Price',
+            yaxis2_title='Volume',
             showlegend=True
         )
         
+        logger.info("Market overview plot created successfully")
         return fig
     
     def visualize_hypersphere(
@@ -1843,30 +1897,31 @@ class MarketVisualizer:
         projection_method: str = 'pca',
         perplexity: int = 30
     ) -> go.Figure:
-        """
-        Visualize encoded states in reduced dimensionality
+        """Visualize encoded states in reduced dimensionality"""
+        logger.info(f"Creating hypersphere visualization using {projection_method}")
         
-        Args:
-            n_samples: Number of samples to visualize
-            projection_method: 'pca' or 'tsne'
-            perplexity: Perplexity parameter for t-SNE
-            
-        Returns:
-            Plotly figure with encoded states visualization
-        """
         # Get encoded states
         states = []
-        for i in range(min(n_samples, len(self.df) - self.encoder.sequence_length)):
-            sequence = self.df.iloc[i:i+self.encoder.sequence_length].values
-            timestamp = self.df.index[i+self.encoder.sequence_length-1]
-            state = self.encoder.encode_sequence(sequence, timestamp)
-            states.append(state)
+        max_samples = min(n_samples, len(self.analysis_df) - self.encoder.sequence_length)
+        
+        logger.info(f"Encoding {max_samples} market states...")
+        for i in tqdm(range(max_samples), desc="Encoding states"):
+            sequence = self.analysis_df.iloc[i:i+self.encoder.sequence_length].values
+            timestamp = self.analysis_df.index[i+self.encoder.sequence_length-1]
+            try:
+                state = self.encoder.encode_sequence(sequence, timestamp)
+                states.append(state)
+            except Exception as e:
+                logger.error(f"Error encoding sequence {i}: {str(e)}")
+                continue
         
         # Extract encoded tensors and regimes
+        logger.info("Processing encoded states...")
         encoded_states = torch.stack([s.encoded_state for s in states]).numpy()
         regimes = [s.regime_label for s in states]
         
         # Reduce dimensionality
+        logger.info(f"Reducing dimensionality using {projection_method}...")
         if projection_method == 'pca':
             reducer = PCA(n_components=3)
         else:  # t-SNE
@@ -1904,150 +1959,37 @@ class MarketVisualizer:
             height=800
         )
         
-        return fig
-    
-    def plot_regime_transitions(self, window_days: int = 30) -> go.Figure:
-        """
-        Visualize regime transitions over time
-        
-        Args:
-            window_days: Number of days to visualize
-            
-        Returns:
-            Plotly figure with regime transitions
-        """
-        recent_data = self.df.tail(window_days * 1440).copy()  # 1440 minutes per day
-        
-        # Get regime labels for recent data
-        states = []
-        for i in range(len(recent_data) - self.encoder.sequence_length):
-            sequence = recent_data.iloc[i:i+self.encoder.sequence_length].values
-            timestamp = recent_data.index[i+self.encoder.sequence_length-1]
-            state = self.encoder.encode_sequence(sequence, timestamp)
-            states.append(state)
-        
-        regimes = [s.regime_label for s in states]
-        timestamps = recent_data.index[self.encoder.sequence_length:]
-        
-        # Create figure
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True)
-        
-        # Price plot
-        fig.add_trace(
-            go.Scatter(
-                x=recent_data.index,
-                y=recent_data['close'],
-                name='Price'
-            ),
-            row=1, col=1
-        )
-        
-        # Regime plot
-        fig.add_trace(
-            go.Scatter(
-                x=timestamps,
-                y=regimes,
-                name='Regime',
-                mode='lines',
-                line=dict(width=2)
-            ),
-            row=2, col=1
-        )
-        
-        # Add regime characteristics if available
-        if hasattr(self.encoder.regime_detector, 'get_regime_characteristics'):
-            chars = self.encoder.regime_detector.get_regime_characteristics()
-            regime_desc = {
-                r['regime_id']: r['interpretation']
-                for r in chars
-            }
-            
-            for regime_id, desc in regime_desc.items():
-                fig.add_annotation(
-                    x=1.02,
-                    y=regime_id,
-                    xref='paper',
-                    yref='y2',
-                    text=f"Regime {regime_id}: {desc}",
-                    showarrow=False,
-                    align='left'
-                )
-        
-        fig.update_layout(
-            title='Market Regimes Over Time',
-            xaxis2_title='Date',
-            yaxis_title='Price',
-            yaxis2_title='Regime',
-            height=800,
-            showlegend=True
-        )
-        
-        return fig
-    
-    def visualize_regime_characteristics(self) -> go.Figure:
-        """
-        Create visualization of regime characteristics
-        
-        Returns:
-            Plotly figure with regime characteristics visualization
-        """
-        if not hasattr(self.encoder.regime_detector, 'get_regime_characteristics'):
-            raise NotImplementedError("Regime detector doesn't support characteristic analysis")
-            
-        chars = self.encoder.regime_detector.get_regime_characteristics()
-        
-        # Extract features and create DataFrame
-        features = []
-        for regime in chars:
-            features.append({
-                'Regime': f"Regime {regime['regime_id']}",
-                **regime['characteristics']
-            })
-        
-        df = pd.DataFrame(features)
-        
-        # Create heatmap using plotly
-        fig = go.Figure(data=go.Heatmap(
-            z=df.iloc[:, 1:].values,
-            x=df.columns[1:],
-            y=df['Regime'],
-            colorscale='Viridis',
-            hoverongaps=False
-        ))
-        
-        fig.update_layout(
-            title='Regime Characteristics Heatmap',
-            xaxis_title='Features',
-            yaxis_title='Regimes',
-            height=600,
-            width=1000
-        )
-        
+        logger.info("Hypersphere visualization created successfully")
         return fig
 
 def main():
     """Main visualization script"""
-    # Initialize visualizer
-    viz = MarketVisualizer()
+    logger.info("Starting visualization process...")
     
-    # Create visualizations
-    market_fig = viz.plot_market_overview()
-    hypersphere_fig_pca = viz.visualize_hypersphere(projection_method='pca')
-    hypersphere_fig_tsne = viz.visualize_hypersphere(projection_method='tsne')
-    regime_fig = viz.plot_regime_transitions()
-    characteristics_fig = viz.visualize_regime_characteristics()
-    
-    # Save figures
-    output_dir = Path("visualizations")
-    output_dir.mkdir(exist_ok=True)
-    
-    market_fig.write_html(output_dir / "market_overview.html")
-    hypersphere_fig_pca.write_html(output_dir / "hypersphere_pca.html")
-    hypersphere_fig_tsne.write_html(output_dir / "hypersphere_tsne.html")
-    regime_fig.write_html(output_dir / "regime_transitions.html")
-    characteristics_fig.write_html(output_dir / "regime_characteristics.html")
-    
-    print("Visualizations saved to 'visualizations' directory")
+    try:
+        # Initialize visualizer
+        viz = MarketVisualizer()
+        
+        # Create output directory
+        output_dir = Path("visualizations")
+        output_dir.mkdir(exist_ok=True)
+        logger.info(f"Created output directory: {output_dir}")
+        
+        # Create and save visualizations
+        logger.info("Creating market overview visualization...")
+        market_fig = viz.plot_market_overview()
+        market_fig.write_html(output_dir / "market_overview.html")
+        
+        logger.info("Creating hypersphere visualization...")
+        hypersphere_fig_pca = viz.visualize_hypersphere(projection_method='pca')
+        hypersphere_fig_pca.write_html(output_dir / "hypersphere_pca.html")
+        
+        logger.info("Visualizations completed successfully")
+        print("\nVisualizations saved to 'visualizations' directory")
+        
+    except Exception as e:
+        logger.error(f"Error creating visualizations: {str(e)}", exc_info=True)
+        raise
 
 if __name__ == "__main__":
     main()
