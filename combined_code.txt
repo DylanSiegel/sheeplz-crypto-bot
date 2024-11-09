@@ -1,593 +1,635 @@
 **File Tree (Relevant Files Only)**
-  .
+  src
     - main.py
-    - setup.py
   src\config
     - config.py
-    - features.py
-    - hardware.py
-    - model.py
-    - risk.py
-    - training.py
     - __init__.py
   src\data
-    - features.py
-    - indicators.py
-    - processor.py
+    - base_preprocessor.py
+    - kline_preprocessor.py
+    - market_preprocessor.py
     - __init__.py
   src\data\raw
     - btc_usdt_1m_klines.csv
-  src\env
-    - bybit_env.py
+  src\pipeline
+    - augmenters.py
+    - datasets.py
+    - handlers.py
+    - market_indicators.py
+    - metrics.py
+    - normalizers.py
+    - pipeline.py
     - __init__.py
-  src\models
-    - agent.py
-    - appo.py
-    - nlnn.py
-    - reward.py
-    - __init__.py
-  src\tests
-    - __init__.py
-  src\training
-    - trainer.py
+  src\shared
+    - exceptions.py
+    - types.py
   src\utils
     - logging.py
-    - risk_manager.py
     - system_monitor.py
     - __init__.py
-// File: main.py
-import logging
-from src.config import TradingConfig
-from src.models.agent import Agent
-from src.data.features import FeatureExtractor
-from src.env.bybit_env import BybitFuturesEnv
-from src.utils.risk_manager import RiskManager
+// File: src\main.py
+# src/main.py
+
+from pathlib import Path
+import torch
+from datetime import datetime
+import sys
+from typing import Tuple
+import pandas as pd
+
+from config.config import TradingConfig, TargetType, NormalizationType
+from pipeline.pipeline import TradingDataPipeline
+from pipeline.handlers import DirectionTargetCalculator
+from utils.logging import custom_logger
+from pipeline.metrics import PipelineMetrics
+from pipeline.market_indicators import TechnicalIndicators, IndicatorConfig
+from data.kline_preprocessor import KlinePreprocessor
+from utils.system_monitor import SystemMonitor
+
+def create_config() -> TradingConfig:
+    """Create and initialize configuration"""
+    return TradingConfig(
+        # Data Parameters
+        sequence_length=60,            # 1-hour lookback
+        prediction_horizon=5,          # 5-minute prediction
+        batch_size=4096,              # Optimized for 8GB VRAM
+        
+        # Hardware Optimization
+        num_workers=6,                # Half of Ryzen 9 7900X cores
+        pin_memory=True,
+        
+        # Processing Parameters
+        outlier_std_threshold=4.0,
+        volume_percentile_threshold=0.9995,
+        use_robust_scaling=True,
+        
+        # Target Configuration
+        target_type=TargetType.DIRECTION,
+        target_normalization=NormalizationType.ROBUST
+    )
+
+def process_and_save_data(
+    config: TradingConfig,
+    input_path: Path,
+    output_path: Path,
+    metrics: PipelineMetrics
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Process kline data and save results"""
+    system_monitor = SystemMonitor()
+    
+    try:
+        # Initialize preprocessor
+        preprocessor = KlinePreprocessor(config)
+        
+        # Load and process data
+        custom_logger.logger.info(f"Loading data from {input_path}")
+        raw_data = pd.read_parquet(input_path) if input_path.suffix == '.parquet' else pd.read_csv(input_path)
+        
+        # Process features and targets
+        custom_logger.logger.info("Processing kline data...")
+        features, targets = preprocessor.process_klines(raw_data)
+        
+        # Log processing metrics
+        current_metrics = system_monitor.get_metrics()
+        metrics.update('processing_time', current_metrics.cpu_percent)
+        metrics.update('memory_usage', current_metrics.memory_percent)
+        
+        custom_logger.log_metrics({
+            'cpu_usage': current_metrics.cpu_percent,
+            'memory_usage': current_metrics.memory_percent,
+            'gpu_utilization': current_metrics.gpu_utilization,
+            'data_samples': len(features)
+        }, step=0)
+        
+        # Save processed data
+        custom_logger.logger.info(f"Saving processed data to {output_path}")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        torch.save({
+            'features': features,
+            'targets': targets,
+            'config': config.to_dict(),
+            'processing_timestamp': datetime.now().isoformat()
+        }, output_path)
+        
+        # Log summary statistics
+        custom_logger.logger.info(f"Processed {len(features):,} samples")
+        custom_logger.logger.info(f"Feature shape: {features.shape}")
+        custom_logger.logger.info(f"Target shape: {targets.shape}")
+        
+        return features, targets
+        
+    except Exception as e:
+        custom_logger.logger.error(f"Error processing data: {str(e)}", exception=True)
+        raise
 
 def main():
-    # Initialize logging
-    logging.basicConfig(level=logging.INFO)
-    logger = logging.getLogger(__name__)
-    
-    # Load configuration
-    config = TradingConfig()
-    
-    # Initialize components
-    feature_extractor = FeatureExtractor(config)
-    risk_manager = RiskManager(config)
-    env = BybitFuturesEnv(config)
-    
-    # Initialize agent
-    agent = Agent(
-        input_size=config.feature_dim,
-        hidden_size=config.hidden_size,
-        num_layers=config.num_layers
-    )
-    
-    logger.info("Starting training...")
-    
-    # Training loop
-    for episode in range(config.num_episodes):
-        state, info = env.reset()
-        hidden_states = agent.init_hidden()
-        episode_reward = 0
+    try:
+        # Initialize configuration
+        config = create_config()
+        custom_logger.logger.info("Configuration initialized")
         
-        while True:
-            # Get action from agent
-            action, value, hidden_states = agent.act(state, hidden_states)
+        # Initialize metrics tracker
+        metrics = PipelineMetrics()
+        
+        # Define paths
+        input_path = Path("src/data/raw/btc_usdt_1m_klines.parquet")
+        output_path = Path("src/data/processed/kline_features.pt")
+        
+        # Process and save data
+        features, targets = process_and_save_data(
+            config,
+            input_path,
+            output_path,
+            metrics
+        )
+        
+        # Log final metrics
+        metrics.log_summary()
+        custom_logger.logger.info("Data processing completed successfully")
+        
+        # Optional: Create training/validation splits
+        if features is not None and targets is not None:
+            split_idx = int(len(features) * 0.8)
             
-            # Validate action with risk manager
-            is_valid, message = risk_manager.validate_action(
-                action, env.current_price, env.account_balance
+            split_data = {
+                'train_features': features[:split_idx],
+                'train_targets': targets[:split_idx],
+                'val_features': features[split_idx:],
+                'val_targets': targets[split_idx:],
+                'config': config.to_dict()
+            }
+            
+            split_path = output_path.parent / 'train_val_split.pt'
+            torch.save(split_data, split_path)
+            
+            custom_logger.logger.info(
+                f"Train/validation split saved - "
+                f"Train: {len(split_data['train_features']):,} samples, "
+                f"Val: {len(split_data['val_features']):,} samples"
             )
-            
-            if not is_valid:
-                logger.warning(f"Action rejected: {message}")
-                action = 2  # Default to HOLD
-            
-            # Take action in environment
-            next_state, reward, done, truncated, info = env.step(action)
-            episode_reward += reward
-            
-            if done or truncated:
-                break
-            
-            state = next_state
-            
-        logger.info(f"Episode {episode} completed with reward {episode_reward}")
+        
+    except Exception as e:
+        custom_logger.logger.error(f"Pipeline failed: {str(e)}", exception=True)
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
 
-// File: setup.py
-import os
-import subprocess
-import sys
-from pathlib import Path
-
-def setup_environment():
-    """Setup the development environment with optimized configurations."""
-    # Create virtual environment
-    subprocess.run([sys.executable, "-m", "venv", ".venv"], check=True)
-    
-    # Get the path to the virtual environment's Python interpreter
-    if os.name == "nt":  # Windows
-        python_path = Path(".venv/Scripts/python.exe")
-        pip_path = Path(".venv/Scripts/pip.exe")
-    else:  # Unix-like
-        python_path = Path(".venv/bin/python")
-        pip_path = Path(".venv/bin/pip")
-    
-    # Upgrade pip
-    subprocess.run([str(pip_path), "install", "--upgrade", "pip"], check=True)
-    
-    # Install PyTorch with CUDA 11.8 support (optimized for NVIDIA 3070)
-    subprocess.run([
-        str(pip_path),
-        "install",
-        "torch",
-        "torchvision",
-        "torchaudio",
-        "--index-url",
-        "https://download.pytorch.org/whl/cu118"
-    ], check=True)
-    
-    # Install other requirements
-    subprocess.run([
-        str(pip_path),
-        "install",
-        "-r",
-        "requirements.txt"
-    ], check=True)
-    
-    # Create necessary directories
-    directories = [
-        "logs",
-        "data",
-        "models",
-        "configs",
-        "tests"
-    ]
-    for directory in directories:
-        Path(directory).mkdir(exist_ok=True)
-    
-    print("Environment setup completed successfully!")
-    print("\nActivate your virtual environment:")
-    if os.name == "nt":
-        print(".venv\\Scripts\\activate")
-    else:
-        print("source .venv/bin/activate")
-
-if __name__ == "__main__":
-    setup_environment()
-
 // File: src\config\config.py
-# config.py
+# src/config/config.py
 
-from pydantic import BaseModel, Field
-from typing import List
-from .hardware import HardwareConfig
-from .model import ModelConfig
-from .risk import RiskConfig
-from .features import FeatureConfig
-from .training import TrainingConfig
+from __future__ import annotations
+from typing import Any, Dict, List, Optional, Tuple, Union, TypeVar, Set
+from dataclasses import dataclass, field, fields, asdict
+from enum import Enum
+from pathlib import Path
+import json
+import yaml
 
-class TradingConfig(BaseModel):
-    """Master configuration class.
+class TargetType(Enum):
+    """Types of prediction targets supported by the system."""
+    DIRECTION = "direction"  # Binary classification (up/down)
+    PRICE = "price"         # Direct price prediction
+    VOLATILITY = "volatility"  # Volatility prediction
+    CUSTOM = "custom"       # Custom target type
 
-    This class aggregates all configuration settings for the trading agent and its environment.
+class NormalizationType(Enum):
+    """Supported data normalization methods."""
+    STANDARD = "standard"  # Zero mean, unit variance
+    MINMAX = "minmax"     # Scale to [0,1] range
+    ROBUST = "robust"     # Using median and IQR
+    NONE = "none"         # No normalization
 
+@dataclass
+class TechnicalIndicatorParams:
+    """Parameters for technical indicators."""
+    rsi: Dict[str, List[int]] = field(default_factory=lambda: {'periods': [6, 14, 24]})
+    ema: Dict[str, List[int]] = field(default_factory=lambda: {'periods': [5, 10, 20, 60, 120]})
+    macd: Dict[str, int] = field(default_factory=lambda: {'fast': 12, 'slow': 26, 'signal': 9})
+    bb: Dict[str, Union[int, float]] = field(default_factory=lambda: {'period': 20, 'std': 2.0})
+    atr: Dict[str, int] = field(default_factory=lambda: {'period': 14})
+    volatility: Dict[str, int] = field(default_factory=lambda: {'period': 20})
+    follow_line: Dict[str, Union[int, float, bool]] = field(default_factory=lambda: {
+        'atr_period': 5,
+        'bb_period': 21,
+        'bb_deviation': 1.00,
+        'use_atr_filter': True
+    })
+
+@dataclass
+class TradingConfig:
+    """Configuration for the trading data pipeline.
+    
     Attributes:
-        hardware (HardwareConfig): Configuration for hardware resources.
-        model (ModelConfig): Configuration for the neural network model.
-        risk (RiskConfig): Configuration for risk management parameters.
-        feature (FeatureConfig): Configuration for feature extraction.
-        training (TrainingConfig): Configuration for the training process.
-
-    Methods:
-        optimize_for_hardware(): Optimizes the configuration based on the detected hardware capabilities.
-
+        sequence_length: Number of time steps in the input sequence
+        prediction_horizon: List of future time steps to predict
+        batch_size: Number of samples per batch
+        num_workers: Number of data loading worker processes
+        pin_memory: Whether to pin memory for GPU transfer
+        prefetch_factor: Number of batches to prefetch
+        price_features: List of price-related features to use
+        volume_features: List of volume-related features to use
+        technical_indicators_config: Configuration for technical indicators
+        outlier_std_threshold: Standard deviation threshold for outlier removal
+        volume_percentile_threshold: Percentile threshold for volume clipping
+        normalization_type: Type of normalization to apply
+        learning_rate: Initial learning rate
+        weight_decay: L2 regularization factor
+        epsilon: Small value for numerical stability
+        gradient_clip_val: Maximum gradient norm
+        use_augmentation: Whether to use data augmentation
+        noise_level: Standard deviation of Gaussian noise
+        jitter_ratio: Ratio of time steps to jitter
     """
-    hardware: HardwareConfig = Field(default_factory=HardwareConfig)
-    model: ModelConfig = Field(default_factory=ModelConfig)
-    risk: RiskConfig = Field(default_factory=RiskConfig)
-    feature: FeatureConfig = Field(default_factory=FeatureConfig)
-    training: TrainingConfig = Field(default_factory=TrainingConfig)
+    
+    # Core Parameters
+    sequence_length: int = field(default=60)
+    prediction_horizon: List[int] = field(default_factory=lambda: [5])
+    batch_size: int = field(default=4096)
 
-    def optimize_for_hardware(self):
-        """Optimizes configuration for current hardware.
+    # Hardware Optimization
+    num_workers: int = field(default=6)
+    pin_memory: bool = field(default=True)
+    prefetch_factor: int = field(default=2)
 
-        This method adjusts certain parameters (primarily batch size) based on available GPU memory.
-        It also sets the number of threads used by PyTorch to optimize performance.
-        """
-        if self.hardware.cuda_available:
-            gpu_mem = torch.cuda.get_device_properties(0).total_memory
-            self.model.batch_size = min(self.model.batch_size, int(gpu_mem * 0.7 / (self.model.feature_dim * 4)))
-        torch.set_num_threads(self.hardware.torch_num_threads)
-        if self.hardware.cuda_available:
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-        return self
+    # Feature Groups
+    price_features: List[str] = field(default_factory=lambda: [
+        'open', 'high', 'low', 'close'
+    ])
+    volume_features: List[str] = field(default_factory=lambda: [
+        'volume', 'quote_asset_volume',
+        'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume'
+    ])
+    technical_indicators_config: TechnicalIndicatorParams = field(
+        default_factory=TechnicalIndicatorParams
+    )
 
-def create_default_config() -> TradingConfig:
-    """Creates and returns a default configuration, optimized for the current hardware."""
-    config = TradingConfig()
-    return config.optimize_for_hardware()
+    # Data Preprocessing
+    outlier_std_threshold: float = field(default=4.0)
+    volume_percentile_threshold: float = field(default=0.9995)
+    normalization_type: NormalizationType = field(default=NormalizationType.ROBUST)
 
-import torch
+    # Training Parameters
+    learning_rate: float = field(default=1e-4)
+    weight_decay: float = field(default=1e-6)
+    epsilon: float = field(default=1e-8)
+    gradient_clip_val: float = field(default=1.0)
 
-# Example of how to save the default config to a file (config.pt)
-config = create_default_config()
-torch.save(config.model_dump(), "config.pt")
+    # Data Augmentation
+    use_augmentation: bool = field(default=True)
+    noise_level: float = field(default=0.01)
+    jitter_ratio: float = field(default=0.1)
 
-// File: src\config\features.py
-from pydantic import BaseModel, Field
-from typing import List
+    # Derived Attributes
+    technical_indicators: List[str] = field(init=False)
+    input_dim: int = field(init=False)
 
-class FeatureConfig(BaseModel):
-    """Feature extraction configuration.
+    def __post_init__(self) -> None:
+        """Validates configuration and initializes derived attributes."""
+        self._validate_config()
+        self._derive_attributes()
 
-    This class defines parameters for extracting features from market data.  These features are used as input to the trading agent's neural network.
+    def _validate_config(self) -> None:
+        """Validates configuration parameters."""
+        # Core parameter validation
+        if self.sequence_length <= 0:
+            raise ValueError("sequence_length must be positive")
+        if not self.prediction_horizon:
+            raise ValueError("prediction_horizon cannot be empty")
+        if not all(h > 0 for h in self.prediction_horizon):
+            raise ValueError("All prediction horizons must be positive")
+        if self.batch_size <= 0:
+            raise ValueError("batch_size must be positive")
 
-    Attributes:
-        rolling_window_size (int): The size of the rolling window used for calculating features.  A larger window considers more historical data but might make the features less responsive to recent changes.
-        technical_indicators (List[str]): A list of technical indicators to calculate.  These indicators provide insights into market trends and momentum.  Supported indicators depend on your `ta` library version.
-        market_features (List[str]): A list of raw market features to include. These are typically directly from the market data (e.g., price, volume).
-        normalization_method (str): The method used for normalizing features.  Normalization is essential to prevent features with larger scales from dominating the model's learning.
+        # Hardware parameter validation
+        if self.num_workers < 0:
+            raise ValueError("num_workers cannot be negative")
+        if self.prefetch_factor <= 0:
+            raise ValueError("prefetch_factor must be positive")
 
+        # Feature validation
+        if not self.price_features:
+            raise ValueError("price_features cannot be empty")
+        if not self.volume_features:
+            raise ValueError("volume_features cannot be empty")
+        
+        # Check for feature name uniqueness
+        all_features = set(self.price_features) | set(self.volume_features)
+        if len(all_features) < len(self.price_features) + len(self.volume_features):
+            raise ValueError("Duplicate feature names found")
 
-    """
-    rolling_window_size: int = Field(100, description="Size of rolling window for features")
-    technical_indicators: List[str] = Field(default=["rsi", "macd", "bbands", "volatility"], description="List of technical indicators to use")
-    market_features: List[str] = Field(default=["price", "volume", "spread", "depth", "funding_rate"], description="List of market features to use")
-    normalization_method: str = Field("standard", description="Feature normalization method")
+        # Data preprocessing validation
+        if self.outlier_std_threshold <= 0:
+            raise ValueError("outlier_std_threshold must be positive")
+        if not 0 < self.volume_percentile_threshold <= 1:
+            raise ValueError("volume_percentile_threshold must be between 0 and 1")
 
-// File: src\config\hardware.py
-from pydantic import BaseModel, Field
-import psutil
-import torch
+        # Training parameter validation
+        if self.learning_rate <= 0:
+            raise ValueError("learning_rate must be positive")
+        if self.weight_decay < 0:
+            raise ValueError("weight_decay cannot be negative")
+        if self.epsilon <= 0:
+            raise ValueError("epsilon must be positive")
+        if self.gradient_clip_val <= 0:
+            raise ValueError("gradient_clip_val must be positive")
 
-class HardwareConfig(BaseModel):
-    """Hardware-specific configuration.
+        # Augmentation parameter validation
+        if not 0 <= self.noise_level <= 1:
+            raise ValueError("noise_level must be between 0 and 1")
+        if not 0 <= self.jitter_ratio <= 1:
+            raise ValueError("jitter_ratio must be between 0 and 1")
 
-    This class encapsulates settings related to the hardware resources used by the trading agent.
-    It automatically detects certain hardware features and provides options for optimization.
+    def _derive_attributes(self) -> None:
+        """Derives technical indicators and input dimension."""
+        self.technical_indicators = self._expand_indicator_names()
+        self.input_dim = (
+            len(self.price_features) +
+            len(self.volume_features) +
+            len(self.technical_indicators)
+        )
 
-    Attributes:
-        num_cpu_threads (int): The number of CPU threads to utilize for parallel processing. 
-                               Defaults to the number of logical CPU cores detected by `psutil`.
-        cuda_available (bool): A boolean indicating whether CUDA (GPU acceleration) is available. 
-                               Automatically detected by PyTorch.
-        gpu_memory_limit (int): The maximum amount of GPU memory (in MB) to allocate for training. 
-                               Defaults to 7168 MB (7GB), leaving 1GB for system use on an NVIDIA 3070.  Adjust this based on your GPU's VRAM.
-        torch_num_threads (int): The number of threads PyTorch should use. Defaults to 12 (optimized for Ryzen 9 7900X). Adjust for your CPU.
-        pin_memory (bool): A boolean flag indicating whether to use pinned memory for faster data transfer between CPU and GPU. Defaults to True.  Generally recommended for GPU usage.
+    def _expand_indicator_names(self) -> List[str]:
+        """Expands technical indicator configurations into feature names."""
+        indicators = []
+        
+        # RSI indicators
+        for period in self.technical_indicators_config.rsi['periods']:
+            indicators.append(f"rsi_{period}")
+        
+        # EMA indicators
+        for period in self.technical_indicators_config.ema['periods']:
+            indicators.append(f"ema_{period}")
+        
+        # MACD components
+        indicators.extend([
+            'macd_line',
+            'macd_signal',
+            'macd_histogram'
+        ])
+        
+        # Bollinger Bands components
+        indicators.extend([
+            'bb_upper',
+            'bb_middle',
+            'bb_lower',
+            'bb_bandwidth'
+        ])
+        
+        # ATR and Volatility
+        indicators.extend([
+            'atr',
+            'volatility'
+        ])
+        
+        # Follow Line components
+        indicators.extend([
+            'follow_line',
+            'follow_line_trend'
+        ])
+        
+        return indicators
 
-    """
-    num_cpu_threads: int = Field(default_factory=lambda: psutil.cpu_count(logical=True), description="Number of CPU threads to use")
-    cuda_available: bool = Field(default_factory=lambda: torch.cuda.is_available(), description="Whether CUDA is available")
-    gpu_memory_limit: int = Field(default=7168, description="GPU memory limit in MB")
-    torch_num_threads: int = Field(default=12, description="Number of threads for PyTorch")
-    pin_memory: bool = Field(default=True, description="Use pinned memory for faster GPU transfer")
+    @classmethod
+    def from_dict(cls, config_dict: Dict[str, Any]) -> TradingConfig:
+        """Creates a TradingConfig instance from a dictionary."""
+        # Convert string enum values to proper enum types
+        if 'normalization_type' in config_dict:
+            config_dict['normalization_type'] = NormalizationType[config_dict['normalization_type'].upper()]
+        
+        # Convert technical indicators config
+        if 'technical_indicators_config' in config_dict:
+            config_dict['technical_indicators_config'] = TechnicalIndicatorParams(
+                **config_dict['technical_indicators_config']
+            )
+        
+        return cls(**config_dict)
 
-// File: src\config\model.py
-from pydantic import BaseModel, Field
+    @classmethod
+    def from_file(cls, file_path: Union[str, Path]) -> TradingConfig:
+        """Loads configuration from a JSON or YAML file."""
+        file_path = Path(file_path)
+        
+        with open(file_path, 'r') as f:
+            if file_path.suffix == '.json':
+                config_dict = json.load(f)
+            elif file_path.suffix in {'.yml', '.yaml'}:
+                config_dict = yaml.safe_load(f)
+            else:
+                raise ValueError(f"Unsupported file format: {file_path.suffix}")
+        
+        return cls.from_dict(config_dict)
 
-class ModelConfig(BaseModel):
-    """Neural network configuration.
+    def to_dict(self) -> Dict[str, Any]:
+        """Converts configuration to a dictionary."""
+        config_dict = asdict(self)
+        
+        # Convert enum values to strings
+        config_dict['normalization_type'] = self.normalization_type.value
+        
+        # Remove derived attributes
+        config_dict.pop('technical_indicators', None)
+        config_dict.pop('input_dim', None)
+        
+        return config_dict
 
-    This class defines the architecture and training hyperparameters for the neural network model.
-
-    Attributes:
-        feature_dim (int): The dimensionality of the input feature vector.  This should match the output of your feature extractor.
-        hidden_size (int): The number of neurons in each hidden layer of the neural network.
-        num_layers (int): The number of hidden layers in the n-LNN (novel neural network) architecture.
-        dropout (float): The dropout rate used for regularization during training (a value between 0 and 1).
-        learning_rate (float): The learning rate used by the optimizer.  This controls the step size during gradient descent.
-        batch_size (int): The size of the mini-batches used during training.  Larger batch sizes can improve training speed but require more memory.
-        sequence_length (int): The length of the input sequences used for training the recurrent layers (if applicable).  This is relevant if your model has RNN components.
-        gradient_clip (float): The maximum value for gradient clipping to prevent exploding gradients during training.  This helps stabilize training.
-
-    """
-    feature_dim: int = Field(64, description="Input feature dimension")
-    hidden_size: int = Field(256, description="Hidden layer size")
-    num_layers: int = Field(4, description="Number of n-LNN layers")
-    dropout: float = Field(0.1, description="Dropout rate")
-    learning_rate: float = Field(3e-4, description="Learning rate")
-    batch_size: int = Field(512, description="Training batch size")
-    sequence_length: int = Field(100, description="Sequence length for training")
-    gradient_clip: float = Field(1.0, description="Gradient clipping value")
-
-// File: src\config\risk.py
-from pydantic import BaseModel, Field
-
-class RiskConfig(BaseModel):
-    """Risk management configuration.
-
-    This class defines parameters to control risk during trading.  These parameters are crucial for preventing excessive losses.
-
-    Attributes:
-        max_position_size (float): The maximum fraction of the account balance that can be used for a single position.  A value between 0 and 1.  For example, 0.1 means a maximum of 10% of the account balance can be risked on any one trade.
-        stop_loss_pct (float): The percentage loss at which an open position will be automatically closed (stop-loss order).  A value between 0 and 1.  For example, 0.02 means a stop-loss order will be triggered if the position incurs a 2% loss.
-        take_profit_pct (float): The percentage profit at which an open position will be automatically closed (take-profit order). A value between 0 and 1. For example, 0.04 means a take-profit order will be triggered if the position achieves a 4% profit.
-        max_leverage (float): The maximum leverage allowed for trades.  This magnifies both profits and losses.  Higher leverage increases risk.
-        min_trade_interval (int): The minimum time (in seconds) between consecutive trades to avoid excessive trading frequency.  This helps to avoid over-trading and potential slippage.
-        max_drawdown (float): The maximum acceptable drawdown (percentage loss from peak equity) before trading is stopped.  This parameter helps to prevent catastrophic losses.
-        position_sizing_method (str): The method used for determining position sizes.  This could be 'kelly' (Kelly criterion), 'fixed', or another custom method.
-
-    """
-    max_position_size: float = Field(0.1, description="Maximum position size as fraction of capital")
-    stop_loss_pct: float = Field(0.02, description="Stop loss percentage")
-    take_profit_pct: float = Field(0.04, description="Take profit percentage")
-    max_leverage: float = Field(5.0, description="Maximum allowed leverage")
-    min_trade_interval: int = Field(5, description="Minimum time interval between trades (seconds)")
-    max_drawdown: float = Field(0.2, description="Maximum allowed drawdown")
-    position_sizing_method: str = Field("kelly", description="Position sizing method")
-
-// File: src\config\training.py
-from pydantic import BaseModel, Field
-
-class TrainingConfig(BaseModel):
-    """Training configuration.
-
-    This class contains hyperparameters for the reinforcement learning training process.
-
-    Attributes:
-        num_episodes (int): The total number of training episodes.
-        gamma (float): The discount factor used in the reinforcement learning algorithm.  This determines the importance of future rewards. A value closer to 1 emphasizes long-term rewards.
-        gae_lambda (float): The lambda parameter for Generalized Advantage Estimation (GAE).  This parameter controls the bias-variance tradeoff in GAE.
-        entropy_coef (float): The coefficient for the entropy bonus in the loss function.  This encourages exploration during training.
-        value_loss_coef (float): The coefficient for the value function loss in the loss function.  This balances the policy loss and value function loss.
-        max_grad_norm (float): The maximum norm for gradient clipping to prevent exploding gradients during training.  Gradient clipping helps stabilize training.
-        update_interval (int): The number of steps between policy updates.  More frequent updates might lead to faster learning but can be more noisy.
-        num_minibatches (int): The number of minibatches used for each policy update. This parameter is used in algorithms like PPO to reduce computational cost.
-        warmup_steps (int): The number of initial steps during which the policy is not updated.  This allows the agent to gather some initial experience before updating the policy.
-
-    """
-    num_episodes: int = Field(10000, description="Number of training episodes")
-    gamma: float = Field(0.99, description="Discount factor")
-    gae_lambda: float = Field(0.95, description="GAE lambda parameter")
-    entropy_coef: float = Field(0.01, description="Entropy coefficient")
-    value_loss_coef: float = Field(0.5, description="Value loss coefficient")
-    max_grad_norm: float = Field(0.5, description="Maximum gradient norm")
-    update_interval: int = Field(2048, description="Steps between policy updates")
-    num_minibatches: int = Field(4, description="Number of minibatches per update")
-    warmup_steps: int = Field(1000, description="Number of warmup steps")
+    def save(self, file_path: Union[str, Path]) -> None:
+        """Saves configuration to a JSON or YAML file."""
+        file_path = Path(file_path)
+        config_dict = self.to_dict()
+        
+        with open(file_path, 'w') as f:
+            if file_path.suffix == '.json':
+                json.dump(config_dict, f, indent=2)
+            elif file_path.suffix in {'.yml', '.yaml'}:
+                yaml.dump(config_dict, f, default_flow_style=False)
+            else:
+                raise ValueError(f"Unsupported file format: {file_path.suffix}")
 
 // File: src\config\__init__.py
 
 
-// File: src\data\features.py
-import numpy as np
+// File: src\data\base_preprocessor.py
+# src/data/base_preprocessor.py
+
+from abc import ABC, abstractmethod
 import pandas as pd
-import ta
-from typing import List, Union
+import numpy as np
+from typing import Dict, Any, Optional
 from dataclasses import dataclass
+import logging
+
+from config.config import TradingConfig
+from shared.exceptions import ValidationError, ProcessingError
+from utils.logging import custom_logger
 
 @dataclass
-class IndicatorConfig:
-    """Configuration for technical indicator calculations.
+class PreprocessingStats:
+    """Statistics from data preprocessing operations."""
+    total_rows: int = 0
+    memory_usage_mb: float = 0.0
+    processing_time_sec: float = 0.0
+    outliers_removed: Dict[str, int] = field(default_factory=dict)
+    invalid_values_fixed: int = 0
+    features_generated: int = 0
 
-    Attributes:
-        rsi_period (int): The period for Relative Strength Index (RSI) calculation.
-        macd_fast (int): The fast period for Moving Average Convergence Divergence (MACD) calculation.
-        macd_slow (int): The slow period for MACD calculation.
-        macd_signal (int): The signal period for MACD calculation.
-        bb_period (int): The period for Bollinger Bands calculation.
-        bb_std (int): The standard deviation multiplier for Bollinger Bands calculation.
-
-    """
-    rsi_period: int = 14
-    macd_fast: int = 12
-    macd_slow: int = 26
-    macd_signal: int = 9
-    bb_period: int = 20
-    bb_std: int = 2
-
-class TechnicalIndicators:
-    """Calculates various technical indicators from price data.
-
-    This class uses the `TA-Lib` library to efficiently compute several common technical indicators.
-
-    Args:
-        config (IndicatorConfig, optional): Configuration object specifying parameters for indicator calculations. 
-                                            Defaults to `IndicatorConfig()`.
-
-    Methods:
-        calculate_all(prices: Union[List[float], np.ndarray]) -> dict: Calculates all configured indicators.
-        calculate_rsi(df: pd.DataFrame) -> float: Calculates the Relative Strength Index (RSI).
-        calculate_macd(df: pd.DataFrame) -> dict: Calculates the Moving Average Convergence Divergence (MACD) and its signal and difference.
-        calculate_bollinger_bands(df: pd.DataFrame) -> dict: Calculates the Bollinger Bands (upper, middle, lower).
-        calculate_volatility(df: pd.DataFrame, window: int = 20) -> float: Calculates annualized volatility.
-
-    """
-    def __init__(self, config: IndicatorConfig = None):
-        self.config = config or IndicatorConfig()
-
-    def calculate_all(self, prices: Union[List[float], np.ndarray]) -> dict:
-        """Calculates all configured technical indicators.
-
-        Args:
-            prices (Union[List[float], np.ndarray]): A list or NumPy array of closing prices.
-
-        Returns:
-            dict: A dictionary containing all calculated indicators.
-
-        """
-        df = pd.DataFrame({'close': prices})
-        indicators = {}
-        indicators['rsi'] = self.calculate_rsi(df)
-        macd_data = self.calculate_macd(df)
-        indicators.update(macd_data)
-        bb_data = self.calculate_bollinger_bands(df)
-        indicators.update(bb_data)
-        indicators['volatility'] = self.calculate_volatility(df)
-        return indicators
-
-    def calculate_rsi(self, df: pd.DataFrame) -> float:
-        """Calculates the Relative Strength Index (RSI).
-
-        Args:
-            df (pd.DataFrame): Pandas DataFrame with a 'close' column containing closing prices.
-
-        Returns:
-            float: The RSI value.
-
-        """
-        rsi = ta.momentum.RSIIndicator(close=df['close'], window=self.config.rsi_period)
-        return rsi.rsi().iloc[-1]
-
-    def calculate_macd(self, df: pd.DataFrame) -> dict:
-        """Calculates the Moving Average Convergence Divergence (MACD) and its signal and difference.
-
-        Args:
-            df (pd.DataFrame): Pandas DataFrame with a 'close' column containing closing prices.
-
-        Returns:
-            dict: A dictionary containing the MACD, MACD signal, and MACD difference.
-
-        """
-        macd = ta.trend.MACD(close=df['close'], window_slow=self.config.macd_slow, window_fast=self.config.macd_fast, window_sign=self.config.macd_signal)
-        return {'macd': macd.macd().iloc[-1], 'macd_signal': macd.macd_signal().iloc[-1], 'macd_diff': macd.macd_diff().iloc[-1]}
-
-    def calculate_bollinger_bands(self, df: pd.DataFrame) -> dict:
-        """Calculates the Bollinger Bands (upper, middle, lower).
-
-        Args:
-            df (pd.DataFrame): Pandas DataFrame with a 'close' column containing closing prices.
-
-        Returns:
-            dict: A dictionary containing the upper, middle, and lower Bollinger Bands.
-
-        """
-        bb = ta.volatility.BollingerBands(close=df['close'], window=self.config.bb_period, window_dev=self.config.bb_std)
-        return {'bb_high': bb.bollinger_hband().iloc[-1], 'bb_mid': bb.bollinger_mavg().iloc[-1], 'bb_low': bb.bollinger_lband().iloc[-1]}
-
-    def calculate_volatility(self, df: pd.DataFrame, window: int = 20) -> float:
-        """Calculates annualized volatility.
-
-        Args:
-            df (pd.DataFrame): Pandas DataFrame with a 'close' column containing closing prices.
-            window (int, optional): The rolling window size for volatility calculation. Defaults to 20.
-
-        Returns:
-            float: The annualized volatility.
-
-        """
-        returns = df['close'].pct_change()
-        return returns.std() * np.sqrt(252)  # Annualized volatility
-
-// File: src\data\indicators.py
-import numpy as np
-import pandas as pd
-import ta
-from typing import List, Union
-from dataclasses import dataclass
-
-@dataclass
-class IndicatorConfig:
-    rsi_period: int = 14
-    macd_fast: int = 12
-    macd_slow: int = 26
-    macd_signal: int = 9
-    bb_period: int = 20
-    bb_std: int = 2
+class BasePreprocessor(ABC):
+    """Base class for data preprocessing."""
     
-class TechnicalIndicators:
-    def __init__(self, config: IndicatorConfig = None):
-        self.config = config or IndicatorConfig()
-        
-    def calculate_all(self, prices: Union[List[float], np.ndarray]) -> dict:
-        """Calculate all technical indicators"""
-        df = pd.DataFrame({'close': prices})
-        
-        indicators = {}
-        
-        # RSI
-        indicators['rsi'] = self.calculate_rsi(df)
-        
-        # MACD
-        macd_data = self.calculate_macd(df)
-        indicators.update(macd_data)
-        
-        # Bollinger Bands
-        bb_data = self.calculate_bollinger_bands(df)
-        indicators.update(bb_data)
-        
-        # Volatility
-        indicators['volatility'] = self.calculate_volatility(df)
-        
-        return indicators
-        
-    def calculate_rsi(self, df: pd.DataFrame) -> float:
-        """Calculate Relative Strength Index"""
-        rsi = ta.momentum.RSIIndicator(
-            close=df['close'],
-            window=self.config.rsi_period
-        )
-        return rsi.rsi().iloc[-1]
-        
-    def calculate_macd(self, df: pd.DataFrame) -> dict:
-        """Calculate MACD indicator"""
-        macd = ta.trend.MACD(
-            close=df['close'],
-            window_slow=self.config.macd_slow,
-            window_fast=self.config.macd_fast,
-            window_sign=self.config.macd_signal
-        )
-        return {
-            'macd': macd.macd().iloc[-1],
-            'macd_signal': macd.macd_signal().iloc[-1],
-            'macd_diff': macd.macd_diff().iloc[-1]
-        }
-        
-    def calculate_bollinger_bands(self, df: pd.DataFrame) -> dict:
-        """Calculate Bollinger Bands"""
-        bb = ta.volatility.BollingerBands(
-            close=df['close'],
-            window=self.config.bb_period,
-            window_dev=self.config.bb_std
-        )
-        return {
-            'bb_high': bb.bollinger_hband().iloc[-1],
-            'bb_mid': bb.bollinger_mavg().iloc[-1],
-            'bb_low': bb.bollinger_lband().iloc[-1]
-        }
-        
-    def calculate_volatility(self, df: pd.DataFrame, window: int = 20) -> float:
-        """Calculate price volatility"""
-        returns = df['close'].pct_change()
-        return returns.std() * np.sqrt(252)  # Annualized volatility
-
-// File: src\data\processor.py
-from typing import Dict, List
-import pandas as pd
-import numpy as np
-
-class DataProcessor:
-    def __init__(self, config):
+    def __init__(self, config: TradingConfig):
         self.config = config
+        self.logger = custom_logger.logger
+        self.stats = PreprocessingStats()
+    
+    def clean_data(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Common data cleaning operations."""
+        clean_data = data.copy()
         
-    def preprocess_market_data(self, raw_data: Dict) -> Dict:
-        """Process raw market data into standardized format"""
-        processed_data = {
-            'close_price': float(raw_data['last_price']),
-            'volume': float(raw_data['volume_24h']),
-            'bid_ask_spread': float(raw_data['best_ask']) - float(raw_data['best_bid']),
-            'funding_rate': float(raw_data['funding_rate']),
-            'open_interest': float(raw_data['open_interest']),
-            'leverage_ratio': float(raw_data['leverage_ratio']),
-            'market_depth_ratio': self._calculate_depth_ratio(raw_data),
-            'taker_buy_ratio': float(raw_data['taker_buy_volume']) / 
-                              (float(raw_data['taker_buy_volume']) + 
-                               float(raw_data['taker_sell_volume']))
-        }
-        return processed_data
+        # Handle outliers
+        self._remove_outliers(clean_data)
+        
+        # Handle invalid values
+        self._handle_invalid_values(clean_data)
+        
+        return clean_data
+    
+    def _remove_outliers(self, data: pd.DataFrame) -> None:
+        """Remove outliers using robust statistics."""
+        for col in data.select_dtypes(include=[np.number]).columns:
+            rolling = data[col].rolling(window=24, center=True, min_periods=1)
+            q_high = rolling.quantile(0.9995)
+            q_low = rolling.quantile(0.0005)
+            
+            outliers = ((data[col] > q_high) | (data[col] < q_low)).sum()
+            self.stats.outliers_removed[col] = outliers
+            
+            data[col] = np.where(
+                data[col] > q_high,
+                q_high,
+                np.where(data[col] < q_low, q_low, data[col])
+            )
+    
+    def _handle_invalid_values(self, data: pd.DataFrame) -> None:
+        """Handle missing and invalid values."""
+        numeric_cols = data.select_dtypes(include=[np.number]).columns
+        invalid_mask = data[numeric_cols].isna() | np.isinf(data[numeric_cols])
+        self.stats.invalid_values_fixed = invalid_mask.sum().sum()
+        
+        # Replace with appropriate values
+        for col in numeric_cols:
+            data[col] = data[col].fillna(method='ffill').fillna(0)
+            data[col] = np.nan_to_num(data[col], nan=0.0, posinf=None, neginf=None)
+    
+    @abstractmethod
+    def validate_data(self, data: pd.DataFrame) -> None:
+        """Validate input data requirements."""
+        pass
+
+// File: src\data\kline_preprocessor.py
+# src/data/kline_preprocessor.py
+
+import torch
+from typing import Dict, List
+
+@dataclass
+class ProcessedKlines:
+    """Container for processed kline data."""
+    features: torch.Tensor
+    targets: Dict[int, torch.Tensor]
+    feature_names: List[str]
+    target_type: TargetType
+    stats: PreprocessingStats
+
+class KlinePreprocessor(BasePreprocessor):
+    """Processes OHLCV data for ML model input."""
+    
+    def __init__(
+        self,
+        config: TradingConfig,
+        technical_indicators: Optional[TechnicalIndicators] = None
+    ):
+        super().__init__(config)
+        self.technical_indicators = technical_indicators or TechnicalIndicators(
+            config.technical_indicators_config
+        )
+    
+    def process_klines(
+        self,
+        data: pd.DataFrame,
+        validate: bool = True
+    ) -> ProcessedKlines:
+        """Process klines into ML-ready format."""
+        if validate:
+            self.validate_data(data)
+        
+        # Clean data using base class method
+        clean_data = self.clean_data(data)
+        
+        # Generate features
+        feature_data = self._generate_features(clean_data)
+        
+        # Calculate targets
+        targets = self._calculate_targets(clean_data['close'])
+        
+        # Convert to tensors
+        features = self._prepare_features(feature_data)
+        
+        return ProcessedKlines(
+            features=features,
+            targets=targets,
+            feature_names=self.config.technical_indicators,
+            target_type=self.config.target_type,
+            stats=self.stats
+        )
+    
+    def validate_data(self, data: pd.DataFrame) -> None:
+        """Validate OHLCV data requirements."""
+        # Implementation for OHLCV-specific validation
+        pass
+    
+    def _validate_ohlc(self, data: pd.DataFrame) -> None:
+        """Validate and fix OHLC relationships."""
+        # OHLCV-specific validation logic
+        pass
+
+// File: src\data\market_preprocessor.py
+# src/data/market_preprocessor.py
+
+from pathlib import Path
+from typing import Union, Optional
+
+class MarketDataPreprocessor(BasePreprocessor):
+    """Handles loading and storing large market datasets."""
+    
+    def __init__(
+        self,
+        config: TradingConfig,
+        data_path: Optional[Path] = None
+    ):
+        super().__init__(config)
+        self.data_path = data_path
+        self._setup_chunking()
+    
+    def load_and_process(
+        self,
+        output_path: Optional[Path] = None
+    ) -> pd.DataFrame:
+        """Load, clean, and optionally save market data."""
+        # Implementation focusing on efficient data loading and storage
+        pass
+    
+    def validate_data(self, data: pd.DataFrame) -> None:
+        """Validate market data requirements."""
+        pass
 
 // File: src\data\__init__.py
-from .processor import DataProcessor
-from .features import FeatureCalculator
+# File: src/data/__init__.py
 
-__all__ = ['DataProcessor', 'FeatureCalculator']
+from .base_preprocessor import MarketDataPreprocessor
+from .feature_transformer import KlineFeatureTransformer, KlineTransformerConfig
+from .market_indicators import TechnicalIndicators, IndicatorConfig
+
 
 // File: src\data\raw\btc_usdt_1m_klines.csv
 // Snippet:
@@ -598,1207 +640,1109 @@ __all__ = ['DataProcessor', 'FeatureCalculator']
 2020-01-01 00:03:00+00:00 7177.77 7182.60 7177.00 7181.11  69.330 2020-01-01 00:03:59.999000+00:00        4.977934e+05               104                       43.723                  313920.02981       0
 2020-01-01 00:04:00+00:00 7179.10 7179.10 7172.94 7175.25  97.368 2020-01-01 00:04:59.999000+00:00        6.986274e+05               193                       36.616                  262734.68999       0
 
-// File: src\env\bybit_env.py
-import asyncio
-import aiowebsocket
-import json
-import hmac
-import hashlib
-import time
-from loguru import logger
-from src.data.features import EnhancedFeatureExtractor
-# ... other imports ...
+// File: src\pipeline\augmenters.py
+# File: src/pipeline/augmenters.py
 
-BYBIT_WEBSOCKET_URL = "wss://stream-testnet.bybit.com/v5/public/linear" #Change to mainnet if needed
-
-class BybitFuturesEnv(gym.Env):
-    def __init__(self, config, api_key=None, api_secret=None):
-        # ... other initializations ...
-        self.config = config
-        self.feature_extractor = EnhancedFeatureExtractor(config.feature)
-        self.api_key = api_key
-        self.api_secret = api_secret
-        self.websocket = None
-        self.market_data_queue = asyncio.Queue()
-        self.last_ping_time = 0
-
-    async def connect_websocket(self):
-        """Establishes a websocket connection to Bybit, handling authentication if needed."""
-        if self.api_key and self.api_secret:
-            auth_data = self._generate_auth_data()
-            url = f"{BYBIT_WEBSOCKET_URL}?max_active_time=1m" # Customize alive time
-            async with aiowebsocket.connect(url) as ws:
-                self.websocket = ws
-                await self.websocket.send(json.dumps(auth_data))
-                auth_response = await self.websocket.receive()
-                if not self._check_auth_success(json.loads(auth_response)):
-                    logger.error("Authentication failed!")
-                    return
-                await self.subscribe_to_channels()
-                await self._websocket_loop()
-
-        else:
-            async with aiowebsocket.connect(BYBIT_WEBSOCKET_URL) as ws:
-                self.websocket = ws
-                await self.subscribe_to_channels()
-                await self._websocket_loop()
+import torch
+import logging
+from config.config import TradingConfig
 
 
-    def _generate_auth_data(self):
-      """Generates authentication data for private channels."""
-      expires = int((time.time() + 60) * 1000)  # Expires in 60 seconds
-      message = f"GET/realtime{expires}".encode('utf-8')
-      signature = hmac.new(self.api_secret.encode('utf-8'), message, hashlib.sha256).hexdigest()
-      return {
-          "op": "auth",
-          "args": [self.api_key, expires, signature]
-      }
+class DataAugmenter:
+    """Implements various data augmentation strategies."""
 
-    def _check_auth_success(self, response):
-        """Checks the authentication response from Bybit."""
-        return response.get('retCode') == 0
-
-    async def subscribe_to_channels(self):
-        """Subscribes to the necessary Bybit websocket channels."""
-        await self.websocket.send(json.dumps({"op": "subscribe", "args": ["instrument_info.100ms.BTCUSDT"]})) #Subscribe to BTCUSDT
-        # Add other subscriptions as needed (e.g., trades, klines)
-
-    async def _websocket_loop(self):
-        """Main loop for receiving and processing websocket messages."""
-        while True:
-            try:
-                message = await self.websocket.receive()
-                await self.process_websocket_message(message)
-                if time.time() - self.last_ping_time > 20:  #Send ping every 20 seconds
-                  self.last_ping_time = time.time()
-                  await self.websocket.send(json.dumps({"op": "ping"}))
-                  pong_response = await asyncio.wait_for(self.websocket.receive(), timeout=5) #wait for pong
-                  if pong_response != '"pong"': #check for successful pong
-                    logger.warning("Ping timeout, attempting reconnect...")
-                    await self.websocket.close()
-                    await self.connect_websocket() #Attempt to reconnect
-                    break
-
-            except asyncio.TimeoutError:
-                logger.warning("Websocket receive timeout")
-                await self.websocket.close()
-                await self.connect_websocket()
-                break
-
-            except aiowebsocket.exceptions.WebSocketError as e:
-                logger.error(f"Websocket error: {e}")
-                await asyncio.sleep(5)
-                await self.websocket.close()
-                await self.connect_websocket()
-                break
-            except Exception as e:
-                logger.exception(f"An unexpected error occurred: {e}")
-                await asyncio.sleep(5)
-                await self.websocket.close()
-                await self.connect_websocket()
-                break
-
-
-
-    async def process_websocket_message(self, message):
-        """Processes a single message received from the Bybit websocket."""
-        try:
-            data = json.loads(message)
-            if data['topic'] == 'instrument_info.100ms.BTCUSDT':
-                await self.market_data_queue.put(self._parse_market_data(data['data']))
-
-        except json.JSONDecodeError:
-            logger.error("Invalid JSON received from websocket")
-        except KeyError as e:
-            logger.error(f"Missing key in websocket message: {e}")
-        except Exception as e:
-            logger.exception(f"Error processing websocket message: {e}")
-
-
-    def _parse_market_data(self, raw_data):
-        """Parses and processes a single market data point from Bybit's websocket.
+    def __init__(self, config: TradingConfig):
+        """Initializes the data augmenter.
 
         Args:
-          raw_data (dict): A dictionary containing raw market data from Bybit's websocket.
+            config: Trading configuration containing augmentation parameters
+        """
+        self.config = config
+        self.logger = logging.getLogger(__name__)
+
+    def augment(self, sequence: torch.Tensor) -> torch.Tensor:
+        """Applies configured augmentations to the input sequence.
+
+        Args:
+            sequence: Input tensor to augment
 
         Returns:
-          dict: A dictionary containing processed market data ready for feature extraction. Returns an empty dictionary if parsing fails.
+            Augmented tensor
         """
-        try:
-            processed_data = {
-                'close_price': float(raw_data['last_price']),
-                'volume': float(raw_data['volume']),
-                'bid_ask_spread': float(raw_data['best_ask_price']) - float(raw_data['best_bid_price']),
-                'funding_rate': float(raw_data['funding_rate']),
-                'market_depth_ratio': self._calculate_depth_ratio(raw_data),  # Implement this function
-                'taker_buy_ratio': float(raw_data.get('taker_buy_sell_ratio', 0.5)) # Handle missing data gracefully
-            }
-            return processed_data
-        except (KeyError, ValueError, TypeError) as e:
-            logger.warning(f"Error parsing market data: {e}, Raw Data: {raw_data}")
-            return {}
+        if not self.config.use_augmentation:
+            return sequence
 
-    # ... rest of your BybitFuturesEnv class ...
+        augmented = sequence.clone()
 
-    # ... (rest of your code) ...
+        # Apply Gaussian noise
+        if self.config.noise_level > 0:
+            noise = torch.randn_like(augmented) * self.config.noise_level
+            augmented += noise
 
-// File: src\env\__init__.py
+        # Apply time jittering
+        if self.config.jitter_ratio > 0:
+            augmented = self._apply_time_jitter(augmented)
+
+        return augmented
+
+    def _apply_time_jitter(self, sequence: torch.Tensor) -> torch.Tensor:
+        """Applies time jittering to the sequence.
+
+        Args:
+            sequence: Input tensor to jitter
+
+        Returns:
+            Time jittered tensor
+        """
+        seq_len = sequence.size(0)
+        num_jitter = int(seq_len * self.config.jitter_ratio)
+
+        if num_jitter > 0:
+            jitter_idx = torch.randperm(seq_len)[:num_jitter]
+            augmented_sequence = sequence.clone()
+            augmented_sequence[jitter_idx] = sequence[jitter_idx].roll(1, dims=0)
+            self.logger.debug(f"Applied time jittering on indices: {jitter_idx.tolist()}")
+            return augmented_sequence
+
+        return sequence
 
 
-// File: src\models\agent.py
+// File: src\pipeline\datasets.py
+# File: src/pipeline/datasets.py
 
-
-// File: src\models\appo.py
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.cuda.amp import autocast, GradScaler
-from typing import Dict, List, Optional, Tuple
-import numpy as np
-from dataclasses import dataclass
-from .nlnn import NLNN
-from .reward import CompositeReward, RewardConfig
-import threading
-from queue import Queue
-import time
-
-@dataclass
-class APPOConfig:
-    """Configuration for APPO algorithm"""
-    # Network architecture
-    input_dim: int = 64
-    hidden_dim: int = 256
-    num_layers: int = 4
-    
-    # APPO parameters
-    num_workers: int = 12  # Optimized for Ryzen 9 7900X
-    batch_size: int = 512  # Optimized for RTX 3070
-    clip_ratio: float = 0.2
-    value_loss_coef: float = 0.5
-    entropy_coef: float = 0.01
-    max_grad_norm: float = 0.5
-    
-    # Learning rates
-    actor_lr: float = 3e-4
-    critic_lr: float = 1e-3
-    
-    # Optimization
-    gamma: float = 0.99
-    gae_lambda: float = 0.95
-    update_epochs: int = 4
-    mini_batch_size: int = 64
-    
-    # Experience replay
-    buffer_size: int = 10000
-    priority_alpha: float = 0.6
-    priority_beta: float = 0.4
-    
-    # Auxiliary tasks
-    use_auxiliary: bool = True
-    aux_weight: float = 0.1
-
-class AsyncPPOAgent(nn.Module):
-    """Asynchronous Proximal Policy Optimization with hardware optimizations"""
-    
-    def __init__(self, config: APPOConfig):
-        super().__init__()
-        self.config = config
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # Initialize networks
-        self.backbone = NLNN(
-            input_size=config.input_dim,
-            hidden_size=config.hidden_dim,
-            num_layers=config.num_layers
-        ).to(self.device)
-        
-        self.actor = nn.Sequential(
-            nn.Linear(config.hidden_dim, config.hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(config.hidden_dim // 2, 3)  # Buy, Sell, Hold
-        ).to(self.device)
-        
-        self.critic = nn.Sequential(
-            nn.Linear(config.hidden_dim, config.hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(config.hidden_dim // 2, 1)
-        ).to(self.device)
-        
-        if config.use_auxiliary:
-            self.auxiliary_head = nn.Sequential(
-                nn.Linear(config.hidden_dim, config.hidden_dim // 2),
-                nn.ReLU(),
-                nn.Linear(config.hidden_dim // 2, config.input_dim)
-            ).to(self.device)
-        
-        # Initialize optimizers
-        self.actor_optimizer = torch.optim.Adam(
-            list(self.backbone.parameters()) + list(self.actor.parameters()),
-            lr=config.actor_lr
-        )
-        self.critic_optimizer = torch.optim.Adam(
-            list(self.backbone.parameters()) + list(self.critic.parameters()),
-            lr=config.critic_lr
-        )
-        
-        # Initialize mixed precision training
-        self.scaler = GradScaler()
-        
-        # Initialize experience replay
-        self.replay_buffer = PrioritizedReplayBuffer(
-            config.buffer_size,
-            config.priority_alpha,
-            config.priority_beta
-        )
-        
-        # Initialize worker threads
-        self.workers = [
-            PPOWorker(i, self, Queue())
-            for i in range(config.num_workers)
-        ]
-        
-        # Compile model for faster execution
-        self.trace_model()
-    
-    def trace_model(self):
-        """JIT compile the model for faster execution"""
-        self.backbone = torch.compile(self.backbone)
-        self.actor = torch.compile(self.actor)
-        self.critic = torch.compile(self.critic)
-        if self.config.use_auxiliary:
-            self.auxiliary_head = torch.compile(self.auxiliary_head)
-    
-    @torch.compile
-    def forward(self, state: torch.Tensor,
-                hidden_states: Optional[List[torch.Tensor]] = None
-                ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
-        """Forward pass with mixed precision"""
-        with autocast():
-            # Get features from backbone
-            features, new_hidden = self.backbone(state, hidden_states)
-            
-            # Get action logits and value estimate
-            action_logits = self.actor(features)
-            value = self.critic(features)
-            
-            # Get auxiliary prediction if enabled
-            if self.config.use_auxiliary:
-                aux_pred = self.auxiliary_head(features)
-            else:
-                aux_pred = None
-            
-            return action_logits, value, new_hidden, aux_pred
-    
-    def select_action(self, state: torch.Tensor,
-                     hidden_states: List[torch.Tensor],
-                     deterministic: bool = False) -> Tuple[torch.Tensor, float, List[torch.Tensor]]:
-        """Select action using the current policy"""
-        with torch.no_grad():
-            action_logits, value, new_hidden, _ = self(state, hidden_states)
-            
-            if deterministic:
-                action = torch.argmax(action_logits, dim=-1)
-            else:
-                action_probs = F.softmax(action_logits, dim=-1)
-                action = torch
-
-    def update_minibatch(self, states: torch.Tensor,
-                        actions: torch.Tensor,
-                        returns: torch.Tensor,
-                        advantages: torch.Tensor):
-        """Update policy and value function on a single minibatch"""
-        with autocast(enabled=self.config.use_amp):
-            # Get current policy and value predictions
-            new_log_probs, new_values, entropy = self.evaluate_actions(states, actions)
-            
-            # Calculate policy loss with clipping
-            ratio = torch.exp(new_log_probs)
-            surr1 = ratio * advantages
-            surr2 = torch.clamp(ratio, 1 - self.config.clip_ratio, 1 + self.config.clip_ratio) * advantages
-            policy_loss = -torch.min(surr1, surr2).mean()
-            
-            # Calculate value loss with clipping
-            value_pred_clipped = values + torch.clamp(
-                new_values - values,
-                -self.config.clip_ratio,
-                self.config.clip_ratio
-            )
-            value_losses = (new_values - returns).pow(2)
-            value_losses_clipped = (value_pred_clipped - returns).pow(2)
-            value_loss = torch.max(value_losses, value_losses_clipped).mean()
-            
-            # Calculate auxiliary loss if enabled
-            if self.config.use_auxiliary:
-                aux_pred = self.auxiliary_head(features)
-                aux_loss = F.mse_loss(aux_pred, next_states)
-            else:
-                aux_loss = 0
-            
-            # Combine losses
-            total_loss = (
-                policy_loss
-                - self.config.entropy_coef * entropy
-                + self.config.value_loss_coef * value_loss
-                + self.config.aux_weight * aux_loss
-            )
-            
-            # Optimize using mixed precision
-            if self.config.use_amp:
-                self.scaler.scale(total_loss).backward()
-                
-                # Clip gradients
-                if self.config.max_grad_norm > 0:
-                    for param_group in [
-                        list(self.backbone.parameters()),
-                        list(self.actor.parameters()),
-                        list(self.critic.parameters())
-                    ]:
-                        self.scaler.unscale_(self.actor_optimizer)
-                        torch.nn.utils.clip_grad_norm_(param_group, self.config.max_grad_norm)
-                
-                self.scaler.step(self.actor_optimizer)
-                self.scaler.step(self.critic_optimizer)
-                self.scaler.update()
-            else:
-                total_loss.backward()
-                if self.config.max_grad_norm > 0:
-                    for param_group in [
-                        list(self.backbone.parameters()),
-                        list(self.actor.parameters()),
-                        list(self.critic.parameters())
-                    ]:
-                        torch.nn.utils.clip_grad_norm_(param_group, self.config.max_grad_norm)
-                
-                self.actor_optimizer.step()
-                self.critic_optimizer.step()
-            
-            self.actor_optimizer.zero_grad()
-            self.critic_optimizer.zero_grad()
-            
-            return {
-                'policy_loss': policy_loss.item(),
-                'value_loss': value_loss.item(),
-                'entropy': entropy.item(),
-                'aux_loss': aux_loss.item() if isinstance(aux_loss, torch.Tensor) else aux_loss
-            }
-    
-    def train(self, num_steps: int):
-        """Main training loop"""
-        # Start worker threads
-        for worker in self.workers:
-            worker.start()
-        
-        total_steps = 0
-        episode_rewards = []
-        metrics_history = []
-        
-        try:
-            while total_steps < num_steps:
-                # Collect experiences from workers
-                experiences = []
-                while len(experiences) < self.config.batch_size:
-                    if not self.experience_queue.empty():
-                        exp = self.experience_queue.get()
-                        experiences.append(exp)
-                        total_steps += 1
-                
-                # Update policy
-                metrics = self.update(experiences)
-                metrics_history.append(metrics)
-                
-                # Log progress
-                if total_steps % 1000 == 0:
-                    avg_metrics = {
-                        k: np.mean([m[k] for m in metrics_history[-1000:]])
-                        for k in metrics_history[0].keys()
-                    }
-                    logger.info(f"Step {total_steps}/{num_steps} - Metrics: {avg_metrics}")
-        
-        finally:
-            # Clean up workers
-            for worker in self.workers:
-                worker.join()
-    
-    def save_checkpoint(self, path: str):
-        """Save model checkpoint"""
-        torch.save({
-            'backbone_state_dict': self.backbone.state_dict(),
-            'actor_state_dict': self.actor.state_dict(),
-            'critic_state_dict': self.critic.state_dict(),
-            'auxiliary_state_dict': self.auxiliary_head.state_dict() if self.config.use_auxiliary else None,
-            'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
-            'critic_optimizer_state_dict': self.critic_optimizer.state_dict(),
-            'config': self.config,
-            'scaler_state_dict': self.scaler.state_dict() if self.scaler else None
-        }, path)
-    
-    def load_checkpoint(self, path: str):
-        """Load model checkpoint"""
-        checkpoint = torch.load(path, map_location=self.device)
-        
-        self.backbone.load_state_dict(checkpoint['backbone_state_dict'])
-        self.actor.load_state_dict(checkpoint['actor_state_dict'])
-        self.critic.load_state_dict(checkpoint['critic_state_dict'])
-        
-        if self.config.use_auxiliary and checkpoint['auxiliary_state_dict']:
-            self.auxiliary_head.load_state_dict(checkpoint['auxiliary_state_dict'])
-        
-        self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
-        self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
-        
-        if self.scaler and checkpoint['scaler_state_dict']:
-            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
-
-if __name__ == "__main__":
-    # Example usage
-    config = APPOConfig(
-        input_dim=64,
-        hidden_dim=256,
-        num_layers=4,
-        num_workers=12,  # Using all cores of Ryzen 9 7900X
-        batch_size=512,  # Optimized for RTX 3070 8GB VRAM
-        use_amp=True,    # Enable automatic mixed precision
-        tensor_parallel=True  # Enable tensor parallelization
-    )
-    
-    agent = AsyncPPOAgent(config)
-    
-    # Train the agent
-    agent.train(num_steps=1000000)
-    
-    # Save checkpoint
-    agent.save_checkpoint("appo_checkpoint.pt")
-
-
-// File: src\models\nlnn.py
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-import gymnasium as gym
-import numpy as np
-from dataclasses import dataclass
-from typing import Tuple, Dict, List
+from torch.utils.data import Dataset
+from typing import Dict, List, Optional, Tuple, Union
+from pipeline.handlers import TargetCalculator
+from config.config import TradingConfig
+from pipeline.normalizers import FeatureNormalizer
+from pipeline.augmenters import DataAugmenter
 import logging
-import time
-from collections import deque
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+from data.base_preprocessor import ValidationError
 
-@dataclass
-class TradingConfig:
-    """Configuration for trading parameters and risk management"""
-    max_position_size: float = 0.1  # Maximum position size as fraction of capital
-    stop_loss_pct: float = 0.02     # Stop loss percentage
-    take_profit_pct: float = 0.04   # Take profit percentage
-    max_leverage: float = 5.0       # Maximum allowed leverage
-    min_trade_interval: int = 5     # Minimum intervals between trades
-    rolling_window_size: int = 100  # Size of rolling window for feature calculation
 
-class FeatureExtractor:
-    """Extracts and normalizes trading features"""
-    
-    def __init__(self, config: TradingConfig):
-        self.config = config
-        self.price_history = deque(maxlen=config.rolling_window_size)
-        self.volume_history = deque(maxlen=config.rolling_window_size)
-        
-    def calculate_features(self, market_data: Dict) -> np.ndarray:
-        """Calculate normalized feature vector from market data"""
-        # Add new data points
-        self.price_history.append(market_data['close_price'])
-        self.volume_history.append(market_data['volume'])
-        
-        if len(self.price_history) < 2:
-            return np.zeros(10)  # Return zero features if insufficient history
-            
-        # Calculate technical features
-        returns = np.diff(self.price_history) / np.array(list(self.price_history)[:-1])
-        volatility = np.std(returns[-20:]) if len(returns) >= 20 else 0
-        rsi = self._calculate_rsi(list(self.price_history))
-        
-        # Normalize and combine features
-        features = np.array([
-            self._normalize(market_data['close_price'], self.price_history),
-            self._normalize(market_data['volume'], self.volume_history),
-            volatility,
-            rsi / 100.0,  # RSI is already 0-100
-            market_data['bid_ask_spread'] / market_data['close_price'],
-            market_data['funding_rate'],
-            market_data['open_interest'] / np.mean(self.volume_history),
-            market_data['leverage_ratio'] / self.config.max_leverage,
-            market_data['market_depth_ratio'],
-            market_data['taker_buy_ratio']
-        ])
-        
-        return np.clip(features, -1, 1)  # Ensure all features are in [-1, 1]
-    
-    def _normalize(self, value: float, history: deque) -> float:
-        """Min-max normalization using recent history"""
-        if len(history) < 2:
-            return 0
-        min_val = min(history)
-        max_val = max(history)
-        if min_val == max_val:
-            return 0
-        return (value - min_val) / (max_val - min_val) * 2 - 1
-    
-    def _calculate_rsi(self, prices: List[float], periods: int = 14) -> float:
-        """Calculate Relative Strength Index"""
-        if len(prices) < periods + 1:
-            return 50.0
-            
-        deltas = np.diff(prices)
-        gains = np.clip(deltas, 0, None)
-        losses = -np.clip(deltas, None, 0)
-        
-        avg_gain = np.mean(gains[-periods:])
-        avg_loss = np.mean(losses[-periods:])
-        
-        if avg_loss == 0:
-            return 100.0
-            
-        rs = avg_gain / avg_loss
-        rsi = 100 - (100 / (1 + rs))
-        return rsi
+def validate_tensor_shape(tensor: torch.Tensor, expected_shape: Tuple[Optional[int], ...], name: str) -> None:
+    """Validates tensor shape against expected shape.
 
-class RiskManager:
-    """Handles position sizing and risk management"""
-    
-    def __init__(self, config: TradingConfig):
-        self.config = config
-        self.current_position = 0
-        self.last_trade_time = 0
-        
-    def validate_action(self, action: int, current_price: float, 
-                       account_balance: float) -> Tuple[bool, str]:
-        """Validate if an action can be executed based on risk parameters"""
-        current_time = time.time()
-        
-        # Check trading frequency
-        if current_time - self.last_trade_time < self.config.min_trade_interval:
-            return False, "Trading too frequently"
-            
-        # Check position sizes
-        new_position = self._calculate_position_size(action, current_price, account_balance)
-        if abs(new_position) > self.config.max_position_size * account_balance:
-            return False, "Position size exceeds maximum"
-            
-        return True, ""
-        
-    def _calculate_position_size(self, action: int, current_price: float,
-                               account_balance: float) -> float:
-        """Calculate appropriate position size based on risk parameters"""
-        base_size = account_balance * self.config.max_position_size
-        
-        # Scale position size based on market volatility (simplified)
-        # In practice, you'd want more sophisticated volatility adjustment
-        volatility_scalar = 0.5  # Could be dynamically calculated
-        position_size = base_size * volatility_scalar
-        
-        # Adjust for action type (0: Buy, 1: Sell, 2: Hold)
-        if action == 2:  # Hold
-            return self.current_position
-        elif action == 1:  # Sell
-            return -position_size
-        else:  # Buy
-            return position_size
+    Args:
+        tensor: Tensor to validate
+        expected_shape: Expected shape (None for dynamic dimensions)
+        name: Name of the tensor for error messages
 
-class N_LNN(nn.Module):
-    """Enhanced n-LNN implementation with additional features"""
-    
-    def __init__(self, input_size: int, hidden_size: int, num_layers: int = 1):
-        super().__init__()
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        
-        # Input transformation
-        self.input_transform = nn.Linear(input_size, hidden_size)
-        
-        # Learnable parameters
-        self.W_i = nn.ParameterList([
-            nn.Parameter(torch.randn(hidden_size, hidden_size)) 
-            for _ in range(num_layers)
-        ])
-        self.W_r = nn.ParameterList([
-            nn.Parameter(torch.randn(hidden_size, hidden_size))
-            for _ in range(num_layers)
-        ])
-        
-        # Eigen learning rates and scaling factors
-        self.lambda_i = nn.ParameterList([
-            nn.Parameter(torch.ones(hidden_size))
-            for _ in range(num_layers)
-        ])
-        self.lambda_r = nn.ParameterList([
-            nn.Parameter(torch.ones(hidden_size))
-            for _ in range(num_layers)
-        ])
-        
-        self.scaling_i = nn.Parameter(torch.ones(1))
-        self.scaling_r = nn.Parameter(torch.ones(1))
-        
-        self.dropout = nn.Dropout(0.1)
-        self.layer_norm = nn.LayerNorm(hidden_size)
-        
-    def normalize(self, v: torch.Tensor, epsilon: float = 1e-8) -> torch.Tensor:
-        """Hypersphere normalization with numerical stability"""
-        norm = torch.norm(v, dim=-1, keepdim=True)
-        return v / (norm + epsilon)
-    
-    def slerp(self, h_t: torch.Tensor, h_new: torch.Tensor,
-              alpha: float = 0.5) -> torch.Tensor:
-        """Spherical linear interpolation with safety checks"""
-        # Ensure inputs are normalized
-        h_t = self.normalize(h_t)
-        h_new = self.normalize(h_new)
-        
-        # Calculate cos_theta with numerical stability
-        cos_theta = torch.sum(h_t * h_new, dim=-1, keepdim=True).clamp(-1 + 1e-7, 1 - 1e-7)
-        theta = torch.acos(cos_theta)
-        
-        # Handle edge cases
-        sin_theta = torch.sin(theta)
-        mask = sin_theta.abs() > 1e-7
-        
-        result = torch.where(
-            mask,
-            ((torch.sin((1 - alpha) * theta) / sin_theta) * h_t) + 
-            ((torch.sin(alpha * theta) / sin_theta) * h_new),
-            h_t
+    Raises:
+        ValidationError: If tensor shape doesn't match expected shape
+    """
+    if len(tensor.shape) != len(expected_shape):
+        raise ValidationError(
+            f"Expected {name} to have {len(expected_shape)} dimensions, "
+            f"got {len(tensor.shape)}"
         )
-        
-        return self.normalize(result)
-    
-    def forward(self, inputs: torch.Tensor, 
-                hidden_states: List[torch.Tensor]) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        """Forward pass with multi-layer support and residual connections"""
-        # Input projection
-        x = self.input_transform(inputs)
-        x = self.layer_norm(x)
-        
-        new_hidden_states = []
-        for layer in range(self.num_layers):
-            h_t = hidden_states[layer]
-            
-            # Apply transformations
-            i_transform = torch.matmul(x, self.W_i[layer]) * self.lambda_i[layer]
-            r_transform = torch.matmul(h_t, self.W_r[layer]) * self.lambda_r[layer]
-            
-            # Combine transformations
-            h_new = self.normalize(
-                self.scaling_i * i_transform + 
-                self.scaling_r * r_transform
+
+    for i, (actual, expected) in enumerate(zip(tensor.shape, expected_shape)):
+        if expected is not None and actual != expected:
+            raise ValidationError(
+                f"Expected {name} dimension {i} to be {expected}, got {actual}"
             )
-            
-            # Apply SLERP
-            h_new = self.slerp(h_t, h_new)
-            
-            # Residual connection if dimensions match
-            if x.shape == h_new.shape:
-                h_new = h_new + x
-                
-            h_new = self.layer_norm(h_new)
-            h_new = self.dropout(h_new)
-            
-            new_hidden_states.append(h_new)
-            x = h_new  # Use as input for next layer
-            
-        return x, new_hidden_states
 
-class Agent(nn.Module):
-    """Trading agent with actor-critic architecture"""
-    
-    def __init__(self, input_size: int, hidden_size: int, num_layers: int = 1):
-        super().__init__()
-        self.n_lnn = N_LNN(input_size, hidden_size, num_layers)
-        
-        # Actor network (policy)
-        self.actor = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_size // 2, 3),  # 3 actions: Buy, Sell, Hold
-        )
-        
-        # Critic network (value function)
-        self.critic = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_size // 2, 1)
-        )
-        
-        # Initialize weights
-        self.apply(self._init_weights)
-        
-    def _init_weights(self, module):
-        """Initialize network weights"""
-        if isinstance(module, nn.Linear):
-            nn.init.orthogonal_(module.weight.data, gain=np.sqrt(2))
-            module.bias.data.zero_()
-            
-    def forward(self, state: torch.Tensor, hidden_states: List[torch.Tensor]
-                ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
-        """Forward pass returning action probabilities and value estimate"""
-        features, new_hidden = self.n_lnn(state, hidden_states)
-        
-        # Get action probabilities and value estimate
-        action_logits = self.actor(features)
-        value = self.critic(features)
-        
-        # Apply action masking if needed (e.g., prevent buying when already long)
-        # action_mask = self._get_action_mask(state)
-        # action_logits = action_logits.masked_fill(~action_mask, float('-inf'))
-        
-        return F.softmax(action_logits, dim=-1), value, new_hidden
-    
-    def act(self, state: torch.Tensor, hidden_states: List[torch.Tensor]
-            ) -> Tuple[int, float, List[torch.Tensor]]:
-        """Select action based on current policy"""
-        with torch.no_grad():
-            action_probs, value, new_hidden = self(state, hidden_states)
-            action = torch.multinomial(action_probs, 1).item()
-            
-        return action, value.item(), new_hidden
 
-# Example usage:
-if __name__ == "__main__":
-    # Configuration
-    config = TradingConfig()
-    feature_extractor = FeatureExtractor(config)
-    risk_manager = RiskManager(config)
-    
-    # Initialize agent
-    input_size = 10  # Number of features
-    hidden_size = 64
-    num_layers = 2
-    agent = Agent(input_size, hidden_size, num_layers)
-    optimizer = optim.Adam(agent.parameters(), lr=3e-4)
-    
-    # Initialize hidden states
-    hidden_states = [
-        torch.zeros(1, hidden_size) for _ in range(num_layers)
-    ]
-    
-    # Example market data
-    market_data = {
-        'close_price': 50000.0,
-        'volume': 100.0,
-        'bid_ask_spread': 1.0,
-        'funding_rate': 0.0001,
-        'open_interest': 1000.0,
-        'leverage_ratio': 2.0,
-        'market_depth_ratio': 0.5,
-        'taker_buy_ratio': 0.6
-    }
-    
-    # Extract features
-    features = feature_extractor.calculate_features(market_data)
-    state = torch.FloatTensor(features).unsqueeze(0)
-    
-    # Get action
-    action, value, new_hidden = agent.act(state, hidden_states)
-    
-    # Validate action
-    is_valid, message = risk_manager.validate_action(
-        action, market_data['close_price'], account_balance=10000.0
-    )
-    
-    if is_valid:
-        logging.info(f"Taking action {action} with value estimate {value}")
-    else:
-        logging.warning(f"Action rejected: {message}")
+class SequencedMarketDataset(Dataset):
+    """Dataset for creating sequences from market data."""
 
-// File: src\models\reward.py
-import torch
-import numpy as np
-from typing import Dict, List, Optional, Union
-from dataclasses import dataclass
-from abc import ABC, abstractmethod
-import torch.nn.functional as F
-from torch.cuda.amp import autocast
+    def __init__(
+        self,
+        data: pd.DataFrame,
+        config: TradingConfig,
+        feature_normalizer: FeatureNormalizer,
+        target_calculator: TargetCalculator,
+        data_augmenter: Optional[DataAugmenter] = None,
+        is_training: bool = True
+    ):
+        """Initializes the dataset.
 
-@dataclass
-class RewardConfig:
-    """Configuration for reward calculation"""
-    # PnL Rewards
-    pnl_scale: float = 1.0
-    realized_pnl_weight: float = 0.7
-    unrealized_pnl_weight: float = 0.3
-    
-    # Risk-Adjusted Rewards
-    use_sharpe: bool = True
-    sharpe_window: int = 100
-    risk_free_rate: float = 0.0
-    
-    # Trading Behavior Rewards
-    timing_scale: float = 0.3
-    position_scale: float = 0.2
-    spread_scale: float = 0.1
-    
-    # Penalties
-    oversizing_penalty: float = -0.5
-    overtrading_penalty: float = -0.3
-    drawdown_penalty: float = -0.4
-    
-    # Exploration Rewards
-    curiosity_scale: float = 0.1
-    novelty_threshold: float = 0.1
-
-class BaseReward(ABC):
-    """Abstract base class for reward functions"""
-    
-    def __init__(self, config: RewardConfig):
+        Args:
+            data: Input DataFrame containing market data
+            config: Trading configuration
+            feature_normalizer: Normalizer for features
+            target_calculator: Calculator for targets
+            data_augmenter: Optional augmenter for training data
+            is_training: Whether this is a training dataset
+        """
         self.config = config
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+        self.normalizer = feature_normalizer
+        self.target_calculator = target_calculator
+        self.augmenter = data_augmenter
+        self.is_training = is_training
+
+        self.features = self._prepare_features(data)
+        self.sequences, self.targets = self._create_sequences()
+
+        # Validate shapes
+        self._validate_shapes()
+
+    def _prepare_features(self, data: pd.DataFrame) -> torch.Tensor:
+        """Prepares and normalizes features from raw data.
+
+        Args:
+            data: Input DataFrame
+
+        Returns:
+            Normalized feature tensor
+        """
+        # Extract relevant features
+        feature_data = data[self.config.feature_keys + self.config.technical_indicators].values
+        features = torch.tensor(feature_data, dtype=torch.float32)
+
+        # Transform features using already fitted normalizer
+        normalized_features = self.normalizer.transform(features)
+
+        return normalized_features
+
+    def _create_sequences(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Creates sequences and corresponding targets.
+
+        Returns:
+            Tuple of (sequences, targets) tensors
+        """
+        total_sequences = len(self.features) - self.config.sequence_length - self.config.prediction_horizon + 1
+        sequences = []
+        targets = []
+
+        for i in range(total_sequences):
+            # Extract sequence
+            seq = self.features[i:i + self.config.sequence_length]
+
+            # Apply augmentation if training
+            if self.is_training and self.augmenter is not None:
+                seq = self.augmenter.augment(seq)
+
+            # Calculate target
+            target = self.target_calculator(
+                self.features,
+                i + self.config.sequence_length - 1,
+                self.config.prediction_horizon
+            )
+
+            sequences.append(seq)
+            targets.append(target)
+
+        return torch.stack(sequences), torch.stack(targets)
+
+    def _validate_shapes(self) -> None:
+        """Validates shapes of sequences and targets."""
+        expected_seq_shape = (None, self.config.sequence_length, self.config.input_dim)
+        expected_target_shape = (None, self.target_calculator.get_output_dim())
+
+        validate_tensor_shape(self.sequences, expected_seq_shape, "sequences")
+        validate_tensor_shape(self.targets, expected_target_shape, "targets")
+
+    def __len__(self) -> int:
+        """Returns the number of sequences in the dataset."""
+        return len(self.sequences)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Returns a sequence and target pair.
+
+        Args:
+            idx: Index of the sequence to retrieve
+
+        Returns:
+            Tuple of (sequence, target) tensors
+        """
+        return self.sequences[idx], self.targets[idx]
+
+
+// File: src\pipeline\handlers.py
+# File: src/pipeline/handlers.py
+
+from abc import ABC, abstractmethod
+import torch
+from typing import Dict, Any, Tuple, List, Optional
+import logging
+from datetime import datetime, timezone
+import json
+import asyncio
+import websockets
+import queue
+from dataclasses import dataclass
+import itertools
+from concurrent.futures import ThreadPoolExecutor
+
+from pipeline.normalizers import FeatureNormalizer
+from pipeline.augmenters import DataAugmenter
+from config.config import TradingConfig, TargetType
+from data.base_preprocessor import ProcessingError
+from pipeline.market_indicators import TechnicalIndicators
+
+
+class TargetCalculator(ABC):
+    """Abstract base class for target calculation strategies."""
+
     @abstractmethod
-    def calculate(self, state: Dict[str, torch.Tensor], 
-                 action: torch.Tensor, 
-                 next_state: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def __call__(self, data: torch.Tensor, index: int, horizon: int) -> torch.Tensor:
+        """Calculates the target value for a given index and horizon.
+
+        Args:
+            data: Input tensor containing feature data
+            index: Current time step index
+            horizon: Number of steps ahead to predict
+
+        Returns:
+            Tensor containing the calculated target value
+        """
         pass
 
-class PnLReward(BaseReward):
-    """Profit and Loss based reward"""
-    
-    @torch.compile
-    def calculate(self, state: Dict[str, torch.Tensor],
-                 action: torch.Tensor,
-                 next_state: Dict[str, torch.Tensor]) -> torch.Tensor:
-        with autocast():
-            realized_pnl = next_state['realized_pnl']
-            unrealized_pnl = next_state['unrealized_pnl']
-            
-            pnl_reward = (
-                self.config.realized_pnl_weight * realized_pnl +
-                self.config.unrealized_pnl_weight * unrealized_pnl
-            ) * self.config.pnl_scale
-            
-            return pnl_reward
+    @abstractmethod
+    def get_output_dim(self) -> int:
+        """Returns the dimension of the target output."""
+        pass
 
-class SharpeReward(BaseReward):
-    """Sharpe ratio based reward"""
-    
-    def __init__(self, config: RewardConfig):
-        super().__init__(config)
-        self.returns_history = torch.zeros(
-            (config.sharpe_window,),
-            device=self.device
-        )
-        self.current_idx = 0
-    
-    @torch.compile
-    def calculate(self, state: Dict[str, torch.Tensor],
-                 action: torch.Tensor,
-                 next_state: Dict[str, torch.Tensor]) -> torch.Tensor:
-        with autocast():
-            # Update returns history
-            current_return = (
-                next_state['total_pnl'] - state['total_pnl']
-            ) / state['account_balance']
-            
-            self.returns_history[self.current_idx] = current_return
-            self.current_idx = (self.current_idx + 1) % self.config.sharpe_window
-            
-            # Calculate Sharpe ratio
-            if self.current_idx >= self.config.sharpe_window:
-                excess_returns = self.returns_history - self.config.risk_free_rate
-                sharpe = (
-                    torch.mean(excess_returns) /
-                    (torch.std(excess_returns) + 1e-7)
-                ) * torch.sqrt(torch.tensor(252.0, device=self.device))  # Annualized
-                
-                return sharpe
-            
-            return torch.tensor(0.0, device=self.device)
+    @abstractmethod
+    def get_target_type(self) -> TargetType:
+        """Returns the type of target this calculator produces."""
+        pass
 
-class BehaviorReward(BaseReward):
-    """Trading behavior based reward"""
-    
-    @torch.compile
-    def calculate(self, state: Dict[str, torch.Tensor],
-                 action: torch.Tensor,
-                 next_state: Dict[str, torch.Tensor]) -> torch.Tensor:
-        with autocast():
-            # Timing reward based on price movement direction
-            price_movement = next_state['close_price'] - state['close_price']
-            timing_reward = torch.sign(price_movement) * torch.sign(action - 1)  # -1 for sell, 0 for hold, 1 for buy
-            timing_reward *= self.config.timing_scale
-            
-            # Position sizing reward
-            position_size = torch.abs(next_state['position_size'])
-            optimal_size = state['account_balance'] * state['volatility']
-            position_reward = -torch.abs(position_size - optimal_size) * self.config.position_scale
-            
-            # Spread cost penalty
-            spread_cost = state['bid_ask_spread'] * torch.abs(action - 1)
-            spread_penalty = -spread_cost * self.config.spread_scale
-            
-            return timing_reward + position_reward + spread_penalty
 
-class RiskPenalty(BaseReward):
-    """Risk-based penalties"""
-    
-    @torch.compile
-    def calculate(self, state: Dict[str, torch.Tensor],
-                 action: torch.Tensor,
-                 next_state: Dict[str, torch.Tensor]) -> torch.Tensor:
-        with autocast():
-            penalties = torch.tensor(0.0, device=self.device)
-            
-            # Oversizing penalty
-            max_position = state['account_balance'] * state['max_position_size']
-            if torch.abs(next_state['position_size']) > max_position:
-                penalties += self.config.oversizing_penalty
-            
-            # Overtrading penalty
-            if state['trade_count'] > state['optimal_trade_count']:
-                penalties += self.config.overtrading_penalty
-            
-            # Drawdown penalty
-            current_drawdown = (state['peak_equity'] - next_state['account_balance']) / state['peak_equity']
-            if current_drawdown > state['max_drawdown']:
-                penalties += self.config.drawdown_penalty
-            
-            return penalties
+class DirectionTargetCalculator(TargetCalculator):
+    """Calculates directional movement as target."""
 
-class CuriosityReward(BaseReward):
-    """Intrinsic motivation through curiosity"""
-    
-    def __init__(self, config: RewardConfig, state_dim: int):
-        super().__init__(config)
-        self.state_history = torch.zeros(
-            (1000, state_dim),
-            device=self.device
-        )
-        self.current_idx = 0
-    
-    @torch.compile
-    def calculate(self, state: Dict[str, torch.Tensor],
-                 action: torch.Tensor,
-                 next_state: Dict[str, torch.Tensor]) -> torch.Tensor:
-        with autocast():
-            state_tensor = torch.cat([
-                torch.tensor(list(state.values()), device=self.device)
-            ])
-            
-            # Update state history
-            self.state_history[self.current_idx] = state_tensor
-            self.current_idx = (self.current_idx + 1) % 1000
-            
-            # Calculate novelty as distance to nearest neighbor
-            distances = torch.norm(
-                self.state_history - state_tensor.unsqueeze(0),
-                dim=1
+    def __init__(self):
+        self.target_type = TargetType.DIRECTION
+
+    def __call__(self, data: torch.Tensor, index: int, horizon: int) -> torch.Tensor:
+        """Calculates direction: 1 if price increases, 0 otherwise."""
+        current_price = data[index, 3]  # Assuming 'close' is at index 3
+        future_price = data[index + horizon, 3]
+        direction = 1.0 if future_price > current_price else 0.0
+        return torch.tensor(direction, dtype=torch.float32)
+
+    def get_output_dim(self) -> int:
+        return 1
+
+    def get_target_type(self) -> TargetType:
+        return self.target_type
+
+
+@dataclass
+class RealTimeDataHandler:
+    """Handles real-time market data processing and buffering."""
+
+    config: TradingConfig
+    normalizer: FeatureNormalizer
+    target_calculator: TargetCalculator
+    feature_extractor: Any  # Replace with actual type if available
+    buffer_size: int = 300
+    max_reconnect_attempts: int = 5
+
+    def __post_init__(self):
+        """Initializes buffers and queues."""
+        self.feature_buffer = FeatureBuffer(self.buffer_size)
+        self.sequence_queue = queue.Queue(maxsize=self.config.batch_size * 2)
+
+        # Initialize state
+        self._is_running = False
+        self._websocket = None
+        self._executor = ThreadPoolExecutor(max_workers=2)
+        self.logger = logging.getLogger(__name__)
+
+    async def start(self, uri: str) -> None:
+        """Starts the real-time data handling process.
+
+        Args:
+            uri: WebSocket URI to connect to
+        """
+        self._is_running = True
+        reconnect_attempts = 0
+
+        while self._is_running and reconnect_attempts < self.max_reconnect_attempts:
+            try:
+                async with websockets.connect(uri) as websocket:
+                    self._websocket = websocket
+                    reconnect_attempts = 0  # Reset counter on successful connection
+                    self.logger.info(f"Connected to {uri}")
+
+                    while self._is_running:
+                        message = await websocket.recv()
+                        await self._process_message(message)
+
+            except websockets.exceptions.ConnectionClosed:
+                reconnect_attempts += 1
+                wait_time = min(2 ** reconnect_attempts, 60)  # Exponential backoff
+                self.logger.warning(
+                    f"Connection lost. Retrying in {wait_time}s "
+                    f"(attempt {reconnect_attempts}/{self.max_reconnect_attempts})"
+                )
+                await asyncio.sleep(wait_time)
+
+            except Exception as e:
+                self.logger.error(f"Error in WebSocket connection: {str(e)}")
+                break
+
+        self._is_running = False
+        self.logger.info("Real-time data handler stopped")
+
+    async def _process_message(self, message: str) -> None:
+        """Processes incoming WebSocket messages.
+
+        Args:
+            message: Raw WebSocket message
+        """
+        loop = asyncio.get_event_loop()
+        try:
+            data = json.loads(message)
+
+            # Extract features asynchronously to prevent blocking
+            features = await loop.run_in_executor(
+                self._executor,
+                self.feature_extractor.extract_features,
+                data
             )
-            novelty = torch.min(distances[distances > 0])
-            
-            # Scale novelty reward
-            novelty_reward = torch.where(
-                novelty > self.config.novelty_threshold,
-                self.config.curiosity_scale,
-                torch.tensor(0.0, device=self.device)
+
+            # Handle missing timestamps by extrapolating from previous data
+            if 'timestamp' not in data or data['timestamp'] is None:
+                if self.feature_buffer.buffer:
+                    last_timestamp = self.feature_buffer.buffer[-1].get('timestamp', datetime.now(timezone.utc).timestamp() * 1000)
+                    features['timestamp'] = last_timestamp + 60000  # Add 1 minute in ms
+                else:
+                    features['timestamp'] = datetime.now(timezone.utc).timestamp() * 1000
+
+            # Convert to tensor
+            feature_tensor = torch.tensor(features.values, dtype=torch.float32)
+
+            # Normalize features asynchronously
+            normalized_features = await loop.run_in_executor(
+                self._executor,
+                self.normalizer.transform,
+                feature_tensor.unsqueeze(0)
             )
-            
-            return novelty_reward
+            normalized_features = normalized_features.squeeze(0)
 
-class CompositeReward:
-    """Combines multiple reward components"""
-    
-    def __init__(self, config: RewardConfig, state_dim: int):
-        self.components = {
-            'pnl': PnLReward(config),
-            'sharpe': SharpeReward(config),
-            'behavior': BehaviorReward(config),
-            'risk': RiskPenalty(config),
-            'curiosity': CuriosityReward(config, state_dim)
-        }
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    @torch.compile
-    def calculate_reward(self,
-                        state: Dict[str, torch.Tensor],
-                        action: torch.Tensor,
-                        next_state: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """Calculate combined reward from all components"""
-        with autocast():
-            rewards = {}
-            
-            # Calculate rewards in parallel if on GPU
-            if self.device.type == 'cuda':
-                streams = [torch.cuda.Stream() for _ in self.components]
-                
-                for (name, component), stream in zip(self.components.items(), streams):
-                    with torch.cuda.stream(stream):
-                        rewards[name] = component.calculate(state, action, next_state)
-                
-                torch.cuda.synchronize()
-            else:
-                for name, component in self.components.items():
-                    rewards[name] = component.calculate(state, action, next_state)
-            
-            # Combine rewards
-            total_reward = sum(rewards.values())
-            
-            # Clip final reward for stability
-            return torch.clamp(total_reward, -10.0, 10.0)
+            # Add to buffer
+            self.feature_buffer.append(normalized_features)
 
-// File: src\models\__init__.py
+            # Get sequence if available
+            sequence = self.feature_buffer.get_sequence(self.config.sequence_length)
+            if sequence is not None:
+                # Add to queue if space available
+                try:
+                    self.sequence_queue.put_nowait(sequence)
+                except queue.Full:
+                    self.logger.warning("Sequence queue full, dropping oldest sequence")
+                    self.sequence_queue.get_nowait()  # Remove oldest
+                    self.sequence_queue.put_nowait(sequence)
+
+        except json.JSONDecodeError:
+            self.logger.error("Failed to decode WebSocket message")
+        except Exception as e:
+            self.logger.error(f"Error processing message: {str(e)}")
+
+    def get_next_sequence(self, timeout: float = 0.1) -> Optional[torch.Tensor]:
+        """Retrieves the next available sequence.
+
+        Args:
+            timeout: Time to wait for sequence in seconds
+
+        Returns:
+            Sequence tensor if available, None otherwise
+        """
+        try:
+            return self.sequence_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def stop(self) -> None:
+        """Stops the real-time data handler."""
+        self._is_running = False
+        if self._websocket:
+            asyncio.create_task(self._websocket.close())
+        self._executor.shutdown(wait=True)
 
 
-// File: src\tests\__init__.py
+class FeatureBuffer:
+    """Thread-safe buffer for storing and managing feature sequences."""
+
+    def __init__(self, max_size: int):
+        """Initializes the feature buffer.
+
+        Args:
+            max_size: Maximum number of features to store
+        """
+        self.max_size = max_size
+        self.buffer = deque(maxlen=max_size)
+        self._lock = threading.Lock()
+
+    def append(self, features: torch.Tensor) -> None:
+        """Appends features to the buffer thread-safely.
+
+        Args:
+            features: Feature tensor to append
+        """
+        with self._lock:
+            # Optionally include timestamp for extrapolation
+            # Assuming features include a timestamp at a specific index
+            self.buffer.append(features)
+
+    def get_sequence(self, sequence_length: int) -> Optional[torch.Tensor]:
+        """Retrieves a sequence of specified length if available.
+
+        Args:
+            sequence_length: Length of sequence to retrieve
+
+        Returns:
+            Sequence tensor if available, None otherwise
+        """
+        with self._lock:
+            if len(self.buffer) < sequence_length:
+                return None
+
+            sequence = list(itertools.islice(
+                self.buffer,
+                len(self.buffer) - sequence_length,
+                len(self.buffer)
+            ))
+            return torch.stack(sequence)
+
+    def clear(self) -> None:
+        """Clears the buffer."""
+        with self._lock:
+            self.buffer.clear()
 
 
-// File: src\training\trainer.py
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast
-from torch.nn.utils import clip_grad_norm_
+// File: src\pipeline\market_indicators.py
+# File: src/pipeline/market_indicators.py
+
 import numpy as np
-from typing import Dict, List, Optional, Tuple
-import time
-from pathlib import Path
-import wandb
-from loguru import logger
+import pandas as pd
+import ta
+from typing import List, Union, Dict, Tuple
+from dataclasses import dataclass, field
+from config.config import TradingConfig, IndicatorConfig
 
-from src.config.config import TradingConfig
-from src.models.nlnn import ActorCritic
-from src.data.features import FeatureExtractor
-from src.env.bybit_env import BybitFuturesEnv
-from src.utils.risk_manager import RiskManager
 
-class Trainer:
-    def __init__(self, config: TradingConfig):
-        self.config = config
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # Initialize components
-        self.env = BybitFuturesEnv(config)
-        self.feature_extractor = FeatureExtractor(config)
-        self.risk_manager = RiskManager(config)
-        
-        # Initialize model and optimizer
-        self.model = ActorCritic(
-            input_size=config.model.feature_dim,
-            hidden_size=config.model.hidden_size,
-            num_layers=config.model.num_layers
-        ).to(self.device)
-        
-        self.optimizer = optim.Adam(
-            self.model.parameters(),
-            lr=config.model.learning_rate
-        )
-        
-        # Initialize mixed precision training
-        self.scaler = GradScaler()
-        
-        # Initialize experience buffer
-        self.buffer_size = config.training.update_interval
-        self.clear_buffers()
-        
-        # Setup wandb logging
-        wandb.init(
-            project="nlnn-trading",
-            config=config.dict(),
-            name=f"train_{int(time.time())}"
-        )
-    
-    def clear_buffers(self):
-        """Reset experience buffers"""
-        self.states = []
-        self.actions = []
-        self.rewards = []
-        self.values = []
-        self.log_probs = []
-        self.hidden_states = []
-        self.masks = []
-    
-    @torch.compile
-    def compute_gae(self,
-                    rewards: torch.Tensor,
-                    values: torch.Tensor,
-                    masks: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute Generalized Advantage Estimation"""
-        advantages = torch.zeros_like(rewards)
-        returns = torch.zeros_like(rewards)
-        running_return = 0
-        running_advantage = 0
-        
-        for t in reversed(range(len(rewards))):
-            if t < len(rewards) - 1:
-                next_value = values[t + 1]
-            else:
-                next_value = 0
-                
-            running_return = rewards[t] + self.config.training.gamma * running_return * masks[t]
-            running_tderror = (
-                rewards[t] + 
-                self.config.training.gamma * next_value * masks[t] - 
-                values[t]
-            )
-            running_advantage = (
-                running_tderror + 
-                self.config.training.gamma * 
-                self.config.training.gae_lambda * 
-                running_advantage * 
-                masks[t]
-            )
-            
-            returns[t] = running_return
-            advantages[t] = running_advantage
-            
-        return returns, advantages
-    
-    def train_step(self) -> Dict[str, float]:
-        """Perform a single training step"""
-        # Convert buffers to tensors
-        states = torch.cat(self.states)
-        actions = torch.tensor(self.actions, device=self.device)
-        rewards = torch.tensor(self.rewards, device=self.device)
-        old_values = torch.cat(self.values)
-        old_log_probs = torch.cat(self.log_probs)
-        masks = torch.tensor(self.masks, device=self.device)
-        
-        # Compute returns and advantages
-        returns, advantages = self.compute_gae(rewards, old_values, masks)
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        
-        # Prepare batches
-        batch_size = len(states) // self.config.training.num_minibatches
-        indices = np.arange(len(states))
-        
-        # Training metrics
-        metrics = {
-            "value_loss": 0,
-            "policy_loss": 0,
-            "entropy_loss": 0,
-            "total_loss": 0
+@dataclass
+class IndicatorConfig:
+    """Configuration class for technical indicators"""
+    # MACD parameters
+    macd_fast: int = 12
+    macd_slow: int = 26
+    macd_signal: int = 9
+
+    # Bollinger Bands parameters
+    bb_period: int = 20
+    bb_std: int = 2
+
+    # Multiple periods for EMA and RSI
+    ema_periods: List[int] = field(default_factory=lambda: [5, 10, 20, 60, 120])
+    rsi_periods: List[int] = field(default_factory=lambda: [6, 14, 24])
+
+    # Volatility calculation period
+    volatility_period: int = 20
+
+    # Follow Line (FL) parameters
+    fl_atr_period: int = 5
+    fl_bb_period: int = 21
+    fl_bb_deviation: float = 1.00
+    fl_use_atr_filter: bool = True
+
+
+class TechnicalIndicators:
+    """Class for calculating various technical indicators"""
+
+    def __init__(self, config: IndicatorConfig = None):
+        """Initialize with optional custom configuration"""
+        self.config = config or IndicatorConfig()
+
+    def calculate_all(self, df: pd.DataFrame) -> Dict:
+        """Calculate all technical indicators
+
+        Args:
+            df: DataFrame with 'high', 'low', 'close' columns
+
+        Returns:
+            Dictionary containing all calculated indicators
+        """
+        indicators = {}
+
+        # Multiple RSI periods
+        indicators['rsi'] = {
+            f'rsi_{period}': self.calculate_rsi(df, period)
+            for period in self.config.rsi_periods
         }
+
+        # Multiple EMA periods
+        indicators['ema'] = {
+            f'ema_{period}': self.calculate_ema(df, period)
+            for period in self.config.ema_periods
+        }
+
+        # MACD
+        indicators.update(self.calculate_macd(df))
+
+        # Bollinger Bands
+        indicators.update(self.calculate_bollinger_bands(df))
+
+        # Volatility
+        indicators['volatility'] = self.calculate_volatility(
+            df,
+            self.config.volatility_period
+        )
+
+        # Follow Line
+        indicators.update(self.calculate_follow_line(df))
+
+        return indicators
+
+    def calculate_follow_line(self, df: pd.DataFrame) -> Dict[str, Union[pd.Series, Dict[str, pd.Series]]]:
+        """Calculate the Follow Line (FL) indicator and its signals
+
+        Args:
+            df: DataFrame with 'high', 'low', 'close' columns
+
+        Returns:
+            Dictionary containing FL values and signals
+        """
+        # Calculate Bollinger Bands
+        bb = ta.volatility.BollingerBands(
+            close=df['close'],
+            window=self.config.fl_bb_period,
+            window_dev=self.config.fl_bb_deviation
+        )
+        upper_band = bb.bollinger_hband()
+        lower_band = bb.bollinger_lband()
+
+        # Calculate ATR
+        atr = ta.volatility.AverageTrueRange(
+            high=df['high'],
+            low=df['low'],
+            close=df['close'],
+            window=self.config.fl_atr_period
+        ).average_true_range()
+
+        # Initialize Follow Line series
+        fl = pd.Series(index=df.index, dtype=float)
+        trend = pd.Series(index=df.index, dtype=float)
+
+        # Calculate Follow Line values
+        for i in range(len(df)):
+            if i == 0:
+                fl.iloc[i] = df['close'].iloc[i]
+                trend.iloc[i] = 0
+                continue
+
+            prev_fl = fl.iloc[i - 1]
+            curr_price = df['close'].iloc[i]
+            curr_high = df['high'].iloc[i]
+            curr_low = df['low'].iloc[i]
+
+            # Determine new FL value based on price position relative to Bollinger Bands
+            if curr_price > upper_band.iloc[i]:
+                new_fl = curr_low - (atr.iloc[i] if self.config.fl_use_atr_filter else 0)
+            elif curr_price < lower_band.iloc[i]:
+                new_fl = curr_high + (atr.iloc[i] if self.config.fl_use_atr_filter else 0)
+            else:
+                new_fl = prev_fl
+
+            # Adjust FL based on trend to prevent unnecessary reversals
+            if prev_fl > new_fl:  # Previous trend was up
+                fl.iloc[i] = min(prev_fl, new_fl)
+                trend.iloc[i] = -1 if fl.iloc[i] < prev_fl else 1
+            else:  # Previous trend was down or flat
+                fl.iloc[i] = max(prev_fl, new_fl)
+                trend.iloc[i] = 1 if fl.iloc[i] > prev_fl else -1
+
+        # Generate buy/sell signals
+        signals = self._generate_fl_signals(trend)
+
+        return {
+            'follow_line': {
+                'fl_value': fl,
+                'fl_trend': trend,
+                'signals': signals
+            }
+        }
+
+    def _generate_fl_signals(self, trend: pd.Series) -> Dict[str, pd.Series]:
+        """Generate buy/sell signals based on trend changes
+
+        Args:
+            trend: Series of trend values (1 for up, -1 for down)
+
+        Returns:
+            Dictionary containing buy and sell signals
+        """
+        buy_signals = (trend == 1) & (trend.shift(1) == -1)
+        sell_signals = (trend == -1) & (trend.shift(1) == 1)
+
+        return {
+            'buy_signals': buy_signals,
+            'sell_signals': sell_signals
+        }
+
+    def calculate_rsi(self, df: pd.DataFrame, period: int) -> pd.Series:
+        """Calculate Relative Strength Index for a given period"""
+        rsi = ta.momentum.RSIIndicator(
+            close=df['close'],
+            window=period
+        )
+        return rsi.rsi()
+
+    def calculate_ema(self, df: pd.DataFrame, period: int) -> pd.Series:
+        """Calculate Exponential Moving Average for a given period"""
+        ema = ta.trend.EMAIndicator(
+            close=df['close'],
+            window=period
+        )
+        return ema.ema_indicator()
+
+    def calculate_macd(self, df: pd.DataFrame) -> Dict[str, pd.Series]:
+        """Calculate MACD indicator with its components"""
+        macd = ta.trend.MACD(
+            close=df['close'],
+            window_slow=self.config.macd_slow,
+            window_fast=self.config.macd_fast,
+            window_sign=self.config.macd_signal
+        )
+        return {
+            'macd_line': macd.macd(),
+            'macd_signal': macd.macd_signal(),
+            'macd_histogram': macd.macd_diff()
+        }
+
+    def calculate_bollinger_bands(self, df: pd.DataFrame) -> Dict[str, pd.Series]:
+        """Calculate Bollinger Bands components"""
+        bb = ta.volatility.BollingerBands(
+            close=df['close'],
+            window=self.config.bb_period,
+            window_dev=self.config.bb_std
+        )
+        return {
+            'bb_upper': bb.bollinger_hband(),
+            'bb_middle': bb.bollinger_mavg(),
+            'bb_lower': bb.bollinger_lband(),
+            'bb_bandwidth': bb.bollinger_hband() - bb.bollinger_lband()
+        }
+
+    def calculate_volatility(self, df: pd.DataFrame, window: int) -> pd.Series:
+        """Calculate annualized price volatility"""
+        returns = df['close'].pct_change().dropna()
+        return returns.rolling(window=window).std() * np.sqrt(252)
+
+
+// File: src\pipeline\metrics.py
+# File: src/pipeline/metrics.py
+
+import time
+from typing import Dict, List
+import logging
+
+
+class PipelineMetrics:
+    """Tracks and logs pipeline performance metrics."""
+
+    def __init__(self):
+        """Initializes the metrics tracker."""
+        self.metrics: Dict[str, List[float]] = {
+            'processing_time': [],
+            'queue_size': [],
+            'sequence_length': []
+        }
+        self.start_time = time.time()
+        self.logger = logging.getLogger(__name__)
+
+    def update(self, metric_name: str, value: float) -> None:
+        """Updates a metric value.
+
+        Args:
+            metric_name: Name of the metric
+            value: New value
+        """
+        if metric_name in self.metrics:
+            self.metrics[metric_name].append(value)
+
+    def log_summary(self) -> None:
+        """Logs a summary of tracked metrics."""
+        runtime = time.time() - self.start_time
+
+        for name, values in self.metrics.items():
+            if values:
+                avg_value = sum(values) / len(values)
+                min_value = min(values)
+                max_value = max(values)
+                self.logger.info(
+                    f"{name} - Average: {avg_value:.4f}, "
+                    f"Min: {min_value:.4f}, "
+                    f"Max: {max_value:.4f}"
+                )
+
+        self.logger.info(f"Total runtime: {runtime:.2f}s")
+
+    def reset(self) -> None:
+        """Resets all metrics."""
+        for key in self.metrics:
+            self.metrics[key] = []
+        self.start_time = time.time()
+
+
+// File: src\pipeline\normalizers.py
+# src/pipeline/normalizers.py
+"""Feature normalization implementation"""
+
+from abc import ABC, abstractmethod
+import torch
+from typing import Dict, Optional
+from shared.types import NormalizationType
+from shared.exceptions import ProcessingError
+
+class BaseNormalizer(ABC):
+    """Abstract base class for feature normalization."""
+    
+    @abstractmethod
+    def fit(self, data: torch.Tensor) -> None:
+        pass
+    
+    @abstractmethod
+    def transform(self, data: torch.Tensor) -> torch.Tensor:
+        pass
+    
+    @abstractmethod
+    def inverse_transform(self, data: torch.Tensor) -> torch.Tensor:
+        pass
+
+class FeatureNormalizer(BaseNormalizer):
+    """Implements various normalization strategies."""
+    
+    def __init__(self, method: NormalizationType, epsilon: float = 1e-8):
+        self.method = method
+        self.epsilon = epsilon
+        self.params: Dict[str, torch.Tensor] = {}
+        self._is_fitted = False
+    
+    def fit(self, data: torch.Tensor) -> None:
+        if self.method == NormalizationType.STANDARD:
+            self.params["mean"] = data.mean(dim=0)
+            self.params["std"] = data.std(dim=0)
+        elif self.method == NormalizationType.MINMAX:
+            self.params["min"] = data.min(dim=0)[0]
+            self.params["max"] = data.max(dim=0)[0]
+        elif self.method == NormalizationType.ROBUST:
+            q1 = torch.quantile(data, 0.25, dim=0)
+            q3 = torch.quantile(data, 0.75, dim=0)
+            self.params["median"] = torch.median(data, dim=0)[0]
+            self.params["iqr"] = q3 - q1
         
-        # Perform multiple epochs of training
-        for _ in range(self.config.training.num_epochs):
-            np.random.shuffle(indices)
+        self._is_fitted = True
+    
+    def transform(self, data: torch.Tensor) -> torch.Tensor:
+        if not self._is_fitted and self.method != NormalizationType.NONE:
+            raise ProcessingError("Normalizer must be fitted before transform")
             
-            for start in range(0, len(states), batch_size):
-                end = start + batch_size
-                batch_indices = indices[start:end]
-                
-                # Get batch data
-                batch_states = states[batch_indices]
-                batch_actions = actions[batch_indices]
-                batch_returns = returns[batch_indices]
-                batch_advantages = advantages[batch_indices]
-                batch_old_values = old_values[batch_indices]
-                batch_old_log_probs = old_log_probs[batch_indices]
-                
-                # Forwar
+        if self.method == NormalizationType.STANDARD:
+            return (data - self.params["mean"]) / (self.params["std"] + self.epsilon)
+        elif self.method == NormalizationType.MINMAX:
+            denominator = self.params["max"] - self.params["min"]
+            denominator[denominator == 0] = 1
+            return (data - self.params["min"]) / denominator
+        elif self.method == NormalizationType.ROBUST:
+            return (data - self.params["median"]) / (self.params["iqr"] + self.epsilon)
+        
+        return data
+    
+    def inverse_transform(self, data: torch.Tensor) -> torch.Tensor:
+        if not self._is_fitted and self.method != NormalizationType.NONE:
+            raise ProcessingError("Normalizer must be fitted before inverse_transform")
+            
+        if self.method == NormalizationType.STANDARD:
+            return data * (self.params["std"] + self.epsilon) + self.params["mean"]
+        elif self.method == NormalizationType.MINMAX:
+            denominator = self.params["max"] - self.params["min"]
+            denominator[denominator == 0] = 1
+            return data * denominator + self.params["min"]
+        elif self.method == NormalizationType.ROBUST:
+            return data * (self.params["iqr"] + self.epsilon) + self.params["median"]
+            
+        return data
+
+// File: src\pipeline\pipeline.py
+# File: src/pipeline/pipeline.py
+
+from typing import Any, Optional, Tuple
+import torch
+from torch.utils.data import DataLoader
+from pathlib import Path
+import pandas as pd
+import logging
+
+from config.config import TradingConfig
+from pipeline.normalizers import FeatureNormalizer, NormalizationType
+from pipeline.augmenters import DataAugmenter
+from pipeline.datasets import SequencedMarketDataset
+from pipeline.handlers import RealTimeDataHandler, TargetCalculator, DirectionTargetCalculator
+from pipeline.metrics import PipelineMetrics
+from utils.logging import custom_logger
+from data.base_preprocessor import MarketDataPreprocessor
+from pipeline.market_indicators import IndicatorConfig, TechnicalIndicators
+
+
+class TradingDataPipeline:
+    """Orchestrates the complete trading data pipeline."""
+
+    def __init__(
+        self,
+        config: TradingConfig,
+        target_calculator: TargetCalculator,
+        device: torch.device = None
+    ):
+        """Initializes the trading pipeline.
+
+        Args:
+            config: Trading configuration
+            target_calculator: Calculator for target values
+            device: Torch device to use
+        """
+        self.config = config
+        self.target_calculator = target_calculator
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Initialize components
+        self.feature_normalizer = FeatureNormalizer(
+            method=config.target_normalization,
+            epsilon=config.epsilon
+        )
+        self.data_augmenter = DataAugmenter(config) if config.use_augmentation else None
+
+        self.logger = custom_logger.logger
+
+        # Initialize technical indicators
+        self.technical_indicators = TechnicalIndicators(
+            IndicatorConfig()
+        )
+
+    def prepare_data(
+        self,
+        data_path: Path,
+        train_split: float = 0.8
+    ) -> Tuple[DataLoader, DataLoader]:
+        """Prepares training and validation data loaders.
+
+        Args:
+            data_path: Path to raw data file
+            train_split: Ratio of data to use for training
+
+        Returns:
+            Tuple of (train_loader, val_loader)
+        """
+        # Load and preprocess data
+        preprocessor = MarketDataPreprocessor(self.config, data_path, self.technical_indicators)
+        preprocessor.load_data()
+        preprocessor.clean_data()
+        preprocessor.normalize_features()
+        processed_data = preprocessor.get_processed_data()
+
+        # Split data
+        train_data, val_data = self._split_data(processed_data, train_split)
+
+        # Fit scaler on training data
+        feature_columns = self.config.feature_keys + self.config.technical_indicators
+        train_features = torch.tensor(train_data[feature_columns].values, dtype=torch.float32)
+        self.feature_normalizer.fit(train_features)
+
+        # Normalize both training and validation data
+        preprocessor.normalizer = self.feature_normalizer  # Ensure preprocessor uses the same scaler
+        preprocessor.normalize_features()
+        train_data = preprocessor.get_processed_data().iloc[:len(train_data)]
+        val_data = preprocessor.get_processed_data().iloc[len(train_data):]
+
+        # Create datasets
+        train_dataset = SequencedMarketDataset(
+            train_data,
+            self.config,
+            self.feature_normalizer,
+            self.target_calculator,
+            self.data_augmenter,
+            is_training=True
+        )
+
+        val_dataset = SequencedMarketDataset(
+            val_data,
+            self.config,
+            self.feature_normalizer,
+            self.target_calculator,
+            is_training=False
+        )
+
+        # Create data loaders
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=self.config.batch_size,
+            shuffle=True,
+            num_workers=self.config.num_workers,
+            pin_memory=self.config.pin_memory,
+            prefetch_factor=self.config.prefetch_factor
+        )
+
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=self.config.batch_size,
+            shuffle=False,
+            num_workers=self.config.num_workers,
+            pin_memory=self.config.pin_memory,
+            prefetch_factor=self.config.prefetch_factor
+        )
+
+        self.logger.info(
+            f"Data split - Training: {len(train_data):,} samples, "
+            f"Validation: {len(val_data):,} samples"
+        )
+
+        return train_loader, val_loader
+
+    def create_realtime_handler(self, feature_extractor: Optional[Any] = None) -> RealTimeDataHandler:
+        """Creates a real-time data handler instance.
+
+        Args:
+            feature_extractor: Optional MarketFeatureExtractor instance
+
+        Returns:
+            Configured RealTimeDataHandler instance
+        """
+        if feature_extractor is None:
+            from pipeline.handlers import MarketFeatureExtractor
+            feature_extractor = MarketFeatureExtractor(self.config)
+
+        return RealTimeDataHandler(
+            config=self.config,
+            normalizer=self.feature_normalizer,
+            target_calculator=self.target_calculator,
+            feature_extractor=feature_extractor
+        )
+
+    def _split_data(
+        self,
+        data: pd.DataFrame,
+        train_split: float
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Splits data into training and validation sets.
+
+        Args:
+            data: Input DataFrame
+            train_split: Ratio of data to use for training
+
+        Returns:
+            Tuple of (train_data, val_data)
+        """
+        split_idx = int(len(data) * train_split)
+        train_data = data.iloc[:split_idx].copy()
+        val_data = data.iloc[split_idx:].copy()
+
+        return train_data, val_data
+
+    def save_pipeline_state(self, path: Path) -> None:
+        """Saves the pipeline state for later use.
+
+        Args:
+            path: Path to save state
+        """
+        state = {
+            'config': self.config.to_dict(),
+            'normalizer_params': self.feature_normalizer.params,
+            'normalizer_method': self.feature_normalizer.method.value
+        }
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(state, path)
+        self.logger.info(f"Pipeline state saved to {path}")
+
+    def load_pipeline_state(self, path: Path) -> None:
+        """Loads a saved pipeline state.
+
+        Args:
+            path: Path to saved state
+        """
+        try:
+            state = torch.load(path)
+            self.config = TradingConfig(**state['config'])
+            self.feature_normalizer = FeatureNormalizer(
+                method=NormalizationType(state['normalizer_method']),
+                epsilon=self.config.epsilon
+            )
+            self.feature_normalizer.params = state['normalizer_params']
+            self.feature_normalizer._is_fitted = True
+
+            self.logger.info(f"Pipeline state loaded from {path}")
+
+        except Exception as e:
+            self.logger.error(f"Error loading pipeline state: {str(e)}")
+            raise
+
+
+// File: src\pipeline\__init__.py
+# File: src/pipeline/__init__.py
+
+from .normalizers import FeatureNormalizer, NormalizationType
+from .augmenters import DataAugmenter
+from .datasets import SequencedMarketDataset
+from .handlers import RealTimeDataHandler, TargetCalculator, DirectionTargetCalculator
+from .metrics import PipelineMetrics
+from .pipeline import TradingDataPipeline, PipelineMetrics
+from .feature_transformer import KlineFeatureTransformer, KlineTransformerConfig
+from .market_indicators import TechnicalIndicators, IndicatorConfig
+
+
+// File: src\shared\exceptions.py
+"""Custom exceptions used across modules"""
+
+class ValidationError(Exception):
+    """Raised when data validation fails"""
+    pass
+
+class ProcessingError(Exception):
+    """Raised when data processing fails"""
+    pass
+
+// File: src\shared\types.py
+# src/shared/types.py
+"""Common types and enums used across modules"""
+
+from enum import Enum
+from dataclasses import dataclass
+from typing import List, Dict, Any, Optional
+
+class TargetType(Enum):
+    """Enumeration of supported target types."""
+    DIRECTION = "direction"
+    PRICE = "price"
+    VOLATILITY = "volatility"
+    CUSTOM = "custom"
+
+class NormalizationType(Enum):
+    """Enumeration of supported normalization methods."""
+    STANDARD = "standard"
+    MINMAX = "minmax"
+    ROBUST = "robust"
+    NONE = "none"
+
+@dataclass
+class ProcessingMetrics:
+    """Metrics for monitoring processing performance"""
+    cpu_percent: float
+    memory_percent: float
+    gpu_utilization: List[float]
+    gpu_memory_percent: List[float]
+
+# src/shared/exceptions.py
+"""Custom exceptions used across modules"""
+
+class ValidationError(Exception):
+    """Raised when data validation fails"""
+    pass
+
+class ProcessingError(Exception):
+    """Raised when data processing fails"""
+    pass
 
 // File: src\utils\logging.py
+# File: src/utils/logging.py
+
 from loguru import logger
 import sys
 from pathlib import Path
@@ -1810,10 +1754,10 @@ class CustomLogger:
     def __init__(self, log_dir: str = "logs"):
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(exist_ok=True)
-        
+
         # Remove default logger and set up our custom configuration
         logger.remove()
-        
+
         # Add file handler
         log_file = self.log_dir / f"trading_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
         logger.add(
@@ -1823,207 +1767,21 @@ class CustomLogger:
             rotation="1 day",
             compression="zip"
         )
-        
+
         # Add console handler
         logger.add(
             sys.stdout,
             format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
             level="INFO"
         )
-        
+
     def log_metrics(self, metrics: Dict[str, Any], step: int):
-        """Log metrics to both file and wandb if configured"""
+        """Log metrics to both file and wandb if configured."""
         metrics_str = json.dumps(metrics)
         logger.info(f"Step {step} metrics: {metrics_str}")
 
 custom_logger = CustomLogger()  # Singleton instance
 
-// File: src\utils\risk_manager.py
-import numpy as np
-from typing import Dict, Tuple, List
-from dataclasses import dataclass
-import threading
-from concurrent.futures import ThreadPoolExecutor
-import time
-from collections import deque
-from loguru import logger
-import torch
-
-@dataclass
-class RiskConfig:
-    max_position_size: float = 0.1
-    stop_loss_pct: float = 0.02
-    take_profit_pct: float = 0.04
-    max_leverage: float = 5.0
-    min_trade_interval: float = 1.0  # seconds
-    max_drawdown: float = 0.2
-    position_sizing_method: str = "adaptive_kelly"
-    num_threads: int = 24  # Optimized for Ryzen 9 7900X
-    risk_check_batch_size: int = 1000
-    use_cuda: bool = True
-
-class Position:
-    def __init__(self, size: float, entry_price: float, entry_time: float):
-        self.size = size
-        self.entry_price = entry_price
-        self.entry_time = entry_time
-        self.stop_loss = None
-        self.take_profit = None
-        self.unrealized_pnl = 0.0
-        self.realized_pnl = 0.0
-
-class EnhancedRiskManager:
-    """Hardware-optimized risk management system"""
-    
-    def __init__(self, config: RiskConfig):
-        self.config = config
-        self.device = torch.device("cuda" if torch.cuda.is_available() and config.use_cuda else "cpu")
-        
-        # Initialize thread pool for parallel processing
-        self.thread_pool = ThreadPoolExecutor(max_workers=config.num_threads)
-        
-        # Position management
-        self.positions: Dict[str, Position] = {}
-        self.position_lock = threading.Lock()
-        
-        # Performance tracking
-        self.trades_history = deque(maxlen=1000)
-        self.pnl_history = deque(maxlen=1000)
-        self.last_trade_time = 0
-        
-        # Risk metrics
-        self.current_drawdown = 0.0
-        self.peak_equity = 0.0
-        self.win_rate = 0.5  # Initial estimate
-        
-        # Batch processing buffers
-        self.pending_actions = []
-        self.pending_prices = []
-        self.pending_timestamps = []
-        
-        # CUDA streams for parallel computation
-        self.streams = None
-        if self.device.type == 'cuda':
-            self.streams = [torch.cuda.Stream() for _ in range(2)]
-
-    def validate_action_batch(self, 
-                            actions: List[int],
-                            prices: List[float],
-                            account_balance: float) -> List[Tuple[bool, str]]:
-        """Validate multiple actions in parallel"""
-        if self.device.type == 'cuda':
-            return self._validate_action_batch_gpu(actions, prices, account_balance)
-        else:
-            return self._validate_action_batch_cpu(actions, prices, account_balance)
-
-    @torch.compile
-    def _validate_action_batch_gpu(self,
-                                 actions: List[int],
-                                 prices: List[float],
-                                 account_balance: float) -> List[Tuple[bool, str]]:
-        """GPU-accelerated batch action validation"""
-        with torch.cuda.amp.autocast():
-            # Convert inputs to tensors
-            actions_tensor = torch.tensor(actions, device=self.device)
-            prices_tensor = torch.tensor(prices, device=self.device)
-            
-            # Calculate position sizes
-            position_sizes = self._calculate_position_sizes_gpu(
-                actions_tensor, prices_tensor, account_balance
-            )
-            
-            # Check position limits
-            position_valid = torch.abs(position_sizes) <= (
-                self.config.max_position_size * account_balance
-            )
-            
-            # Check leverage limits
-            leverage = torch.abs(position_sizes * prices_tensor) / account_balance
-            leverage_valid = leverage <= self.config.max_leverage
-            
-            # Check trading frequency
-            current_time = time.time()
-            time_valid = (current_time - self.last_trade_time) >= self.config.min_trade_interval
-            
-            # Combine all checks
-            valid = position_valid & leverage_valid & torch.full_like(
-                position_valid, time_valid, dtype=torch.bool
-            )
-            
-            # Generate messages
-            messages = []
-            for i, (p_valid, l_valid, is_valid) in enumerate(
-                zip(position_valid.cpu(), leverage_valid.cpu(), valid.cpu())
-            ):
-                if not is_valid:
-                    if not time_valid:
-                        messages.append("Trading too frequently")
-                    elif not p_valid:
-                        messages.append("Position size exceeds maximum")
-                    elif not l_valid:
-                        messages.append("Leverage exceeds maximum")
-                else:
-                    messages.append("")
-            
-            return list(zip(valid.cpu().tolist(), messages))
-
-    def _validate_action_batch_cpu(self,
-                                 actions: List[int],
-                                 prices: List[float],
-                                 account_balance: float) -> List[Tuple[bool, str]]:
-        """CPU-based parallel action validation"""
-        def validate_single(args):
-            action, price = args
-            return self._validate_single_action(action, price, account_balance)
-        
-        # Process validations in parallel
-        with ThreadPoolExecutor(max_workers=self.config.num_threads) as executor:
-            results = list(executor.map(validate_single, zip(actions, prices)))
-        
-        return results
-
-    def _validate_single_action(self,
-                              action: int,
-                              current_price: float,
-                              account_balance: float) -> Tuple[bool, str]:
-        """Validate a single action with all risk checks"""
-        current_time = time.time()
-        
-        # Check trading frequency
-        if current_time - self.last_trade_time < self.config.min_trade_interval:
-            return False, "Trading too frequently"
-        
-        # Calculate position size
-        position_size = self._calculate_adaptive_position_size(
-            action, current_price, account_balance
-        )
-        
-        # Check position limits
-        if abs(position_size) > self.config.max_position_size * account_balance:
-            return False, "Position size exceeds maximum"
-        
-        # Check leverage
-        leverage = abs(position_size * current_price) / account_balance
-        if leverage > self.config.max_leverage:
-            return False, "Leverage exceeds maximum"
-        
-        # Check drawdown
-        if self.current_drawdown > self.config.max_drawdown:
-            return False, "Maximum drawdown exceeded"
-        
-        return True, ""
-
-    @torch.compile
-    def _calculate_position_sizes_gpu(self,
-                                    actions: torch.Tensor,
-                                    prices: torch.Tensor,
-                                    account_balance: float) -> torch.Tensor:
-        """Calculate position sizes using GPU acceleration"""
-        # Base position size
-        base_size = account_balance * self.config.max_position_size
-        
-        # Calculate adaptive Kelly criterion
-        kelly_fraction = self._calculate_kelly_fraction_gpu
 
 // File: src\utils\system_monitor.py
 import psutil
@@ -2092,5 +1850,9 @@ class SystemMonitor:
         }
 
 // File: src\utils\__init__.py
+# File: src/utils/__init__.py
+
+from .logging import custom_logger
+from .system_monitor import SystemMonitor
 
 
