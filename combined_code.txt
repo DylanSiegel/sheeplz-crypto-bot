@@ -1,157 +1,18 @@
 **File Tree (Relevant Files Only)**
   .
+    - ai_module.py
+    - dataset.py
     - main.py
-    - market_visualizer.py
+    - visualization.py
   data\raw
     - btc_usdt_1m_processed.csv
-// File: main.py
-# main.py
-
-from pathlib import Path
-import sys
-import logging
-from tqdm.auto import tqdm
-from market_visualizer import MarketVisualizer, logger
-
-def main():
-    """Main execution function."""
-    try:
-        logger.info("Initializing MarketVisualizer...")
-        viz = MarketVisualizer(
-            sequence_length=128,
-            hidden_size=256,
-            scaling_method="minmax",
-            batch_size=512,  # Adjusted batch size for performance
-            use_amp=True,
-            cache_size=1000
-        )
-
-        output_dir = Path("visualizations")
-        output_dir.mkdir(exist_ok=True)
-        logger.info(f"Output directory: {output_dir.resolve()}")
-
-        # Generate visualizations with progress tracking
-        with tqdm(total=2, desc="Generating visualizations") as pbar:
-            # t-SNE visualization
-            fig_tsne = viz.visualize_hypersphere(
-                n_samples=10000,
-                projection_method='tsne',
-                perplexity=50,
-                color_feature="close",
-                hover_features=['open', 'high', 'low', 'volume'],
-                save_encoded=True,
-                encoded_save_path="data/encoded_hypersphere_tsne.npy",
-                create_subplots=True
-            )
-            
-            if fig_tsne:
-                output_path_tsne = output_dir / "market_visualization_tsne.html"
-                fig_tsne.write_html(output_path_tsne)
-                logger.info(f"t-SNE visualization saved at {output_path_tsne.resolve()}")
-            pbar.update(1)
-
-            # PCA visualization
-            fig_pca = viz.visualize_hypersphere(
-                n_samples=10000,
-                projection_method='pca',
-                color_feature='rsi_14',
-                hover_features=viz.price_columns + viz.indicator_columns,
-                save_encoded=True,
-                encoded_save_path="data/encoded_hypersphere_pca.npy",
-                create_subplots=True
-            )
-            
-            if fig_pca:
-                output_path_pca = output_dir / "market_visualization_pca.html"
-                fig_pca.write_html(output_path_pca)
-                logger.info(f"PCA visualization saved at {output_path_pca.resolve()}")
-            pbar.update(1)
-
-    except Exception as e:
-        logger.exception("Error in main execution")
-        print(f"An error occurred: {e}")
-        sys.exit(1)
-
-if __name__ == "__main__":
-    main()
-
-
-// File: market_visualizer.py
-# market_visualizer.py
-
+// File: ai_module.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-import pandas as pd
-from pathlib import Path
-import plotly.express as px
-import plotly.graph_objects as go
-from plotly.graph_objs import Figure
-from plotly.subplots import make_subplots
-from sklearn.decomposition import PCA
-from sklearn.manifold import TSNE
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
-from torch.utils.data import Dataset, DataLoader, Subset
-from typing import List, Optional, Literal, Tuple, Union, Dict
-import logging
-from tqdm.auto import tqdm
-import multiprocessing as mp
-from concurrent.futures import ThreadPoolExecutor
-import torch.backends.cudnn as cudnn
-import os
-import gc
-from datetime import datetime
-
-# Enable CUDA optimizations
-cudnn.benchmark = True
-cudnn.deterministic = False
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-
-# Configure logging
-def setup_logging():
-    logger = logging.getLogger(__name__)
-    if not logger.hasHandlers():
-        logger.setLevel(logging.INFO)
-        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-        # File handler
-        file_handler = logging.FileHandler("market_visualizer_optimized.log")
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-        # Stream handler
-        stream_handler = logging.StreamHandler()
-        stream_handler.setFormatter(formatter)
-        logger.addHandler(stream_handler)
-    return logger
-
-logger = setup_logging()
-
-# Determine optimal number of workers based on system
-def get_num_workers():
-    if os.name == 'nt':  # For Windows
-        return min(4, mp.cpu_count())  # Limited to 4 on Windows
-    return min(mp.cpu_count(), 8)  # Use up to 8 workers on other systems
-
-# Set number of workers globally
-NUM_WORKERS = get_num_workers()
-logger.info(f"Using {NUM_WORKERS} workers for data loading")
-
-# Set device
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-logger.info(f"Using device: {device}")
 
 class HypersphericalEncoder(nn.Module):
-    """Neural network encoder that projects input sequences into a hyperspherical latent space."""
-    def __init__(
-            self,
-            projection_dim: int = 128,
-            sequence_length: int = 60,
-            n_price_features: int = 5,
-            n_indicator_features: int = 7,
-            temperature: float = 0.07,
-            device: torch.device = device
-    ):
+    def __init__(self, projection_dim=128, sequence_length=60, n_price_features=5, n_indicator_features=7, temperature=0.07, device='cuda'):
         super().__init__()
         self.projection_dim = projection_dim
         self.sequence_length = sequence_length
@@ -178,14 +39,12 @@ class HypersphericalEncoder(nn.Module):
         torch.set_grad_enabled(False)
 
     def _init_weights(self):
-        """Initialize weights using Xavier initialization."""
         nn.init.xavier_uniform_(self.projection1.weight)
         nn.init.zeros_(self.projection1.bias)
         nn.init.xavier_uniform_(self.projection2.weight)
         nn.init.zeros_(self.projection2.bias)
 
-    def forward(self, x: torch.Tensor, lengths: Optional[List[int]] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass with mixed precision support."""
+    def forward(self, x, lengths=None):
         with torch.autocast(device_type='cuda', dtype=torch.float16):
             if lengths is not None:
                 packed_features = nn.utils.rnn.pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
@@ -202,22 +61,21 @@ class HypersphericalEncoder(nn.Module):
             return normalized, output
 
     @torch.no_grad()
-    def encode_batch(self, sequences: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Encode a batch of sequences."""
+    def encode_batch(self, sequences):
         sequences = sequences.to(self.device, non_blocking=True)
         return self(sequences)
 
+
+// File: dataset.py
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+import gc
+
 class MarketDataset(Dataset):
-    """Enhanced MarketDataset with timestamp handling and caching."""
-    def __init__(
-        self,
-        data_array: np.ndarray,
-        timestamps: pd.DatetimeIndex,
-        sequence_length: int,
-        price_scaler: Union[StandardScaler, MinMaxScaler],
-        indicator_scaler: Union[StandardScaler, MinMaxScaler],
-        cache_size: int = 1000
-    ):
+    def __init__(self, data_array, timestamps, sequence_length, price_scaler, indicator_scaler, cache_size=1000):
         self.data_array = data_array
         self.timestamps = timestamps
         self.sequence_length = sequence_length
@@ -231,8 +89,7 @@ class MarketDataset(Dataset):
     def __len__(self):
         return self.max_index
 
-    def _process_sequence(self, idx: int) -> Tuple[torch.Tensor, float]:
-        """Process and cache a sequence."""
+    def _process_sequence(self, idx):
         if idx in self.cache:
             return self.cache[idx]
 
@@ -249,238 +106,266 @@ class MarketDataset(Dataset):
         if len(self.cache) >= self.cache_size:
             self.cache.pop(next(iter(self.cache)))
         timestamp = self.timestamps[idx + self.sequence_length - 1]
-        timestamp_float = timestamp.timestamp()  # Convert here as well
-        self.cache[idx] = (tensor_data, timestamp_float)  # Cache the float
+        timestamp_float = timestamp.timestamp()
+        self.cache[idx] = (tensor_data, timestamp_float)
 
-        return tensor_data, timestamp_float  # Return float
+        return tensor_data, timestamp_float
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, float]:
-        """Get item with timestamp as float for DataLoader compatibility."""
+    def __getitem__(self, idx):
         return self._process_sequence(idx)
 
-class MarketVisualizer:
-    """Enhanced MarketVisualizer with optimizations and new features."""
-    def __init__(
-        self,
-        data_path: str = "data/raw/btc_usdt_1m_processed.csv",
-        batch_size: int = 512,
-        sequence_length: int = 64,
-        hidden_size: int = 256,
-        device: torch.device = device,
-        scaling_method: Literal["standard", "minmax"] = "standard",
-        cache_size: int = 1000,
-        use_amp: bool = True
-    ):
-        self.data_path = Path(data_path)
-        self.batch_size = batch_size
-        self.device = device
-        self.sequence_length = sequence_length
-        self.hidden_size = hidden_size
-        self.scaling_method = scaling_method
-        self.use_amp = use_amp
-        # Update GradScaler initialization to use new syntax
-        self.scaler = torch.amp.GradScaler('cuda') if use_amp and torch.cuda.is_available() else None
+def load_and_preprocess_data(data_path, scaling_method='standard'):
+    df = pd.read_csv(
+        data_path,
+        parse_dates=['open_time', 'close_time'],
+        dtype_backend='pyarrow'
+    )
 
-        self._load_and_preprocess_data()
-        
-        # Initialize dataset and dataloader
-        self.dataset = MarketDataset(
-            data_array=self.data_array,
-            timestamps=self.timestamps,
-            sequence_length=self.sequence_length,
-            price_scaler=self.price_scaler,
-            indicator_scaler=self.indicator_scaler,
+    df['timestamp'] = pd.to_datetime(df['open_time'])
+    df.set_index('timestamp', inplace=True)
+    timestamps = df.index
+
+    price_columns = ['open', 'high', 'low', 'close', 'volume']
+    indicator_columns = [
+        'quote_asset_volume', 'number_of_trades',
+        'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume',
+        'macd', 'rsi_14', 'ema_10'
+    ]
+
+    analysis_df = df[price_columns + indicator_columns].copy()
+    data_array = analysis_df.values
+
+    price_scaler = StandardScaler() if scaling_method == "standard" else MinMaxScaler()
+    indicator_scaler = StandardScaler() if scaling_method == "standard" else MinMaxScaler()
+
+    price_data = data_array[:, :len(price_columns)]
+    indicator_data = data_array[:, len(price_columns):]
+
+    price_scaler.fit(np.nan_to_num(price_data))
+    indicator_scaler.fit(np.nan_to_num(indicator_data))
+
+    del df
+    del analysis_df
+    gc.collect()
+
+    return data_array, timestamps, price_columns, indicator_columns, price_scaler, indicator_scaler
+
+
+// File: main.py
+import torch
+from torch.utils.data import DataLoader, Subset
+import numpy as np
+from pathlib import Path
+import logging
+from tqdm.auto import tqdm
+import multiprocessing as mp
+import os
+import sys
+
+from ai_module import HypersphericalEncoder
+from dataset import MarketDataset, load_and_preprocess_data
+from visualization import Visualizer
+
+def setup_logging():
+    logger = logging.getLogger(__name__)
+    if not logger.hasHandlers():
+        logger.setLevel(logging.INFO)
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        file_handler = logging.FileHandler("market_visualizer_optimized.log")
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(stream_handler)
+    return logger
+
+logger = setup_logging()
+
+def get_num_workers():
+    if os.name == 'nt':
+        return min(4, mp.cpu_count())
+    return min(mp.cpu_count(), 8)
+
+NUM_WORKERS = get_num_workers()
+logger.info(f"Using {NUM_WORKERS} workers for data loading")
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+logger.info(f"Using device: {device}")
+
+def main():
+    try:
+        data_path = "data/raw/btc_usdt_1m_processed.csv"
+        batch_size = 512
+        sequence_length = 64
+        hidden_size = 256
+        scaling_method = "minmax"
+        cache_size = 1000
+        use_amp = True
+
+        data_array, timestamps, price_columns, indicator_columns, price_scaler, indicator_scaler = load_and_preprocess_data(data_path, scaling_method)
+
+        dataset = MarketDataset(
+            data_array=data_array,
+            timestamps=timestamps,
+            sequence_length=sequence_length,
+            price_scaler=price_scaler,
+            indicator_scaler=indicator_scaler,
             cache_size=cache_size
         )
 
-        self.dataloader = DataLoader(
-            self.dataset,
-            batch_size=self.batch_size,
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
             shuffle=False,
             num_workers=NUM_WORKERS,
             pin_memory=True if torch.cuda.is_available() else False,
             persistent_workers=True if NUM_WORKERS > 0 else False
         )
 
-        self.encoder = self._initialize_encoder()
-
-    def _load_and_preprocess_data(self):
-        """Load and preprocess market data."""
-        try:
-            logger.info(f"Loading data from {self.data_path}")
-            self.df = pd.read_csv(
-                self.data_path,
-                parse_dates=['open_time', 'close_time'],
-                dtype_backend='pyarrow'
-            )
-            
-            self.df['timestamp'] = pd.to_datetime(self.df['open_time'])
-            self.df.set_index('timestamp', inplace=True)
-            self.timestamps = self.df.index
-
-            self.price_columns = ['open', 'high', 'low', 'close', 'volume']
-            self.indicator_columns = [
-                'quote_asset_volume', 'number_of_trades',
-                'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume',
-                'macd', 'rsi_14', 'ema_10'
-            ]
-
-            self.analysis_df = self.df[self.price_columns + self.indicator_columns].copy()
-            self.data_array = self.analysis_df.values
-
-            # Initialize and fit scalers
-            self.price_scaler = StandardScaler() if self.scaling_method == "standard" else MinMaxScaler()
-            self.indicator_scaler = StandardScaler() if self.scaling_method == "standard" else MinMaxScaler()
-            
-            price_data = self.data_array[:, :len(self.price_columns)]
-            indicator_data = self.data_array[:, len(self.price_columns):]
-            
-            self.price_scaler.fit(np.nan_to_num(price_data))
-            self.indicator_scaler.fit(np.nan_to_num(indicator_data))
-
-            del self.df
-            del self.analysis_df
-            gc.collect()
-
-        except Exception as e:
-            logger.error(f"Error in data loading: {str(e)}")
-            raise
-
-    def _initialize_encoder(self) -> HypersphericalEncoder:
-        """Initialize the encoder model."""
-        return HypersphericalEncoder(
-            projection_dim=self.hidden_size,
-            sequence_length=self.sequence_length,
-            n_price_features=len(self.price_columns),
-            n_indicator_features=len(self.indicator_columns),
-            device=self.device
+        encoder = HypersphericalEncoder(
+            projection_dim=hidden_size,
+            sequence_length=sequence_length,
+            n_price_features=len(price_columns),
+            n_indicator_features=len(indicator_columns),
+            device=device
         )
 
-    def _reduce_dimensions(
-        self,
-        encoded_states: np.ndarray,
-        method: str = 'pca',
-        perplexity: int = 50
-    ) -> np.ndarray:
-        """Perform dimensionality reduction with improved error handling."""
-        try:
-            if method == 'pca':
-                reducer = PCA(n_components=3, random_state=42)
-            elif method == 'tsne':
-                # Modified t-SNE parameters for better Windows compatibility
-                reducer = TSNE(
-                    n_components=3,
-                    perplexity=min(perplexity, len(encoded_states) - 1),  # Ensure perplexity is valid
-                    n_jobs=1,  # Force single-threaded to avoid Windows issues
-                    random_state=42,
-                    init='pca',  # Use PCA initialization for better stability
-                    method='barnes_hut'  # More efficient algorithm
-                )
+        available_sequences = len(dataset)
+        n_samples = 10000
+        max_samples = min(n_samples, available_sequences)
+
+        np.random.seed(42)
+        indices = np.random.choice(dataset.max_index, size=max_samples, replace=False)
+
+        subset_dataset = Subset(dataset, indices)
+        subset_dataloader = DataLoader(
+            subset_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=True if torch.cuda.is_available() else False
+        )
+
+        encoded_states = []
+        timestamps_list = []
+
+        for batch_sequences, batch_timestamps in tqdm(subset_dataloader, desc="Encoding sequences"):
+            if use_amp and torch.cuda.is_available():
+                with torch.amp.autocast('cuda'):
+                    batch_encoded, _ = encoder.encode_batch(batch_sequences)
             else:
-                raise ValueError(f"Unsupported projection method: {method}")
+                batch_encoded, _ = encoder.encode_batch(batch_sequences)
 
-            return reducer.fit_transform(encoded_states)
-        except Exception as e:
-            logger.error(f"Dimension reduction failed: {str(e)}")
-            # Fallback to PCA if t-SNE fails
-            if method == 'tsne':
-                logger.info("Falling back to PCA due to t-SNE failure")
-                return self._reduce_dimensions(encoded_states, method='pca')
-            raise
+            encoded_states.append(batch_encoded.cpu().numpy())
+            timestamps_list.extend(batch_timestamps.tolist())
 
-    def visualize_hypersphere(
-        self,
-        n_samples: int = 10000,
-        projection_method: str = 'pca',
-        perplexity: int = 50,
-        color_feature: str = 'macd',
-        hover_features: Optional[List[str]] = None,
-        save_encoded: bool = True,
-        encoded_save_path: str = "data/encoded_hypersphere.npy",
-        create_subplots: bool = True
-    ) -> Union[Figure, None]:
-        """Generate market state visualization with improved error handling."""
-        try:
-            available_sequences = len(self.dataset)
-            max_samples = min(n_samples, available_sequences)
-            
-            np.random.seed(42)
-            indices = np.random.choice(self.dataset.max_index, size=max_samples, replace=False)
-            
-            subset_dataset = Subset(self.dataset, indices)
-            subset_dataloader = DataLoader(
-                subset_dataset,
-                batch_size=self.batch_size,
-                shuffle=False,
-                num_workers=0,  # Force single worker for encoding
-                pin_memory=True if torch.cuda.is_available() else False
+        all_encoded = np.vstack(encoded_states)
+
+        save_encoded = True
+        encoded_save_path = "data/encoded_hypersphere.npy"
+        if save_encoded:
+            save_path = Path(encoded_save_path)
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            np.save(save_path, all_encoded)
+            logger.info(f"Encoded data saved to {save_path}")
+
+        visualizer = Visualizer(
+            data_array=data_array,
+            timestamps=timestamps,
+            price_columns=price_columns,
+            indicator_columns=indicator_columns,
+            sequence_length=sequence_length
+        )
+
+        output_dir = Path("visualizations")
+        output_dir.mkdir(exist_ok=True)
+        logger.info(f"Output directory: {output_dir.resolve()}")
+
+        with tqdm(total=2, desc="Generating visualizations") as pbar:
+            fig_tsne = visualizer.visualize(
+                encoded_states=all_encoded,
+                timestamps=timestamps_list,
+                indices=indices,
+                color_feature="close",
+                hover_features=['open', 'high', 'low', 'volume'],
+                projection_method='tsne',
+                create_subplots=True
             )
 
-            encoded_states = []
-            timestamps = []
-            
-            for batch_sequences, batch_timestamps in tqdm(subset_dataloader, desc="Encoding sequences"):
-                if self.use_amp and torch.cuda.is_available():
-                    # Update to new autocast syntax
-                    with torch.amp.autocast('cuda'):
-                        batch_encoded, _ = self.encoder.encode_batch(batch_sequences)
-                else:
-                    batch_encoded, _ = self.encoder.encode_batch(batch_sequences)
-                    
-                encoded_states.append(batch_encoded.cpu().numpy())
-                timestamps.extend(batch_timestamps.tolist())
+            if fig_tsne:
+                output_path_tsne = output_dir / "market_visualization_tsne.html"
+                fig_tsne.write_html(output_path_tsne)
+                logger.info(f"t-SNE visualization saved at {output_path_tsne.resolve()}")
+            pbar.update(1)
 
-            all_encoded = np.vstack(encoded_states)
-            
-            if save_encoded:
-                save_path = Path(encoded_save_path)
-                save_path.parent.mkdir(parents=True, exist_ok=True)
-                np.save(save_path, all_encoded)
-                logger.info(f"Encoded data saved to {save_path}")
+            fig_pca = visualizer.visualize(
+                encoded_states=all_encoded,
+                timestamps=timestamps_list,
+                indices=indices,
+                color_feature='rsi_14',
+                hover_features=price_columns + indicator_columns,
+                projection_method='pca',
+                create_subplots=True
+            )
 
-            # Add error handling for dimension reduction
-            try:
-                reduced_states = self._reduce_dimensions(all_encoded, projection_method, perplexity)
-            except Exception as e:
-                logger.error(f"Dimension reduction failed: {str(e)}")
-                if projection_method == 'tsne':
-                    logger.info("Falling back to PCA visualization")
-                    reduced_states = self._reduce_dimensions(all_encoded, 'pca')
-                else:
-                    raise
+            if fig_pca:
+                output_path_pca = output_dir / "market_visualization_pca.html"
+                fig_pca.write_html(output_path_pca)
+                logger.info(f"PCA visualization saved at {output_path_pca.resolve()}")
+            pbar.update(1)
 
-            timestamps = [datetime.fromtimestamp(ts) for ts in timestamps]
+    except Exception as e:
+        logger.exception("Error in main execution")
+        print(f"An error occurred: {e}")
+        sys.exit(1)
 
-            if create_subplots:
-                return self._create_subplot_visualization(
-                    reduced_states,
-                    timestamps,
-                    indices,
-                    color_feature,
-                    hover_features
-                )
-            else:
-                return self._create_single_visualization(
-                    reduced_states,
-                    timestamps,
-                    indices,
-                    color_feature,
-                    hover_features
-                )
+if __name__ == "__main__":
+    main()
 
-        except Exception as e:
-            logger.error(f"Error in visualization: {str(e)}")
-            raise
 
-    def _create_subplot_visualization(
-        self,
-        reduced_states: np.ndarray,
-        timestamps: List[datetime],
-        indices: np.ndarray,
-        color_feature: str,
-        hover_features: Optional[List[str]]
-    ) -> Figure:
-        """Create visualization with multiple views."""
+// File: visualization.py
+import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from datetime import datetime
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+
+class Visualizer:
+    def __init__(self, data_array, timestamps, price_columns, indicator_columns, sequence_length):
+        self.data_array = data_array
+        self.timestamps = timestamps
+        self.price_columns = price_columns
+        self.indicator_columns = indicator_columns
+        self.sequence_length = sequence_length
+
+    def _reduce_dimensions(self, encoded_states, method='pca', perplexity=50):
+        if method == 'pca':
+            reducer = PCA(n_components=3, random_state=42)
+        elif method == 'tsne':
+            reducer = TSNE(
+                n_components=3,
+                perplexity=min(perplexity, len(encoded_states) - 1),
+                n_jobs=1,
+                random_state=42,
+                init='pca',
+                method='barnes_hut'
+            )
+        else:
+            raise ValueError(f"Unsupported projection method: {method}")
+
+        return reducer.fit_transform(encoded_states)
+
+    def visualize(self, encoded_states, timestamps, indices, color_feature='macd', hover_features=None, projection_method='pca', create_subplots=True):
+        reduced_states = self._reduce_dimensions(encoded_states, method=projection_method)
+        timestamps = [datetime.fromtimestamp(ts) for ts in timestamps]
+
+        if create_subplots:
+            return self._create_subplot_visualization(reduced_states, timestamps, indices, color_feature, hover_features)
+        else:
+            return self._create_single_visualization(reduced_states, timestamps, indices, color_feature, hover_features)
+
+    def _create_subplot_visualization(self, reduced_states, timestamps, indices, color_feature, hover_features):
         fig = make_subplots(
             rows=2, cols=2,
             subplot_titles=(
@@ -490,14 +375,12 @@ class MarketVisualizer:
                 'Side View (YZ)'
             ),
             specs=[[{'type': 'scatter3d'}, {'type': 'scatter'}],
-                  [{'type': 'scatter'}, {'type': 'scatter'}]]
+                   [{'type': 'scatter'}, {'type': 'scatter'}]]
         )
 
-        # Prepare color and hover data
         color_data = self._get_feature_values(color_feature, indices)
         hover_data = self._prepare_hover_data(hover_features, timestamps, indices)
 
-        # 3D plot
         fig.add_trace(
             go.Scatter3d(
                 x=reduced_states[:, 0],
@@ -516,11 +399,10 @@ class MarketVisualizer:
             row=1, col=1
         )
 
-        # 2D projections
         projections = [
-            (0, 1, 1, 2),  # Top view (XY)
-            (0, 2, 2, 1),  # Front view (XZ)
-            (1, 2, 2, 2)   # Side view (YZ)
+            (0, 1, 1, 2),
+            (0, 2, 2, 1),
+            (1, 2, 2, 2)
         ]
 
         for x_idx, y_idx, row, col in projections:
@@ -541,9 +423,8 @@ class MarketVisualizer:
                 row=row, col=col
             )
 
-        # Update layout
         fig.update_layout(
-            title=f'Market State Visualization - Multiple Views',
+            title='Market State Visualization - Multiple Views',
             showlegend=False,
             height=800,
             width=1200,
@@ -553,15 +434,7 @@ class MarketVisualizer:
 
         return fig
 
-    def _create_single_visualization(
-        self,
-        reduced_states: np.ndarray,
-        timestamps: List[datetime],
-        indices: np.ndarray,
-        color_feature: str,
-        hover_features: Optional[List[str]]
-    ) -> Figure:
-        """Create a single 3D visualization."""
+    def _create_single_visualization(self, reduced_states, timestamps, indices, color_feature, hover_features):
         color_data = self._get_feature_values(color_feature, indices)
         hover_data = self._prepare_hover_data(hover_features, timestamps, indices)
 
@@ -598,37 +471,29 @@ class MarketVisualizer:
 
         return fig
 
-    def _get_feature_values(self, feature: str, indices: np.ndarray) -> np.ndarray:
-        """Get feature values for coloring."""
+    def _get_feature_values(self, feature, indices):
         feature_idx = self._get_feature_index(feature)
         return self.data_array[indices + self.sequence_length - 1, feature_idx]
 
-    def _prepare_hover_data(
-        self,
-        hover_features: Optional[List[str]],
-        timestamps: List[datetime],
-        indices: np.ndarray
-    ) -> List[str]:
-        """Prepare hover data text."""
+    def _prepare_hover_data(self, hover_features, timestamps, indices):
         hover_text = []
-        
+
         if hover_features is None:
             hover_features = []
 
         for i, ts in enumerate(timestamps):
             text_parts = [f"Time: {ts.strftime('%Y-%m-%d %H:%M:%S')}"]
-            
+
             for feature in hover_features:
                 feature_idx = self._get_feature_index(feature)
                 value = self.data_array[indices[i] + self.sequence_length - 1, feature_idx]
                 text_parts.append(f"{feature}: {value:.2f}")
-                
+
             hover_text.append("<br>".join(text_parts))
 
         return hover_text
 
-    def _get_feature_index(self, feature: str) -> int:
-        """Get the index of a feature in the data array."""
+    def _get_feature_index(self, feature):
         if feature in self.price_columns:
             return self.price_columns.index(feature)
         elif feature in self.indicator_columns:

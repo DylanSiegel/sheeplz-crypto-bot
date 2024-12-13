@@ -1,3 +1,4 @@
+
 # n-LNN: A Deep Reinforcement Learning Platform for Trading BTC/USDT Derivatives Futures
 
 This repository contains the code for n-LNN, a deep reinforcement learning (DRL) platform designed for automated trading of Bitcoin/USDT perpetual futures contracts. n-LNN utilizes a novel recurrent neural network architecture with unique properties to handle the complex and volatile nature of the cryptocurrency derivatives market.
