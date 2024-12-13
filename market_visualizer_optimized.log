@@ -1,4 +1,0 @@
-2024-11-09 19:25:12,598 - INFO - Encoded data saved to data\encoded_hypersphere.npy
-2024-11-09 19:25:12,599 - INFO - Output directory: C:\Users\dylan\Desktop\sheeplz-crypto-bot\visualizations
-2024-11-09 19:25:45,836 - INFO - t-SNE visualization saved at C:\Users\dylan\Desktop\sheeplz-crypto-bot\visualizations\market_visualization_tsne.html
-2024-11-09 19:25:46,345 - INFO - PCA visualization saved at C:\Users\dylan\Desktop\sheeplz-crypto-bot\visualizations\market_visualization_pca.html
