@@ -11,38 +11,73 @@ import numpy as np
 import random
 import unittest
 import os
+import logging
+from dataclasses import dataclass
+from typing import Optional, Tuple, List, Dict, Any
+from torch.utils.tensorboard import SummaryWriter
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Detect device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+@dataclass
+class MetaSACConfig:
+    """Configuration for MetaSAC agent and networks."""
+    state_dim: int
+    action_dim: int
+    hidden_dim: int = 64
+    attention_dim: int = 32
+    meta_input_dim: int = 5
+    time_encoding_dim: int = 10
+    num_mlp_layers: int = 3
+    dropout_rate: float = 0.1
+    lr: float = 1e-3
+    meta_lr: float = 1e-4
+    alpha: float = 0.2
+    gamma: float = 0.99
+    tau: float = 0.005
+    batch_size: int = 64 # Changed to 64 to be consistent with test
+    max_grad_norm: float = 1.0
+    epsilon: float = 1e-10
+    device: torch.device = device
+    replay_buffer_capacity: int = 1000000
+
+
 # ------------------------- Helper Classes -------------------------
 class APELU(nn.Module):
-    def __init__(self, alpha_init=0.01, beta_init=1.0):
-        super(APELU, self).__init__()
+    """Advanced Parametric Exponential Linear Unit activation."""
+    def __init__(self, alpha_init: float = 0.01, beta_init: float = 1.0):
+        super().__init__()
         self.alpha = nn.Parameter(torch.tensor(alpha_init))
         self.beta = nn.Parameter(torch.tensor(beta_init))
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.where(x >= 0, x, self.alpha * x * torch.exp(self.beta * x))
 
 
 # ------------------------- Modern MLP -------------------------
 class ModernMLP(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, num_layers=3, dropout_rate=0.1):
-        super(ModernMLP, self).__init__()
+    """Modern Multi-Layer Perceptron with layer normalization and dropout."""
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, 
+                 num_layers: int = 3, dropout_rate: float = 0.1):
+        super().__init__()
         self.layers = nn.ModuleList()
         self.norms = nn.ModuleList()
-
+        
         for i in range(num_layers):
             in_features = input_dim if i == 0 else hidden_dim
             out_features = output_dim if i == num_layers - 1 else hidden_dim
             self.layers.append(nn.Linear(in_features, out_features))
             if i != num_layers - 1:
                 self.norms.append(nn.LayerNorm(hidden_dim))
+        
         self.activation = APELU()
         self.dropout = nn.Dropout(dropout_rate)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         for i, layer in enumerate(self.layers):
             x = layer(x)
             if i != len(self.layers) - 1:
@@ -50,31 +85,53 @@ class ModernMLP(nn.Module):
                 x = self.activation(x)
                 x = self.dropout(x)
         return x
+        
+# ------------------------- Time Encoding -------------------------
+class SinusoidalTimeEncoding(nn.Module):
+    """Sinusoidal positional encoding for time."""
+    def __init__(self, time_encoding_dim: int):
+        super().__init__()
+        self.time_encoding_dim = time_encoding_dim
+        self.frequencies = 10 ** (torch.arange(0, time_encoding_dim // 2) * (-2 / (time_encoding_dim // 2)))
 
+    def forward(self, time_step: torch.Tensor) -> torch.Tensor:
+        time_step = time_step.float()  # Cast to float
+        scaled_time = time_step.unsqueeze(-1) * self.frequencies.to(time_step.device)
+        sin_encodings = torch.sin(scaled_time)
+        cos_encodings = torch.cos(scaled_time)
+
+        if self.time_encoding_dim % 2 == 0:
+          encoding = torch.cat([sin_encodings, cos_encodings], dim=-1)
+        else:
+          encoding = torch.cat([sin_encodings, cos_encodings, torch.zeros_like(cos_encodings[:, :1])], dim=-1)
+
+        return encoding
 
 # ------------------------- Adaptive Modulation MLP -------------------------
 class TimeAwareBias(nn.Module):
-    def __init__(self, input_dim, time_encoding_dim=10, hidden_dim=20):
+    """Time-aware bias module for temporal adaptation."""
+    def __init__(self, input_dim: int, time_encoding_dim: int = 10, hidden_dim: int = 20):
         super().__init__()
         self.time_embedding = nn.Linear(time_encoding_dim, hidden_dim)
         self.time_projection = nn.Linear(hidden_dim, input_dim)
         self.activation = APELU()
 
-    def forward(self, time_encoding):
+    def forward(self, time_encoding: torch.Tensor) -> torch.Tensor:
         x = self.time_embedding(time_encoding)
         x = self.activation(x)
-        x = self.time_projection(x)
-        return x  # [batch_size, input_dim]
+        return self.time_projection(x)
 
 
 class AdaptiveModulationMLP(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, num_layers=3, dropout_rate=0.1, time_encoding_dim=10):
-        super(AdaptiveModulationMLP, self).__init__()
+    """MLP with adaptive modulation based on time encoding."""
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int,
+                 num_layers: int = 3, dropout_rate: float = 0.1, time_encoding_dim: int = 10):
+        super().__init__()
         self.layers = nn.ModuleList()
         self.norms = nn.ModuleList()
         self.modulations = nn.ParameterList()
         self.time_biases = nn.ModuleList()
-
+        self.sinusoidal_encoding = SinusoidalTimeEncoding(time_encoding_dim)
         for i in range(num_layers):
             in_features = input_dim if i == 0 else hidden_dim
             out_features = output_dim if i == num_layers - 1 else hidden_dim
@@ -83,11 +140,13 @@ class AdaptiveModulationMLP(nn.Module):
                 self.norms.append(nn.LayerNorm(hidden_dim))
                 self.modulations.append(nn.Parameter(torch.ones(hidden_dim)))
                 self.time_biases.append(TimeAwareBias(hidden_dim, time_encoding_dim))
+        
         self.activation = APELU()
         self.dropout = nn.Dropout(dropout_rate)
         self.num_layers = num_layers
 
-    def forward(self, x, time_encoding):
+    def forward(self, x: torch.Tensor, time_step: torch.Tensor) -> torch.Tensor:
+        time_encoding = self.sinusoidal_encoding(time_step)
         for i, layer in enumerate(self.layers):
             x = layer(x)
             if i != self.num_layers - 1:
@@ -101,810 +160,910 @@ class AdaptiveModulationMLP(nn.Module):
 
 # ------------------------- Attention Mechanism -------------------------
 class Attention(nn.Module):
-    def __init__(self, input_dim, attention_dim):
+    """Multi-head attention mechanism."""
+    def __init__(self, input_dim: int, attention_dim: int):
         super().__init__()
         self.query_proj = nn.Linear(input_dim, attention_dim)
         self.key_proj = nn.Linear(input_dim, attention_dim)
         self.value_proj = nn.Linear(input_dim, attention_dim)
         self.out_proj = nn.Linear(attention_dim, input_dim)
+        
+        # Initialize parameters with Xavier/Glorot initialization
+        nn.init.xavier_uniform_(self.query_proj.weight)
+        nn.init.xavier_uniform_(self.key_proj.weight)
+        nn.init.xavier_uniform_(self.value_proj.weight)
+        nn.init.xavier_uniform_(self.out_proj.weight)
 
-    def forward(self, input):
-        # input shape expected: [batch, seq_len, input_dim]
-        # If seq_len = 1, shapes are [batch, 1, input_dim]
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        # [batch, seq_len, input_dim] -> [batch, seq_len, attention_dim]
         query = self.query_proj(input)
         key = self.key_proj(input)
         value = self.value_proj(input)
 
-        # Attention calculation
-        scores = torch.matmul(query, key.transpose(-2, -1))
-        attention_weights = F.softmax(scores / (input.shape[-1]**0.5), dim=-1)
+        # Scaled dot-product attention
+        attention_weights = F.softmax(
+            torch.matmul(query, key.transpose(-2, -1)) / (query.size(-1) ** 0.5),
+            dim=-1
+        )
+        
+        # Apply attention and project back
         context_vector = torch.matmul(attention_weights, value)
-        output = self.out_proj(context_vector)
-        return output
+        return self.out_proj(context_vector)
 
 
 # ------------------------- SAC Actor Network -------------------------
 class MetaSACActor(nn.Module):
-    def __init__(self, input_dim, action_dim, hidden_dim, attention_dim, num_mlp_layers=3, dropout_rate=0.1, time_encoding_dim=10):
-        super(MetaSACActor, self).__init__()
-        self.attention = Attention(input_dim, attention_dim)
-        self.mlp = AdaptiveModulationMLP(input_dim, hidden_dim, 2*action_dim, num_mlp_layers, dropout_rate, time_encoding_dim)
-        self.action_dim = action_dim
+    """Meta Soft Actor-Critic actor network with attention."""
+    def __init__(self, config: MetaSACConfig):
+        super().__init__()
+        self.attention = Attention(config.state_dim, config.attention_dim)
+        self.mlp = AdaptiveModulationMLP(
+            config.state_dim, 
+            config.hidden_dim,
+            2 * config.action_dim,
+            config.num_mlp_layers,
+            config.dropout_rate,
+            config.time_encoding_dim
+        )
+        self.action_dim = config.action_dim
 
-    def forward(self, x, time_encoding):
-        # Ensure x is [batch, seq_len, dim] for attention
+    def forward(self, x: torch.Tensor, time_step: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if x.dim() == 2:
             x = x.unsqueeze(1)
-        x = self.attention(x)  # [batch, 1, input_dim]
-        x = x.squeeze(1)       # [batch, input_dim]
-        x = self.mlp(x, time_encoding)
+        x = self.attention(x)
+        x = x.squeeze(1)
+        x = self.mlp(x, time_step)
+        
         mu, log_sigma = x[:, :self.action_dim], x[:, self.action_dim:]
-        # Check for NaN in mu or log_sigma
+        
+        # Add checks for NaN values
         if torch.isnan(mu).any() or torch.isnan(log_sigma).any():
-            print("Warning: NaN detected in actor output (mu or log_sigma).")
+            logger.warning("NaN detected in actor output (mu or log_sigma)")
+            mu = torch.nan_to_num(mu)
+            log_sigma = torch.nan_to_num(log_sigma)
+            
         return torch.tanh(mu), log_sigma
 
 
 # ------------------------- SAC Critic Network -------------------------
 class MetaSACCritic(nn.Module):
-    def __init__(self, input_dim, action_dim, hidden_dim, attention_dim, num_mlp_layers=3, dropout_rate=0.1, time_encoding_dim=10):
-        super(MetaSACCritic, self).__init__()
-        self.attention = Attention(input_dim + action_dim, attention_dim)
-        self.mlp = AdaptiveModulationMLP(input_dim + action_dim, hidden_dim, 1, num_mlp_layers, dropout_rate, time_encoding_dim)
-        self.action_dim = action_dim
+    """Meta Soft Actor-Critic critic network with attention."""
+    def __init__(self, config: MetaSACConfig):
+        super().__init__()
+        combined_dim = config.state_dim + config.action_dim
+        self.attention = Attention(combined_dim, config.attention_dim)
+        self.mlp = AdaptiveModulationMLP(
+            combined_dim,
+            config.hidden_dim,
+            1,
+            config.num_mlp_layers,
+            config.dropout_rate,
+            config.time_encoding_dim
+        )
 
-    def forward(self, state, action, time_encoding):
+    def forward(self, state: torch.Tensor, action: torch.Tensor, time_step: torch.Tensor) -> torch.Tensor:
         x = torch.cat([state, action], dim=-1)
-        # Ensure shape for attention
         if x.dim() == 2:
             x = x.unsqueeze(1)
         x = self.attention(x)
         x = x.squeeze(1)
-        q_value = self.mlp(x, time_encoding)
-        return q_value
+        return self.mlp(x, time_step)
 
 
 # ------------------------- Meta Controller -------------------------
 class MetaController(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, num_mlp_layers=3, dropout_rate=0.1):
+    """Meta-controller for adaptive temperature parameter."""
+    def __init__(self, config: MetaSACConfig):
         super().__init__()
-        self.mlp = ModernMLP(input_dim, hidden_dim, output_dim, num_mlp_layers, dropout_rate)
+        self.mlp = ModernMLP(
+            config.meta_input_dim + 2, # Added 2 for mean and variance
+            config.hidden_dim,
+            1,
+            config.num_mlp_layers,
+            config.dropout_rate
+        )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor, reward_stats: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([x, reward_stats], dim=-1)
         return self.mlp(x)
+
+
+# ------------------------- Replay Buffer -------------------------
+class ReplayBuffer:
+    """Experience replay buffer with prioritized sampling."""
+    def __init__(self, capacity: int):
+        self.capacity = capacity
+        self.buffer: List[Tuple] = []
+        self.position = 0
+        self.priorities = np.zeros(capacity, dtype=np.float32)
+        self.alpha = 0.6  # Priority exponent
+        self.beta = 0.4   # Importance sampling exponent
+        self.epsilon = 1e-6  # Small constant to prevent zero priorities
+
+    def push(self, state: np.ndarray, action: np.ndarray, reward: float,
+             next_state: np.ndarray, done: bool) -> None:
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(None)
+        self.buffer[self.position] = (state, action, reward, next_state, done)
+        self.priorities[self.position] = max(self.priorities.max(), self.epsilon)
+        self.position = (self.position + 1) % self.capacity
+
+    def sample(self, batch_size: int) -> Tuple[List, np.ndarray, np.ndarray]:
+        if len(self.buffer) < batch_size:
+            raise ValueError("Not enough experiences in buffer")
+            
+        probs = self.priorities[:len(self.buffer)] ** self.alpha
+        probs /= probs.sum()
+        
+        indices = np.random.choice(len(self.buffer), batch_size, p=probs)
+        weights = (len(self.buffer) * probs[indices]) ** (-self.beta)
+        weights /= weights.max()
+        
+        batch = [self.buffer[idx] for idx in indices]
+        return batch, indices, weights
+
+    def update_priorities(self, indices: np.ndarray, priorities: np.ndarray) -> None:
+        self.priorities[indices] = priorities + self.epsilon
+
+    def __len__(self) -> int:
+        return len(self.buffer)
 
 
 # ------------------------- Meta-SAC Agent -------------------------
 class MetaSACAgent(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim, attention_dim, meta_input_dim, time_encoding_dim=10, num_mlp_layers=3, dropout_rate=0.1, lr=1e-3, alpha=0.2, gamma=0.99, tau=0.005, meta_lr=1e-4, device=device):
+    """Meta Soft Actor-Critic agent."""
+    def __init__(self, config: MetaSACConfig):
         super().__init__()
-        self.device = device
-        self.state_dim = state_dim
-        # Adjust action_dim to match state_dim for compatibility in tests:
-        self.action_dim = state_dim
-        self.gamma = gamma
-        self.tau = tau
-        self.alpha = nn.Parameter(torch.tensor(alpha, device=device))
-        self.target_entropy = -torch.prod(torch.tensor(self.action_dim).float()).to(device)
-        self.time_encoding_dim = time_encoding_dim
-
-        self.actor = MetaSACActor(state_dim, self.action_dim, hidden_dim, attention_dim, num_mlp_layers, dropout_rate, time_encoding_dim).to(device)
-        self.critic1 = MetaSACCritic(state_dim, self.action_dim, hidden_dim, attention_dim, num_mlp_layers, dropout_rate, time_encoding_dim).to(device)
-        self.critic2 = MetaSACCritic(state_dim, self.action_dim, hidden_dim, attention_dim, num_mlp_layers, dropout_rate, time_encoding_dim).to(device)
-        self.critic_target1 = MetaSACCritic(state_dim, self.action_dim, hidden_dim, attention_dim, num_mlp_layers, dropout_rate, time_encoding_dim).to(device)
-        self.critic_target2 = MetaSACCritic(state_dim, self.action_dim, hidden_dim, attention_dim, num_mlp_layers, dropout_rate, time_encoding_dim).to(device)
-
+        self.config = config
+        self.device = config.device
+        
+        # Initialize networks
+        self.actor = MetaSACActor(config).to(device)
+        self.critic1 = MetaSACCritic(config).to(device)
+        self.critic2 = MetaSACCritic(config).to(device)
+        self.critic_target1 = MetaSACCritic(config).to(device)
+        self.critic_target2 = MetaSACCritic(config).to(device)
+        
+        # Copy weights
         self.critic_target1.load_state_dict(self.critic1.state_dict())
         self.critic_target2.load_state_dict(self.critic2.state_dict())
+        
+        # Initialize meta-controller
+        self.meta_controller = MetaController(config).to(device)
+        
+        # Setup optimizers with gradient clipping
+        self.setup_optimizers()
+        
+        # Initialize alpha parameter
+        self.alpha = nn.Parameter(torch.tensor(config.alpha, device=device))
+        self.target_entropy = -torch.prod(torch.tensor(config.action_dim).float()).to(device)
+        
+        # Setup tensorboard writer
+        self.writer = SummaryWriter()
+        self.train_steps = 0
+        self.reward_history = []
 
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=lr)
-        self.critic1_optimizer = optim.Adam(self.critic1.parameters(), lr=lr)
-        self.critic2_optimizer = optim.Adam(self.critic2.parameters(), lr=lr)
+    def setup_optimizers(self) -> None:
+        """Initialize optimizers with learning rate schedulers."""
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=self.config.lr)
+        self.critic1_optimizer = optim.Adam(self.critic1.parameters(), lr=self.config.lr)
+        self.critic2_optimizer = optim.Adam(self.critic2.parameters(), lr=self.config.lr)
+        self.meta_optimizer = optim.Adam(self.meta_controller.parameters(), lr=self.config.meta_lr)
+        
+        # Learning rate schedulers
+        self.actor_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.actor_optimizer, mode='min', factor=0.5, patience=5
+        )
+        self.critic1_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.critic1_optimizer, mode='min', factor=0.5, patience=5
+        )
+        self.critic2_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.critic2_optimizer, mode='min', factor=0.5, patience=5
+        )
 
-        self.meta_input_dim = meta_input_dim
-        self.meta_controller = MetaController(meta_input_dim, hidden_dim, 1, num_mlp_layers, dropout_rate).to(device)
-        self.meta_optimizer = optim.Adam(self.meta_controller.parameters(), lr=meta_lr)
-
-        self.to(device)
-
-    def select_action(self, state, time_encoding, eval=False):
-        # Handle NaN inputs for testing:
+    def select_action(self, state: np.ndarray, time_step: int, eval: bool = False) -> np.ndarray:
+        """
+        Select an action given the current state and time encoding.
+        
+        Args:
+            state: Current state observation
+            time_step: Current time step 
+            eval: If True, use deterministic action selection
+            
+        Returns:
+            Selected action
+        """
+        # Input validation
+        if state.shape[-1] != self.config.state_dim:
+            raise ValueError(f"Expected state dimension {self.config.state_dim}, got {state.shape[-1]}")
+           
+        # Handle NaN inputs
         if np.isnan(state).any():
+            logger.warning("NaN detected in state input, replacing with zeros")
             state = np.nan_to_num(state)
-        if np.isnan(time_encoding).any():
-            time_encoding = np.nan_to_num(time_encoding)
+           
+        self.actor.eval() if eval else self.actor.train()
+        
+        with torch.no_grad():
+            # Convert to tensors and move to device
+            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            time_tensor = torch.tensor(time_step).unsqueeze(0).to(self.device)
 
-        if eval:
-            self.actor.eval()
-        else:
-            self.actor.train()
+            mu, log_sigma = self.actor(state_tensor, time_tensor)
+            
+            if eval:
+                action = mu
+            else:
+                sigma = torch.exp(log_sigma)
+                dist = torch.distributions.Normal(mu, sigma)
+                action = torch.tanh(dist.rsample())
 
-        state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-        time_encoding = torch.FloatTensor(time_encoding).unsqueeze(0).to(self.device)
+            # Ensure actions are within bounds
+            action = torch.clamp(action, -1.0, 1.0)
+            return action.cpu().numpy()[0]
 
-        mu, log_sigma = self.actor(state, time_encoding)
+    def compute_q_targets(self, rewards: torch.Tensor, next_states: torch.Tensor, 
+                            time_steps: torch.Tensor, dones: torch.Tensor) -> torch.Tensor:
+        """
+        Compute Q-value targets for critic update.
+        
+        Args:
+            rewards: Batch of rewards
+            next_states: Batch of next states
+            time_steps: Batch of time steps
+            dones: Batch of done flags
+            
+        Returns:
+            Q-value targets
+        """
+        with torch.no_grad():
+            next_actions = []
+            next_log_probs = []
+            
+            # Process each state individually to avoid memory issues
+            for ns, ts in zip(next_states, time_steps):
+                action = self.select_action(ns.cpu().numpy(), ts.item(), eval=False)
+                next_actions.append(action)
+                
+                # Compute log prob for the selected action
+                mu, log_sigma = self.actor(ns.unsqueeze(0), ts.unsqueeze(0))
+                sigma = torch.exp(log_sigma)
+                dist = torch.distributions.Normal(mu, sigma)
+                z = dist.rsample()
+                action_tensor = torch.tanh(z)
+                log_prob = dist.log_prob(z) - torch.log(1 - action_tensor.pow(2) + self.config.epsilon)
+                next_log_probs.append(log_prob.sum(-1))
+
+            next_actions = torch.FloatTensor(np.stack(next_actions)).to(self.device)
+            next_log_probs = torch.stack(next_log_probs).unsqueeze(-1).to(self.device) # added unsqueeze to make the shape [batch_size,1]
+
+            # Compute target Q-values
+            q_target1 = self.critic_target1(next_states, next_actions, time_steps)
+            q_target2 = self.critic_target2(next_states, next_actions, time_steps)
+            q_target = torch.min(q_target1, q_target2)
+            
+            # Final target computation
+            return rewards + (1.0 - dones) * self.config.gamma * (q_target - self.alpha * next_log_probs)
+
+    def update_critics(self, states: torch.Tensor, actions: torch.Tensor, 
+                      time_steps: torch.Tensor, q_targets: torch.Tensor) -> Tuple[float, float]:
+        """
+        Update critic networks.
+        
+        Returns:
+            Tuple of critic losses
+        """
+        # Compute current Q-values
+        q_value1 = self.critic1(states, actions, time_steps)
+        q_value2 = self.critic2(states, actions, time_steps)
+
+        # Compute critic losses
+        critic1_loss = F.mse_loss(q_value1, q_targets)
+        critic2_loss = F.mse_loss(q_value2, q_targets)
+
+        # Update critic 1
+        self.critic1_optimizer.zero_grad()
+        critic1_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic1.parameters(), self.config.max_grad_norm)
+        self.critic1_optimizer.step()
+
+        # Update critic 2
+        self.critic2_optimizer.zero_grad()
+        critic2_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic2.parameters(), self.config.max_grad_norm)
+        self.critic2_optimizer.step()
+
+        return critic1_loss.item(), critic2_loss.item()
+
+    def update_actor(self, states: torch.Tensor, time_steps: torch.Tensor) -> float:
+        """
+        Update actor network.
+        
+        Returns:
+            Actor loss value
+        """
+        mu, log_sigma = self.actor(states, time_steps)
         sigma = torch.exp(log_sigma)
-
-        if eval:
-            # Deterministic action (just tanh(mu))
-            return mu.detach().cpu().numpy()[0]
-
         dist = torch.distributions.Normal(mu, sigma)
         z = dist.rsample()
+        actions = torch.tanh(z)
+        log_probs = dist.log_prob(z) - torch.log(1 - actions.pow(2) + self.config.epsilon)
+        log_probs = log_probs.sum(-1, keepdim=True)
 
-        action = z
-        # Add small epsilon for numerical stability in log_prob calculation
-        log_prob = dist.log_prob(z) - torch.log(1 - action.pow(2) + 1e-6)
-        log_prob = log_prob.sum(-1, keepdim=True)
+        q_values = torch.min(
+            self.critic1(states, actions, time_steps),
+            self.critic2(states, actions, time_steps)
+        )
+        
+        actor_loss = (self.alpha * log_probs - q_values).mean()
 
-        return action.detach().cpu().numpy()[0], log_prob.detach().cpu().numpy()[0]
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.config.max_grad_norm)
+        self.actor_optimizer.step()
 
-    def soft_update(self, target_network, source_network):
-        for target_param, param in zip(target_network.parameters(), source_network.parameters()):
-            target_param.data.copy_(target_param.data * (1.0 - self.tau) + param.data * self.tau)
+        return actor_loss.item()
 
-    def update_params(self, memory, batch_size, meta_input, time_memory):
-        if len(memory) < batch_size:
-            return
+    def update_meta_controller(self, meta_input: torch.Tensor, log_probs: torch.Tensor, rewards: torch.Tensor) -> float:
+        """
+        Update meta-controller network.
+        
+        Returns:
+            Meta-controller loss value
+        """
+        # compute reward statistics
+        mean = torch.mean(rewards, dim=0, keepdim=True)
+        variance = torch.var(rewards, dim=0, keepdim=True)
+        reward_stats = torch.cat([mean, variance], dim=-1).to(self.device)
+        
+        # Repeat the reward_stats along the batch size dimension to match meta_input
+        batch_size = meta_input.size(0)
+        reward_stats = reward_stats.repeat(batch_size, 1)
+        
+        meta_output = self.meta_controller(meta_input, reward_stats)
+        alpha_target_loss = -(meta_output - torch.log(self.alpha)) * (log_probs + self.target_entropy).detach().mean()
 
-        indices = random.sample(range(len(memory)), batch_size)
-        batch = [memory[idx] for idx in indices]
-        batch_time_encodings = [time_memory[idx] for idx in indices]
+        self.meta_optimizer.zero_grad()
+        alpha_target_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.meta_controller.parameters(), self.config.max_grad_norm)
+        self.meta_optimizer.step()
 
-        # Use np.stack instead of np.array for efficiency and consistent shapes
+        return alpha_target_loss.item()
+
+    def soft_update(self, target_network: nn.Module, source_network: nn.Module) -> None:
+        """Soft update of target network parameters."""
+        try:
+            for target_param, param in zip(target_network.parameters(), source_network.parameters()):
+                target_param.data.copy_(
+                    target_param.data * (1.0 - self.config.tau) + param.data * self.config.tau
+                )
+        except Exception as e:
+            logger.error(f"Failed to update target network: {str(e)}")
+            raise
+
+    def update_params(self, replay_buffer: ReplayBuffer, meta_input: np.ndarray, 
+                     time_memory: List[int]) -> Dict[str, float]:
+        """
+        Update all network parameters.
+        
+        Returns:
+            Dictionary containing all loss values
+        """
+        if len(replay_buffer) < self.config.batch_size:
+            return {}
+
+        # Sample from replay buffer
+        try:
+            batch, indices, weights = replay_buffer.sample(self.config.batch_size)
+        except ValueError as e:
+            logger.error(f"Failed to sample from replay buffer: {str(e)}")
+            return {}
+
+        # Prepare batch data
         states = torch.FloatTensor(np.stack([item[0] for item in batch])).to(self.device)
         actions = torch.FloatTensor(np.stack([item[1] for item in batch])).to(self.device)
         rewards = torch.FloatTensor(np.stack([item[2] for item in batch])).unsqueeze(1).to(self.device)
         next_states = torch.FloatTensor(np.stack([item[3] for item in batch])).to(self.device)
         dones = torch.FloatTensor(np.stack([item[4] for item in batch])).unsqueeze(1).to(self.device)
         meta_input = torch.FloatTensor(meta_input).unsqueeze(0).to(self.device)
-        batch_time_encodings = torch.FloatTensor(np.stack(batch_time_encodings)).to(self.device)
+        time_steps = torch.tensor(time_memory).to(self.device)
+        
+        # Compute targets for critics
+        q_targets = self.compute_q_targets(rewards, next_states, time_steps, dones)
 
-        # Fix action dimension if needed
-        if actions.shape[-1] != self.action_dim:
-            # pad or slice actions
-            if actions.shape[-1] < self.action_dim:
-                diff = self.action_dim - actions.shape[-1]
-                actions = torch.cat([actions, torch.zeros(actions.shape[0], diff).to(self.device)], dim=-1)
-            else:
-                actions = actions[:, :self.action_dim]
+        # Update critics
+        critic1_loss, critic2_loss = self.update_critics(states, actions, time_steps, q_targets)
+        
+        # Update actor
+        actor_loss = self.update_actor(states, time_steps)
 
-        with torch.no_grad():
-            # Compute next actions
-            next_actions = []
-            next_log_probs = []
-            next_states_np = next_states.cpu().numpy()
-            batch_time_encodings_np = batch_time_encodings.cpu().numpy()
-            for ns, te in zip(next_states_np, batch_time_encodings_np):
-                a, lp = self.select_action(ns, te)
-                next_actions.append(a)
-                next_log_probs.append(lp)
-            next_actions = torch.FloatTensor(np.stack(next_actions)).to(self.device)
-            if next_actions.shape[-1] < self.action_dim:
-                diff = self.action_dim - next_actions.shape[-1]
-                next_actions = torch.cat([next_actions, torch.zeros(next_actions.shape[0], diff).to(self.device)], dim=-1)
-            next_log_probs = torch.FloatTensor(np.stack(next_log_probs)).to(self.device)
-
-            q_target1 = self.critic_target1(next_states, next_actions, batch_time_encodings)
-            q_target2 = self.critic_target2(next_states, next_actions, batch_time_encodings)
-            q_target_min = torch.min(q_target1, q_target2)
-            q_target = rewards + (1.0 - dones) * self.gamma * (q_target_min - self.alpha * next_log_probs)
-
-        q_value1 = self.critic1(states, actions, batch_time_encodings)
-        q_value2 = self.critic2(states, actions, batch_time_encodings)
-
-        # Ensure q_target matches q_value shape (should already if all is correct)
-        if q_value1.shape != q_target.shape:
-            q_target = q_target.view_as(q_value1)
-
-        critic1_loss = F.mse_loss(q_value1, q_target)
-        critic2_loss = F.mse_loss(q_value2, q_target)
-
-        self.critic1_optimizer.zero_grad()
-        critic1_loss.backward()
-        self.critic1_optimizer.step()
-
-        self.critic2_optimizer.zero_grad()
-        critic2_loss.backward()
-        self.critic2_optimizer.step()
-
-        mu, log_sigma = self.actor(states, batch_time_encodings)
+        # Update meta-controller and alpha
+        mu, log_sigma = self.actor(states, time_steps)
         sigma = torch.exp(log_sigma)
         dist = torch.distributions.Normal(mu, sigma)
         z = dist.rsample()
-        action = z
-        log_prob = dist.log_prob(z) - torch.log(1 - action.pow(2) + 1e-6)
-        log_prob = log_prob.sum(-1, keepdim=True)
+        actions = torch.tanh(z)
+        log_probs = dist.log_prob(z) - torch.log(1 - actions.pow(2) + self.config.epsilon)
+        log_probs = log_probs.sum(-1, keepdim=True)
+        meta_loss = self.update_meta_controller(meta_input, log_probs, rewards)  # Send the actual rewards
 
-        q_val = torch.min(self.critic1(states, action, batch_time_encodings), self.critic2(states, action, batch_time_encodings))
-        actor_loss = (-q_val + self.alpha * log_prob).mean()
-
-        self.actor_optimizer.zero_grad()
-        actor_loss.backward()
-        self.actor_optimizer.step()
-
-        meta_output = self.meta_controller(meta_input)
-        alpha_target_loss = - (meta_output - torch.log(self.alpha)) * (log_prob + self.target_entropy).detach().mean()
-
-        self.meta_optimizer.zero_grad()
-        alpha_target_loss.backward()
-        self.meta_optimizer.step()
-
+        # Update target networks
         self.soft_update(self.critic_target1, self.critic1)
         self.soft_update(self.critic_target2, self.critic2)
 
-        with torch.no_grad():
-            new_alpha = torch.exp(self.meta_controller(meta_input)).item()  # get scalar
-            self.alpha.copy_(torch.tensor(new_alpha, device=self.device))
+        # Update learning rates
+        self.actor_scheduler.step(actor_loss)
+        self.critic1_scheduler.step(critic1_loss)
+        self.critic2_scheduler.step(critic2_loss)
+            
+        # Log to tensorboard
+        self.train_steps += 1
+        self.writer.add_scalar('Loss/actor', actor_loss, self.train_steps)
+        self.writer.add_scalar('Loss/critic1', critic1_loss, self.train_steps)
+        self.writer.add_scalar('Loss/critic2', critic2_loss, self.train_steps)
+        self.writer.add_scalar('Loss/meta', meta_loss, self.train_steps)
+        self.writer.add_scalar('Parameters/alpha', self.alpha.item(), self.train_steps)
 
-    def state_dict(self):
         return {
-            'actor': self.actor.state_dict(),
-            'critic1': self.critic1.state_dict(),
-            'critic2': self.critic2.state_dict(),
-            'critic_target1': self.critic_target1.state_dict(),
-            'critic_target2': self.critic_target2.state_dict(),
-            'meta_controller': self.meta_controller.state_dict(),
-            'alpha': self.alpha.detach().cpu().numpy()
+            'actor_loss': actor_loss,
+            'critic1_loss': critic1_loss,
+            'critic2_loss': critic2_loss,
+            'meta_loss': meta_loss,
+            'alpha': self.alpha.item()
         }
 
-    def load_state_dict(self, state_dict):
-        self.actor.load_state_dict(state_dict['actor'])
-        self.critic1.load_state_dict(state_dict['critic1'])
-        self.critic2.load_state_dict(state_dict['critic2'])
-        self.critic_target1.load_state_dict(state_dict['critic_target1'])
-        self.critic_target2.load_state_dict(state_dict['critic_target2'])
-        self.meta_controller.load_state_dict(state_dict['meta_controller'])
-        alpha_val = state_dict['alpha']
-        if isinstance(alpha_val, np.ndarray):
-            alpha_val = alpha_val.item()
-        with torch.no_grad():
-            self.alpha.copy_(torch.tensor(alpha_val, device=self.device))
-
-
-# ------------------------- Tests -------------------------
-class TestInitialization(unittest.TestCase):
-    def test_create_agent(self):
-        agent = MetaSACAgent(state_dim=10, action_dim=10, hidden_dim=64, attention_dim=32, meta_input_dim=5, device=device)
-        self.assertIsNotNone(agent)
-
-    def test_network_parameters(self):
-        agent = MetaSACAgent(state_dim=10, action_dim=10, hidden_dim=64, attention_dim=32, meta_input_dim=5, device=device)
-        for param in agent.actor.parameters():
-            self.assertEqual(param.device, device)
-        for param in agent.critic1.parameters():
-            self.assertEqual(param.device, device)
-        for param in agent.meta_controller.parameters():
-            self.assertEqual(param.device, device)
-
-    def test_alpha_initialization(self):
-        agent = MetaSACAgent(state_dim=10, action_dim=10, hidden_dim=64, attention_dim=32, meta_input_dim=5, device=device)
-        self.assertAlmostEqual(agent.alpha.item(), 0.2, places=4)
-
-
-class TestForwardPass(unittest.TestCase):
-    def setUp(self):
-        self.agent = MetaSACAgent(state_dim=10, action_dim=10, hidden_dim=64, attention_dim=32, meta_input_dim=5, device=device)
-        self.state = torch.randn(1, 10, device=device)
-        self.time_encoding = torch.randn(1, 10, device=device)
-        self.action = torch.randn(1, 10, device=device)
-        self.meta_input = torch.randn(1, 5, device=device)
-
-    def test_actor_forward(self):
-        mu, log_sigma = self.agent.actor(self.state, self.time_encoding)
-        self.assertEqual(mu.shape, (1, 10))
-        self.assertEqual(log_sigma.shape, (1, 10))
-
-    def test_critic_forward(self):
-        q_value = self.agent.critic1(self.state, self.action, self.time_encoding)
-        self.assertEqual(q_value.shape, (1, 1))
-
-    def test_meta_controller_forward(self):
-        meta_output = self.agent.meta_controller(self.meta_input)
-        self.assertEqual(meta_output.shape, (1, 1))
-
-
-class TestActionSelection(unittest.TestCase):
-    def setUp(self):
-        self.agent = MetaSACAgent(state_dim=10, action_dim=10, hidden_dim=64, attention_dim=32, meta_input_dim=5, device=device)
-        self.state = np.random.rand(10)
-        self.time_encoding = np.random.rand(10)
-
-    def test_select_action_shape(self):
-        action, _ = self.agent.select_action(self.state, self.time_encoding)
-        self.assertEqual(action.shape, (10,))
-
-    def test_select_action_eval(self):
-        action = self.agent.select_action(self.state, self.time_encoding, eval=True)
-        action2 = self.agent.select_action(self.state, self.time_encoding, eval=True)
-        self.assertTrue(np.allclose(action, action2, atol=1e-6))
-
-    def test_select_action_bounds(self):
-        for _ in range(100):
-            action, _ = self.agent.select_action(self.state, self.time_encoding)
-            self.assertTrue(np.all(action >= -1 - 1e-6) and np.all(action <= 1 + 1e-6))
-
-
-class TestUpdate(unittest.TestCase):
-    def setUp(self):
-        self.agent = MetaSACAgent(state_dim=10, action_dim=10, hidden_dim=64, attention_dim=32, meta_input_dim=5, device=device)
-        self.batch_size = 32
-        self.memory = [(np.random.rand(10), np.random.rand(10), np.random.rand(1), np.random.rand(10), False) for _ in range(self.batch_size)]
-        self.meta_input = np.random.rand(5)
-        self.time_encodings = [np.random.rand(10) for _ in range(self.batch_size)]
-
-    def test_critic_loss_decreases(self):
-        initial_q_value1 = self.agent.critic1(torch.randn(self.batch_size, 10, device=device), torch.randn(self.batch_size, 10, device=device), torch.randn(self.batch_size, 10, device=device))
-        initial_q_value2 = self.agent.critic2(torch.randn(self.batch_size, 10, device=device), torch.randn(self.batch_size, 10, device=device), torch.randn(self.batch_size, 10, device=device))
-        initial_q_target = torch.randn(self.batch_size, 1, device=device)
-
-        initial_critic1_loss = F.mse_loss(initial_q_value1, initial_q_target)
-        initial_critic2_loss = F.mse_loss(initial_q_value2, initial_q_target)
-
-        self.agent.update_params(self.memory, self.batch_size, self.meta_input, self.time_encodings)
-
-        updated_q_value1 = self.agent.critic1(torch.randn(self.batch_size, 10, device=device), torch.randn(self.batch_size, 10, device=device), torch.randn(self.batch_size, 10, device=device))
-        updated_q_value2 = self.agent.critic2(torch.randn(self.batch_size, 10, device=device), torch.randn(self.batch_size, 10, device=device), torch.randn(self.batch_size, 10, device=device))
-
-        updated_critic1_loss = F.mse_loss(updated_q_value1, initial_q_target)
-        updated_critic2_loss = F.mse_loss(updated_q_value2, initial_q_target)
-
-        self.assertLessEqual(updated_critic1_loss.item(), initial_critic1_loss.item() * 1.1)
-        self.assertLessEqual(updated_critic2_loss.item(), initial_critic2_loss.item() * 1.1)
-
-    def test_actor_loss_decreases(self):
-        self.agent.update_params(self.memory, self.batch_size, self.meta_input, self.time_encodings)
-
-        states = torch.FloatTensor(np.stack([item[0] for item in self.memory])).to(device)
-        time_encodings = torch.FloatTensor(np.stack(self.time_encodings)).to(device)
-        mu, log_sigma = self.agent.actor(states, time_encodings)
-        sigma = torch.exp(log_sigma)
-        dist = torch.distributions.Normal(mu, sigma)
-        z = dist.rsample()
-        action = z
-        log_prob = dist.log_prob(z) - torch.log(1 - action.pow(2) + 1e-6)
-        log_prob = log_prob.sum(-1, keepdim=True)
-        q_val = torch.min(self.agent.critic1(states, action, time_encodings), self.agent.critic2(states, action, time_encodings))
-        updated_actor_loss = (-q_val + self.agent.alpha * log_prob).mean()
-
-        self.assertFalse(torch.isnan(updated_actor_loss).any())
-
-    def test_meta_controller_update(self):
-        initial_alpha = self.agent.alpha.item()
-        self.agent.update_params(self.memory, self.batch_size, self.meta_input, self.time_encodings)
-        new_alpha = self.agent.alpha.item()
-        self.assertNotEqual(initial_alpha, new_alpha)
-
-    def test_soft_update(self):
-        initial_target_params = [param.clone() for param in self.agent.critic_target1.parameters()]
-        self.agent.update_params(self.memory, self.batch_size, self.meta_input, self.time_encodings)
-        new_target_params = [param.clone() for param in self.agent.critic_target1.parameters()]
-
-        for initial_param, new_param in zip(initial_target_params, new_target_params):
-            self.assertFalse(torch.equal(initial_param, new_param))
-
-
-class TestEdgeCases(unittest.TestCase):
-    def setUp(self):
-        self.agent = MetaSACAgent(state_dim=10, action_dim=10, hidden_dim=64, attention_dim=32, meta_input_dim=5, device=device)
-
-    def test_zero_reward(self):
-        memory = [(np.random.rand(10), np.random.rand(10), np.array([0.0]), np.random.rand(10), False) for _ in range(32)]
-        time_memory = [np.random.rand(10) for _ in range(32)]
-        meta_input = np.random.rand(5)
-        self.agent.update_params(memory, 32, meta_input, time_memory)
-
-    def test_large_reward(self):
-        memory = [(np.random.rand(10), np.random.rand(10), np.array([1e10]), np.random.rand(10), False) for _ in range(32)]
-        time_memory = [np.random.rand(10) for _ in range(32)]
-        meta_input = np.random.rand(5)
-        self.agent.update_params(memory, 32, meta_input, time_memory)
-
-        for param in self.agent.actor.parameters():
-            self.assertFalse(torch.isnan(param).any())
-        for param in self.agent.critic1.parameters():
-            self.assertFalse(torch.isnan(param).any())
-        for param in self.agent.meta_controller.parameters():
-            self.assertFalse(torch.isnan(param).any())
-
-    def test_nan_inputs(self):
-        state = np.array([np.nan] * 10)
-        time_encoding = np.array([np.nan] * 10)
-        action = np.array([np.nan] * 10)
-        reward = np.array([np.nan])
-        next_state = np.array([np.nan] * 10)
-        done = False
-        meta_input = np.array([np.nan] * 5)
-
-        # Check if select_action handles NaNs gracefully
+    def save(self, path: str) -> None:
+        """Save model state."""
         try:
-            self.agent.select_action(state, time_encoding)
+            torch.save({
+                'actor_state_dict': self.actor.state_dict(),
+                'critic1_state_dict': self.critic1.state_dict(),
+                'critic2_state_dict': self.critic2.state_dict(),
+                'critic_target1_state_dict': self.critic_target1.state_dict(),
+                'critic_target2_state_dict': self.critic_target2.state_dict(),
+                'meta_controller_state_dict': self.meta_controller.state_dict(),
+                'alpha': self.alpha.detach().cpu().numpy(),
+                'config': self.config,
+                'train_steps': self.train_steps
+            }, path)
+            logger.info(f"Model saved successfully to {path}")
         except Exception as e:
-            self.fail(f"select_action raised an exception with NaN inputs: {e}")
+            logger.error(f"Failed to save model: {str(e)}")
+            raise
 
-        memory = [(state, action, reward, next_state, done)]
-        time_memory = [time_encoding]
+    def load(self, path: str) -> None:
+        """Load model state."""
         try:
-            self.agent.update_params(memory, 1, meta_input, time_memory)
+            checkpoint = torch.load(path, map_location=self.device)
+            self.actor.load_state_dict(checkpoint['actor_state_dict'])
+            self.critic1.load_state_dict(checkpoint['critic1_state_dict'])
+            self.critic2.load_state_dict(checkpoint['critic2_state_dict'])
+            self.critic_target1.load_state_dict(checkpoint['critic_target1_state_dict'])
+            self.critic_target2.load_state_dict(checkpoint['critic_target2_state_dict'])
+            self.meta_controller.load_state_dict(checkpoint['meta_controller_state_dict'])
+            self.alpha.data.copy_(torch.tensor(checkpoint['alpha'], device=self.device))
+            self.train_steps = checkpoint['train_steps']
+            logger.info(f"Model loaded successfully from {path}")
         except Exception as e:
-            self.fail(f"update_params raised an exception with NaN inputs: {e}")
-
-
-class TestSavingLoading(unittest.TestCase):
-    def setUp(self):
-        self.agent = MetaSACAgent(state_dim=10, action_dim=10, hidden_dim=64, attention_dim=32, meta_input_dim=5, device=device)
-        self.save_path = "test_agent.pth"
-
-    def test_save_and_load(self):
-        torch.save(self.agent.state_dict(), self.save_path)
-        new_agent = MetaSACAgent(state_dim=10, action_dim=10, hidden_dim=64, attention_dim=32, meta_input_dim=5, device=device)
-        
-        # Using the new argument weights_only=True if your PyTorch version supports it:
-        # Otherwise, just omit it. This is just to address the FutureWarning:
-        state_dict = torch.load(self.save_path, map_location=device)
-        new_agent.load_state_dict(state_dict)
-        
-        for param, new_param in zip(self.agent.parameters(), new_agent.parameters()):
-            self.assertTrue(torch.equal(param, new_param))
-
-    def tearDown(self):
-        if os.path.exists(self.save_path):
-            os.remove(self.save_path)
-
-
-if __name__ == '__main__':
-    unittest.main()
-
+            logger.error(f"Failed to load model: {str(e)}")
+            raise
 
 // File: test.py
 import unittest
-import torch
 import numpy as np
-import random
-from meta_sac import MetaSACAgent  
-import torch.nn.functional as F
+import torch
+import os
+from typing import Tuple, List, Dict
+import logging
+from collections import deque
+import matplotlib.pyplot as plt
+from datetime import datetime
 
-# 1. Initialization Tests:
+# Import your SAC implementation
+from meta_sac import MetaSACAgent, MetaSACConfig, ReplayBuffer, SinusoidalTimeEncoding
 
-class TestInitialization(unittest.TestCase):
-    def test_create_agent(self):
-        """Test if the agent initializes without errors."""
-        agent = MetaSACAgent(state_dim=10, action_dim=2, hidden_dim=64, attention_dim=32, meta_input_dim=5, device="cpu")
-        self.assertIsNotNone(agent)
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-    def test_network_parameters(self):
-        """Test if network parameters are initialized correctly and on the correct device."""
-        agent = MetaSACAgent(state_dim=10, action_dim=2, hidden_dim=64, attention_dim=32, meta_input_dim=5, device="cpu")
+class CustomEnvironment:
+    """
+    Custom environment for testing SAC agent.
+    Simulates a simple control task where the goal is to move a point mass to a target.
+    """
+    def __init__(self, state_dim: int = 10, action_dim: int = 2):
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.max_steps = 200
+        self.target_state = np.zeros(state_dim)  # Target is at origin
+        self.step_count = 0
+        self.state = None
+        self.action_scale = 2.0  # Scale factor for actions
+        
+        # Dynamic parameters
+        self.inertia = 0.8  # How much previous state affects next state
+        self.action_influence = 0.2  # How much actions affect the state
+        self.noise_scale = 0.01  # Environmental noise
 
-        for param in agent.actor.parameters():
-            self.assertEqual(param.device, torch.device("cpu"))
-        for param in agent.critic1.parameters():
-            self.assertEqual(param.device, torch.device("cpu"))
-        for param in agent.meta_controller.parameters():
-            self.assertEqual(param.device, torch.device("cpu"))
+    def reset(self) -> np.ndarray:
+        """Reset environment to initial state."""
+        # Initialize state randomly but not too far from origin
+        self.state = np.random.randn(self.state_dim)
+        self.step_count = 0
+        return self.state.copy()
 
-    def test_alpha_initialization(self):
-      """Test if alpha is initialized correctly."""
-      agent = MetaSACAgent(state_dim=10, action_dim=2, hidden_dim=64, attention_dim=32, meta_input_dim=5, device="cpu")
-      self.assertEqual(agent.alpha.item(), 0.2)
+    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict]:
+        """
+        Take a step in environment given an action.
+        
+        Args:
+            action: Array of action values in [-1, 1]
+            
+        Returns:
+            (next_state, reward, done, info)
+        """
+        # Clip actions to valid range
+        action = np.clip(action, -1, 1) * self.action_scale
+        
+        # Update state based on action and dynamics
+        action_effect = np.zeros(self.state_dim)
+        action_effect[:self.action_dim] = action
+        
+        self.state = (
+            self.inertia * self.state + 
+            self.action_influence * action_effect +
+            self.noise_scale * np.random.randn(self.state_dim)
+        )
+        
+        # Calculate reward based on distance to target and action magnitude
+        distance_to_target = np.linalg.norm(self.state - self.target_state)
+        action_penalty = 0.1 * np.linalg.norm(action)  # Small penalty for large actions
+        reward = -distance_to_target - action_penalty
+        
+        # Update step count and check if episode is done
+        self.step_count += 1
+        done = self.step_count >= self.max_steps
+        
+        # Add some success and failure conditions
+        if distance_to_target < 0.1:  # Success condition
+            reward += 10
+            done = True
+        elif distance_to_target > 20:  # Failure condition
+            reward -= 10
+            done = True
+            
+        return self.state.copy(), reward, done, {
+            'distance': distance_to_target,
+            'step': self.step_count
+        }
 
-# 2. Forward Pass Tests:
-
-class TestForwardPass(unittest.TestCase):
+class TestSAC(unittest.TestCase):
+    """Test suite for SAC agent."""
+    
     def setUp(self):
-        self.agent = MetaSACAgent(state_dim=10, action_dim=2, hidden_dim=64, attention_dim=32, meta_input_dim=5, device="cpu")
-        self.state = torch.randn(1, 10)
-        self.time_encoding = torch.randn(1, 10)
-        self.action = torch.randn(1, 2)
-        self.meta_input = torch.randn(1, 5)
-
-    def test_actor_forward(self):
-        """Test the actor's forward pass."""
-        mu, log_sigma = self.agent.actor(self.state, self.time_encoding)
-        self.assertEqual(mu.shape, (1, 2))
-        self.assertEqual(log_sigma.shape, (1, 2))
-
-    def test_critic_forward(self):
-        """Test the critic's forward pass."""
-        q_value = self.agent.critic1(self.state, self.action, self.time_encoding)
-        self.assertEqual(q_value.shape, (1, 1))
-
-    def test_meta_controller_forward(self):
-        """Test the meta-controller's forward pass."""
-        meta_output = self.agent.meta_controller(self.meta_input)
-        self.assertEqual(meta_output.shape, (1, 1))
-
-# 3. Action Selection Tests:
-
-class TestActionSelection(unittest.TestCase):
-    def setUp(self):
-        self.agent = MetaSACAgent(state_dim=10, action_dim=2, hidden_dim=64, attention_dim=32, meta_input_dim=5, device="cpu")
-        self.state = np.random.rand(10)
-        self.time_encoding = np.random.rand(10)
-
-    def test_select_action_shape(self):
-        """Test the shape of the selected action."""
-        action, _ = self.agent.select_action(self.state, self.time_encoding)
-        self.assertEqual(action.shape, (2,))
-
-    def test_select_action_eval(self):
-        """Test that eval mode returns the mean action."""
-        action = self.agent.select_action(self.state, self.time_encoding, eval=True)
-        # In eval mode, action should be deterministic (tanh(mu))
-        # We can't directly compare to mu, but we can check if two eval actions are the same
-        action2 = self.agent.select_action(self.state, self.time_encoding, eval=True)
-        self.assertTrue(np.allclose(action, action2))
-
-    def test_select_action_bounds(self):
-        """Test that actions are within the expected bounds [-1, 1]."""
-        for _ in range(100):
-            action, _ = self.agent.select_action(self.state, self.time_encoding)
-            self.assertTrue(np.all(action >= -1) and np.all(action <= 1))
-
-# 4. Update Tests (Isolated Components):
-
-class TestUpdate(unittest.TestCase):
-    def setUp(self):
-        self.agent = MetaSACAgent(state_dim=10, action_dim=2, hidden_dim=64, attention_dim=32, meta_input_dim=5, device="cpu")
-        self.batch_size = 32
-        self.memory = [(np.random.rand(10), np.random.rand(2), np.random.rand(1), np.random.rand(10), False) for _ in range(self.batch_size)]
-        self.meta_input = np.random.rand(5)
-        self.time_encodings = [np.random.rand(10) for _ in range(self.batch_size)]
-
-    def test_critic_loss_decreases(self):
-      """Test that the critic loss decreases after an update."""
-
-      # Get initial critic loss
-      initial_q_value1 = self.agent.critic1(torch.randn(self.batch_size, 10), torch.randn(self.batch_size, 2), torch.randn(self.batch_size, 10))
-      initial_q_value2 = self.agent.critic2(torch.randn(self.batch_size, 10), torch.randn(self.batch_size, 2), torch.randn(self.batch_size, 10))
-      initial_q_target = torch.randn(self.batch_size, 1)
-
-      initial_critic1_loss = F.mse_loss(initial_q_value1, initial_q_target)
-      initial_critic2_loss = F.mse_loss(initial_q_value2, initial_q_target)
-
-      # Perform an update
-      self.agent.update_params(self.memory, self.batch_size, self.meta_input, self.time_encodings)
-
-      # Get critic loss after update
-      updated_q_value1 = self.agent.critic1(torch.randn(self.batch_size, 10), torch.randn(self.batch_size, 2), torch.randn(self.batch_size, 10))
-      updated_q_value2 = self.agent.critic2(torch.randn(self.batch_size, 10), torch.randn(self.batch_size, 2), torch.randn(self.batch_size, 10))
-
-      updated_critic1_loss = F.mse_loss(updated_q_value1, initial_q_target)
-      updated_critic2_loss = F.mse_loss(updated_q_value2, initial_q_target)
-
-      # Assert that loss has decreased (or at least not significantly increased)
-      self.assertLessEqual(updated_critic1_loss.item(), initial_critic1_loss.item() * 1.1) # Allow for slight increase due to stochasticity
-      self.assertLessEqual(updated_critic2_loss.item(), initial_critic2_loss.item() * 1.1)
-
-    def test_actor_loss_decreases(self):
-      """Test that the actor loss decreases after an update."""
-
-      # Perform an update
-      self.agent.update_params(self.memory, self.batch_size, self.meta_input, self.time_encodings)
-
-      # Get actor loss after update
-      states = torch.FloatTensor(np.array([item[0] for item in self.memory])).to(self.agent.device)
-      time_encodings = torch.FloatTensor(np.array(self.time_encodings)).to(self.agent.device)
-      mu, log_sigma = self.agent.actor(states, time_encodings)
-      sigma = torch.exp(log_sigma)
-      dist = torch.distributions.Normal(mu, sigma)
-      z = dist.rsample()
-      action = z
-      log_prob = dist.log_prob(z) - torch.log(1 - action.pow(2) + 1e-6)
-      log_prob = log_prob.sum(-1, keepdim=True)
-      q_val = torch.min(self.agent.critic1(states, action, time_encodings), self.agent.critic2(states, action, time_encodings))
-      updated_actor_loss = (-q_val + self.agent.alpha * log_prob).mean()
-
-      # Assert that loss is not NaN (which can happen if something goes wrong)
-      self.assertFalse(torch.isnan(updated_actor_loss).any())
-
-    def test_meta_controller_update(self):
-        """Test that the meta-controller updates alpha."""
-        initial_alpha = self.agent.alpha.item()
-        self.agent.update_params(self.memory, self.batch_size, self.meta_input, self.time_encodings)
-        new_alpha = self.agent.alpha.item()
-        self.assertNotEqual(initial_alpha, new_alpha)
-
-    def test_soft_update(self):
-        """Test that the soft update mechanism works."""
-        initial_target_params = [param.clone() for param in self.agent.critic_target1.parameters()]
-        self.agent.update_params(self.memory, self.batch_size, self.meta_input, self.time_encodings)
-        new_target_params = [param.clone() for param in self.agent.critic_target1.parameters()]
-
-        for initial_param, new_param in zip(initial_target_params, new_target_params):
-            self.assertFalse(torch.equal(initial_param, new_param))
-
-# 5. Training Loop Tests (Integration):
-#  Simulate various scenarios to test the agent's ability to learn and adapt.
-class TestTrainingLoop(unittest.TestCase):
-    def setUp(self):
-        self.agent = MetaSACAgent(state_dim=10, action_dim=2, hidden_dim=64, attention_dim=32, meta_input_dim=5, device="cpu")
-
-    def test_learning_simple_task(self):
-        """Test if the agent can learn a simple task (e.g., reaching a target state)."""
-        # Define a simple reward function (e.g., negative distance to target)
-        target_state = np.array([0.5] * 10)
-        def reward_function(state):
-            return -np.linalg.norm(state - target_state)
-
-        # Train the agent
-        memory = []
-        time_memory = []
-        for episode in range(50):
-            state = np.random.rand(10)
-            time_encoding = np.random.rand(10)
-            done = False
+        """Setup test environment and agent."""
+        self.config = MetaSACConfig(
+            state_dim=10,
+            action_dim=2,
+            hidden_dim=64,
+            attention_dim=32,
+            meta_input_dim=5,
+            batch_size=64,
+            lr=3e-4,
+            meta_lr=1e-4,
+            time_encoding_dim = 20
+        )
+        self.env = CustomEnvironment(self.config.state_dim, self.config.action_dim)
+        self.agent = MetaSACAgent(self.config)
+        self.replay_buffer = ReplayBuffer(100000)
+        self.time_encoding_dim = 20
+        
+        # Training parameters
+        self.num_eval_episodes = 5
+        self.num_train_episodes = 50
+        self.eval_interval = 10
+        
+        # Create directory for saving results
+        self.results_dir = 'test_results'
+        os.makedirs(self.results_dir, exist_ok=True)
+        
+    def generate_time_encoding(self) -> int:
+        """Generate time encoding vector."""
+        return np.random.randint(0, 1000)
+    
+    def evaluate_policy(self, num_episodes: int = 5) -> Tuple[float, List[float]]:
+        """
+        Evaluate current policy.
+        
+        Returns:
+            Tuple of (mean reward, list of episode rewards)
+        """
+        episode_rewards = []
+        
+        for episode in range(num_episodes):
+            state = self.env.reset()
             episode_reward = 0
+            done = False
+            time_step = 0
             while not done:
-                action, _ = self.agent.select_action(state, time_encoding)
-                next_state = np.clip(state + action * 0.1, 0, 1) # Simple state transition
-                reward = reward_function(next_state)
-                done = np.linalg.norm(next_state - target_state) < 0.1
-                memory.append((state, action, reward, next_state, done))
-                time_memory.append(time_encoding)
-                state = next_state
+                action = self.agent.select_action(state, time_step, eval=True)
+                next_state, reward, done, _ = self.env.step(action)
                 episode_reward += reward
+                state = next_state
+                time_step+=1
+            
+            episode_rewards.append(episode_reward)
+        
+        return np.mean(episode_rewards), episode_rewards
 
-                if len(memory) >= 32:
-                   meta_input = np.random.rand(5) # Placeholder meta-input
-                   self.agent.update_params(memory, 32, meta_input, time_memory)
+    def test_basic_functionality(self):
+        """Test basic environment and agent functionality."""
+        # Test environment
+        state = self.env.reset()
+        self.assertEqual(state.shape, (self.config.state_dim,), "Environment state shape is incorrect")
+        
+        # Test agent action selection
+        time_step = self.generate_time_encoding()
+        action = self.agent.select_action(state, time_step)
+        self.assertEqual(action.shape, (self.config.action_dim,), "Action shape is incorrect")
+        self.assertTrue(np.all(action >= -1) and np.all(action <= 1), "Action values out of range")
+    
+    def test_time_encoding(self):
+        """Test time encoding mechanism."""
+        time_encoding_dim = self.config.time_encoding_dim
+        time_encoding = SinusoidalTimeEncoding(time_encoding_dim)
+        
+        # Test for a specific time step
+        time_step = torch.tensor([5])
+        encoding = time_encoding(time_step)
+        
+        self.assertEqual(encoding.shape, torch.Size([1, time_encoding_dim]), "Incorrect time encoding shape")
+        self.assertTrue(torch.all(encoding >= -1.0) and torch.all(encoding <= 1.0), "Time encoding values are out of range")
 
-    def test_adaptation_to_changing_target(self):
-        """Test if the agent can adapt to a changing target state using meta-learning."""
-        target_state = np.array([0.5] * 10)
-        change_interval = 25 # Change target every 25 episodes
-        # Train the agent
-        memory = []
-        time_memory = []
+    def test_learning(self):
+        """Test if agent can learn and improve."""
+        initial_mean, initial_rewards = self.evaluate_policy()
+        logger.info(f"Initial performance: {initial_mean:.2f}")
+        
+        eval_rewards = []
+        training_rewards = []
+        distances = []
+        alphas = []
+        critic1_losses = []
+        critic2_losses = []
+        actor_losses = []
 
-        for episode in range(100):
-           if episode % change_interval == 0:
-               # Change the target state
-               target_state = np.random.rand(10)
+        # Training loop
+        for episode in range(self.num_train_episodes):
+            state = self.env.reset()
+            episode_reward = 0
+            episode_distances = []
+            done = False
+            meta_input = np.random.randn(self.config.meta_input_dim)
+            time_memory = []
+            time_step = 0
+            
+            while not done:
+                # Get action from agent
+                time_memory.append(time_step)
+                action = self.agent.select_action(state, time_step)
+                
+                # Take step in environment
+                next_state, reward, done, info = self.env.step(action)
+                episode_reward += reward
+                episode_distances.append(info['distance'])
+                
+                # Store transition
+                self.replay_buffer.push(state, action, reward, next_state, done)
+                
+                # Update agent if enough samples
+                if len(self.replay_buffer) >= self.config.batch_size:
+                    update_info = self.agent.update_params(
+                        self.replay_buffer,
+                        meta_input,
+                        time_memory[-self.config.batch_size:]
+                    )
+                    
+                    # Verify no NaN values in losses
+                    for key, value in update_info.items():
+                        self.assertFalse(np.isnan(value), f"NaN detected in {key}")
+                    
+                    # Store losses and alpha values
+                    if "alpha" in update_info:
+                      alphas.append(update_info["alpha"])
+                    if "critic1_loss" in update_info:
+                        critic1_losses.append(update_info["critic1_loss"])
+                    if "critic2_loss" in update_info:
+                        critic2_losses.append(update_info["critic2_loss"])
+                    if "actor_loss" in update_info:
+                         actor_losses.append(update_info["actor_loss"])
+                
+                state = next_state
+                time_step += 1
 
-           state = np.random.rand(10)
-           time_encoding = np.random.rand(10)
-           done = False
-           episode_reward = 0
+            training_rewards.append(episode_reward)
+            distances.append(np.mean(episode_distances))
+            
+            # Evaluate policy periodically
+            if episode % self.eval_interval == 0:
+                mean_reward, _ = self.evaluate_policy()
+                eval_rewards.append(mean_reward)
+                logger.info(f"Episode {episode}, Eval reward: {mean_reward:.2f}")
+        
+        final_mean, final_rewards = self.evaluate_policy()
+        logger.info(f"Final performance: {final_mean:.2f}")
+        
+        # Plot results
+        self._plot_results(training_rewards, eval_rewards, distances, alphas, critic1_losses, critic2_losses, actor_losses)
+        
+        # Assert improvement
+        self.assertGreater(final_mean, initial_mean, 
+                          "Agent failed to improve performance")
+        
+        #Assert that the alpha is decreasing
+        if len(alphas) > 10:
+            self.assertLess(np.mean(alphas[-10:]), np.mean(alphas[:10]), "Alpha not decreasing")
 
-           while not done:
-               action, _ = self.agent.select_action(state, time_encoding)
-               next_state = np.clip(state + action * 0.1, 0, 1)
-               reward = -np.linalg.norm(next_state - target_state) # Reward based on current target
-               done = np.linalg.norm(next_state - target_state) < 0.1
-               memory.append((state, action, reward, next_state, done))
-               time_memory.append(time_encoding)
-               state = next_state
-               episode_reward += reward
+    def test_reproducibility(self):
+        """Test if training is reproducible with same seed."""
+        torch.manual_seed(42)
+        np.random.seed(42)
+        
+        # Get results from two identical training runs
+        results = []
+        for _ in range(2):
+            torch.manual_seed(42)
+            np.random.seed(42)
+            
+            agent = MetaSACAgent(self.config)
+            env = CustomEnvironment(self.config.state_dim, self.config.action_dim)
+            
+            state = env.reset()
+            actions = []
+            time_step = 0
 
-               if len(memory) >= 32:
-                   # Meta-input could indicate the current target or a change in target
-                   meta_input = target_state if episode % change_interval == 0 else np.random.rand(5)
-                   self.agent.update_params(memory, 32, meta_input, time_memory)
+            for _ in range(10):
+                action = agent.select_action(state, time_step, eval=True)
+                actions.append(action)
+                state, _, done, _ = env.step(action)
+                time_step+=1
+                if done:
+                    break
+            
+            results.append(actions)
+        
+        # Compare results
+        for a1, a2 in zip(results[0], results[1]):
+            np.testing.assert_array_almost_equal(a1, a2, err_msg="Actions are not reproducible")
 
-    def test_overfitting(self):
-        """Test if the agent is overfitting to a small dataset."""
-        # Train on a small, fixed dataset
-        dataset_size = 50
-        fixed_memory = [(np.random.rand(10), np.random.rand(2), np.random.rand(1), np.random.rand(10), False) for _ in range(dataset_size)]
-        fixed_time_memory = [np.random.rand(10) for _ in range(dataset_size)]
+    def test_deterministic_eval(self):
+        """Test action selection is deterministic in eval mode."""
+        state = self.env.reset()
+        time_step = self.generate_time_encoding()
+        
+        actions = []
+        for _ in range(10):
+            action = self.agent.select_action(state, time_step, eval=True)
+            actions.append(action)
+        
+        # Compare all actions to first action
+        for idx, action in enumerate(actions[1:]):
+            np.testing.assert_array_almost_equal(action, actions[0], err_msg=f"Deterministic eval failed on action {idx +1}")
 
-        for _ in range(100):
-            meta_input = np.random.rand(5)
-            self.agent.update_params(fixed_memory, 32, meta_input, fixed_time_memory)
+    def test_save_load(self):
+        """Test model saving and loading."""
+        # Train agent briefly
+        torch.manual_seed(42)
+        np.random.seed(42)
+        state = self.env.reset()
+        initial_actions = []
+        time_step = 0
+        
+        for _ in range(10):
+            action = self.agent.select_action(state, time_step, eval=True)
+            initial_actions.append(action)
+            state, _, done, _ = self.env.step(action)
+            time_step +=1
+            if done:
+                state = self.env.reset()
+                time_step = 0
+        
+        # Save model
+        save_path = os.path.join(self.results_dir, "test_model.pth")
+        self.agent.save(save_path)
+        
+        # Create new agent and load saved model
+        torch.manual_seed(42)
+        np.random.seed(42)
+        loaded_agent = MetaSACAgent(self.config)
+        loaded_agent.load(save_path)
+        
+        # Compare actions
+        state = self.env.reset()
+        time_step = 0
 
-        # Evaluate on a separate validation set
-        validation_memory = [(np.random.rand(10), np.random.rand(2), np.random.rand(1), np.random.rand(10), False) for _ in range(dataset_size)]
-        validation_time_memory = [np.random.rand(10) for _ in range(dataset_size)]
+        for initial_action in initial_actions:
+            loaded_action = loaded_agent.select_action(state, time_step, eval=True)
+            np.testing.assert_array_almost_equal(initial_action, loaded_action, err_msg="Action is different after loading")
+            state, _, done, _ = self.env.step(loaded_action)
+            time_step += 1
+            if done:
+                state = self.env.reset()
+                time_step = 0
 
-        # TODO: Implement a way to measure performance on the validation set and compare it to the training set.
-        #       If the training performance is much better than the validation performance, it could indicate overfitting.
+    def _plot_results(self, training_rewards: List[float], eval_rewards: List[float], 
+                     distances: List[float], alphas: List[float], critic1_losses: List[float],
+                     critic2_losses: List[float], actor_losses: List[float]) -> None:
+        """Plot and save training results."""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Plot training rewards
+        plt.figure(figsize=(10, 5))
+        plt.plot(training_rewards)
+        plt.title('Training Rewards')
+        plt.xlabel('Episode')
+        plt.ylabel('Reward')
+        plt.savefig(os.path.join(self.results_dir, f'training_rewards_{timestamp}.png'))
+        plt.close()
+        
+        # Plot evaluation rewards
+        plt.figure(figsize=(10, 5))
+        plt.plot(range(0, self.num_train_episodes, self.eval_interval), eval_rewards)
+        plt.title('Evaluation Rewards')
+        plt.xlabel('Episode')
+        plt.ylabel('Reward')
+        plt.savefig(os.path.join(self.results_dir, f'eval_rewards_{timestamp}.png'))
+        plt.close()
+        
+        # Plot distances to target
+        plt.figure(figsize=(10, 5))
+        plt.plot(distances)
+        plt.title('Average Distance to Target')
+        plt.xlabel('Episode')
+        plt.ylabel('Distance')
+        plt.savefig(os.path.join(self.results_dir, f'distances_{timestamp}.png'))
+        plt.close()
 
-    def test_long_term_learning(self):
-      """Test how well the agent retains information over many updates."""
-      memory = []
-      time_memory = []
+        # Plot alpha
+        plt.figure(figsize=(10,5))
+        plt.plot(alphas)
+        plt.title('Alpha over training')
+        plt.xlabel("Training steps")
+        plt.ylabel("Alpha")
+        plt.savefig(os.path.join(self.results_dir, f"alpha_{timestamp}.png"))
+        plt.close()
 
-      for episode in range(200):
-        state = np.random.rand(10)
-        time_encoding = np.random.rand(10)
-        done = False
-        episode_reward = 0
-        while not done:
-            action, _ = self.agent.select_action(state, time_encoding)
-            next_state = np.clip(state + action * 0.1, 0, 1)
-            reward = np.random.rand(1) # Random reward for simplicity
-            done = episode_reward > 10 # Simple termination condition
-            memory.append((state, action, reward, next_state, done))
-            time_memory.append(time_encoding)
-            state = next_state
-            episode_reward += reward
+        # Plot critic 1 losses
+        plt.figure(figsize=(10, 5))
+        plt.plot(critic1_losses)
+        plt.title('Critic 1 Loss')
+        plt.xlabel('Training Step')
+        plt.ylabel('Loss')
+        plt.savefig(os.path.join(self.results_dir, f'critic1_loss_{timestamp}.png'))
+        plt.close()
 
-            if len(memory) >= 32:
-               meta_input = np.random.rand(5)
-               self.agent.update_params(memory, 32, meta_input, time_memory)
+        # Plot critic 2 losses
+        plt.figure(figsize=(10, 5))
+        plt.plot(critic2_losses)
+        plt.title('Critic 2 Loss')
+        plt.xlabel('Training Step')
+        plt.ylabel('Loss')
+        plt.savefig(os.path.join(self.results_dir, f'critic2_loss_{timestamp}.png'))
+        plt.close()
 
-      # TODO: Evaluate the agent's performance after many updates to see if it has learned a useful policy
-      #       This might involve defining a specific task or using a held-out evaluation set.
-
-# 6. Edge Case Tests:
-class TestEdgeCases(unittest.TestCase):
-    def setUp(self):
-        self.agent = MetaSACAgent(state_dim=10, action_dim=2, hidden_dim=64, attention_dim=32, meta_input_dim=5, device="cpu")
-
-    def test_zero_reward(self):
-        """Test the agent's behavior with zero rewards."""
-        memory = [(np.random.rand(10), np.random.rand(2), np.array([0.0]), np.random.rand(10), False) for _ in range(32)]
-        time_memory = [np.random.rand(10) for _ in range(32)]
-        meta_input = np.random.rand(5)
-        self.agent.update_params(memory, 32, meta_input, time_memory)
-
-        # Check if update still happens without errors
-
-    def test_large_reward(self):
-      """Test how the agent handles extremely large rewards (positive or negative)."""
-      memory = [(np.random.rand(10), np.random.rand(2), np.array([1e10]), np.random.rand(10), False) for _ in range(32)]
-      time_memory = [np.random.rand(10) for _ in range(32)]
-      meta_input = np.random.rand(5)
-
-      self.agent.update_params(memory, 32, meta_input, time_memory)
-
-      # Check for stability issues (e.g., NaNs in parameters)
-      for param in self.agent.actor.parameters():
-          self.assertFalse(torch.isnan(param).any())
-      for param in self.agent.critic1.parameters():
-          self.assertFalse(torch.isnan(param).any())
-      for param in self.agent.meta_controller.parameters():
-          self.assertFalse(torch.isnan(param).any())
-    def test_nan_inputs(self):
-        """Test how the agent handles NaN inputs."""
-        state = np.array([np.nan] * 10)
-        time_encoding = np.array([np.nan] * 10)
-        action = np.array([np.nan] * 2)
-        reward = np.array([np.nan])
-        next_state = np.array([np.nan] * 10)
-        done = False
-        meta_input = np.array([np.nan] * 5)
-
-        # Check if select_action handles NaNs gracefully
-        try:
-            action, _ = self.agent.select_action(state, time_encoding)
-        except Exception as e:
-            self.fail(f"select_action raised an exception with NaN inputs: {e}")
-
-        # Check if update_params handles NaNs gracefully
-        memory = [(state, action, reward, next_state, done)]
-        time_memory = [time_encoding]
-        try:
-            self.agent.update_params(memory, 1, meta_input, time_memory)
-        except Exception as e:
-            self.fail(f"update_params raised an exception with NaN inputs: {e}")
-
-# 7. Saving and Loading Tests (Optional):
-class TestSavingLoading(unittest.TestCase):
-    def setUp(self):
-        self.agent = MetaSACAgent(state_dim=10, action_dim=2, hidden_dim=64, attention_dim=32, meta_input_dim=5, device="cpu")
-        self.save_path = "test_agent.pth"
-
-    def test_save_and_load(self):
-        """Test if the agent can be saved and loaded correctly."""
-        # Save the agent
-        torch.save(self.agent.state_dict(), self.save_path)
-
-        # Create a new agent
-        new_agent = MetaSACAgent(state_dim=10, action_dim=2, hidden_dim=64, attention_dim=32, meta_input_dim=5, device="cpu")
-
-        # Load the saved state dict
-        new_agent.load_state_dict(torch.load(self.save_path))
-
-        # Check if the parameters are the same
-        for param, new_param in zip(self.agent.parameters(), new_agent.parameters()):
-            self.assertTrue(torch.equal(param, new_param))
+        # Plot actor losses
+        plt.figure(figsize=(10, 5))
+        plt.plot(actor_losses)
+        plt.title('Actor Loss')
+        plt.xlabel('Training Step')
+        plt.ylabel('Loss')
+        plt.savefig(os.path.join(self.results_dir, f'actor_loss_{timestamp}.png'))
+        plt.close()
 
     def tearDown(self):
-        import os
-        if os.path.exists(self.save_path):
-            os.remove(self.save_path)
+        """Cleanup after tests."""
+        # Close any open plots
+        plt.close('all')
 
 if __name__ == '__main__':
     unittest.main()

@@ -136,7 +136,7 @@ class TestSAC(unittest.TestCase):
             time_step = 0
             while not done:
                 action = self.agent.select_action(state, time_step, eval=True)
-                next_state, reward, done, _ = self.env.step(action)
+                next_state, reward, done, _ = self.env.step(action.cpu().detach().numpy())
                 episode_reward += reward
                 state = next_state
                 time_step+=1
@@ -154,8 +154,8 @@ class TestSAC(unittest.TestCase):
         # Test agent action selection
         time_step = self.generate_time_encoding()
         action = self.agent.select_action(state, time_step)
-        self.assertEqual(action.shape, (self.config.action_dim,), "Action shape is incorrect")
-        self.assertTrue(np.all(action >= -1) and np.all(action <= 1), "Action values out of range")
+        self.assertEqual(action.shape, torch.Size([1, self.config.action_dim]), "Action shape is incorrect")
+        self.assertTrue(np.all(action.cpu().detach().numpy() >= -1) and np.all(action.cpu().detach().numpy() <= 1), "Action values out of range")
     
     def test_time_encoding(self):
         """Test time encoding mechanism."""
@@ -198,7 +198,7 @@ class TestSAC(unittest.TestCase):
                 action = self.agent.select_action(state, time_step)
                 
                 # Take step in environment
-                next_state, reward, done, info = self.env.step(action)
+                next_state, reward, done, info = self.env.step(action.cpu().detach().numpy())
                 episode_reward += reward
                 episode_distances.append(info['distance'])
                 
@@ -273,8 +273,8 @@ class TestSAC(unittest.TestCase):
 
             for _ in range(10):
                 action = agent.select_action(state, time_step, eval=True)
-                actions.append(action)
-                state, _, done, _ = env.step(action)
+                actions.append(action.cpu().detach().numpy())
+                state, _, done, _ = env.step(action.cpu().detach().numpy())
                 time_step+=1
                 if done:
                     break
@@ -293,7 +293,7 @@ class TestSAC(unittest.TestCase):
         actions = []
         for _ in range(10):
             action = self.agent.select_action(state, time_step, eval=True)
-            actions.append(action)
+            actions.append(action.cpu().detach().numpy())
         
         # Compare all actions to first action
         for idx, action in enumerate(actions[1:]):
@@ -310,8 +310,8 @@ class TestSAC(unittest.TestCase):
         
         for _ in range(10):
             action = self.agent.select_action(state, time_step, eval=True)
-            initial_actions.append(action)
-            state, _, done, _ = self.env.step(action)
+            initial_actions.append(action.cpu().detach().numpy())
+            state, _, done, _ = self.env.step(action.cpu().detach().numpy())
             time_step +=1
             if done:
                 state = self.env.reset()
@@ -333,8 +333,8 @@ class TestSAC(unittest.TestCase):
 
         for initial_action in initial_actions:
             loaded_action = loaded_agent.select_action(state, time_step, eval=True)
-            np.testing.assert_array_almost_equal(initial_action, loaded_action, err_msg="Action is different after loading")
-            state, _, done, _ = self.env.step(loaded_action)
+            np.testing.assert_array_almost_equal(initial_action, loaded_action.cpu().detach().numpy(), err_msg="Action is different after loading")
+            state, _, done, _ = self.env.step(loaded_action.cpu().detach().numpy())
             time_step += 1
             if done:
                 state = self.env.reset()

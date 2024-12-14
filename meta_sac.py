@@ -356,7 +356,7 @@ class MetaSACAgent(nn.Module):
             self.critic2_optimizer, mode='min', factor=0.5, patience=5
         )
 
-    def select_action(self, state: np.ndarray, time_step: int, eval: bool = False) -> np.ndarray:
+    def select_action(self, state: np.ndarray, time_step: int, eval: bool = False) -> torch.Tensor: # Modified return type to torch.Tensor
         """
         Select an action given the current state and time encoding.
         
@@ -395,7 +395,7 @@ class MetaSACAgent(nn.Module):
 
             # Ensure actions are within bounds
             action = torch.clamp(action, -1.0, 1.0)
-            return action.cpu().numpy()[0]
+            return action # modified to not convert to numpy array until the end
 
     def compute_q_targets(self, rewards: torch.Tensor, next_states: torch.Tensor, 
                             time_steps: torch.Tensor, dones: torch.Tensor) -> torch.Tensor:
@@ -417,7 +417,7 @@ class MetaSACAgent(nn.Module):
             
             # Process each state individually to avoid memory issues
             for ns, ts in zip(next_states, time_steps):
-                action = self.select_action(ns.cpu().numpy(), ts.item(), eval=False)
+                action = self.select_action(ns.cpu().numpy(), ts.item(), eval=False).unsqueeze(0) #modified to unsqueeze and return a tensor
                 next_actions.append(action)
                 
                 # Compute log prob for the selected action
@@ -429,7 +429,7 @@ class MetaSACAgent(nn.Module):
                 log_prob = dist.log_prob(z) - torch.log(1 - action_tensor.pow(2) + self.config.epsilon)
                 next_log_probs.append(log_prob.sum(-1))
 
-            next_actions = torch.FloatTensor(np.stack(next_actions)).to(self.device)
+            next_actions = torch.cat(next_actions, dim=0).to(self.device)
             next_log_probs = torch.stack(next_log_probs).unsqueeze(-1).to(self.device) # added unsqueeze to make the shape [batch_size,1]
 
             # Compute target Q-values
