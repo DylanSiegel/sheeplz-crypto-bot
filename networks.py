@@ -1,10 +1,10 @@
-# networks.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple
+from typing import Tuple, List, Optional
 import logging
 import numpy as np
+from env.config import EnvironmentConfig
 
 logger = logging.getLogger(__name__)
 
@@ -289,14 +289,14 @@ class FractalDimensionLayer(nn.Module):
 
 class ModernMLP(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int,
-                 num_layers: int = 3, dropout_rate: float = 0.1, use_custom_layers: bool = False, window_size:int = 10, custom_layers: list = None):
+                 num_layers: int, dropout_rate: float, use_custom_layers: bool, window_size:int, custom_layers: Optional[List[str]] = None):
         super().__init__()
         self.layers = nn.ModuleList()
         self.norms = nn.ModuleList()
         self.use_custom_layers = use_custom_layers
         self.hidden_dim = hidden_dim
         self.dropout_rate = dropout_rate
-        self.custom_layers_list = []
+        self.custom_layers_list: List[nn.Module] = []
         self.device_ = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         if use_custom_layers:
@@ -309,7 +309,18 @@ class ModernMLP(nn.Module):
                     FractalDimensionLayer(hidden_dim)
                 ]
             else:
-                self.custom_layers_list = [layer(hidden_dim=hidden_dim, window_size=window_size) for layer in custom_layers]
+                layer_mapping = {
+                    'KLinePatternLayer': KLinePatternLayer,
+                    'VolatilityTrackingLayer': VolatilityTrackingLayer,
+                    'TimeWarpLayer': TimeWarpLayer,
+                    'ExponentialMovingAverageLayer': ExponentialMovingAverageLayer,
+                    'FractalDimensionLayer': FractalDimensionLayer
+                }
+                for layer_name in custom_layers:
+                    if layer_name in layer_mapping:
+                        self.custom_layers_list.append(layer_mapping[layer_name](hidden_dim=hidden_dim, window_size=window_size))
+                    else:
+                        logger.warning(f"Custom layer '{layer_name}' is not recognized and will be ignored.")
 
             for i, cl in enumerate(self.custom_layers_list):
                 cl.to(self.device_)
@@ -365,7 +376,7 @@ class SinusoidalTimeEncoding(nn.Module):
         return encoding
 
 class TimeAwareBias(nn.Module):
-    def __init__(self, input_dim: int, time_encoding_dim: int = 10, hidden_dim: int = 20):
+    def __init__(self, input_dim: int, time_encoding_dim: int, hidden_dim: int):
         super().__init__()
         self.time_embedding = nn.Linear(time_encoding_dim, hidden_dim)
         self.time_projection = nn.Linear(hidden_dim, input_dim)
@@ -378,7 +389,7 @@ class TimeAwareBias(nn.Module):
 
 class AdaptiveModulationMLP(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int,
-                 num_layers: int = 3, dropout_rate: float = 0.1, time_encoding_dim: int = 10, use_custom_layers: bool = False, window_size:int = 10, custom_layers: list = None):
+                 num_layers: int, dropout_rate: float, time_encoding_dim: int, use_custom_layers: bool, window_size:int, custom_layers: Optional[List[str]] = None):
         super().__init__()
         self.layers = nn.ModuleList()
         self.norms = nn.ModuleList()
@@ -388,7 +399,7 @@ class AdaptiveModulationMLP(nn.Module):
         self.use_custom_layers = use_custom_layers
         self.hidden_dim = hidden_dim
         self.dropout_rate = dropout_rate
-        self.custom_layers_list = []
+        self.custom_layers_list: List[nn.Module] = []
         self.device_ = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         if use_custom_layers:
@@ -401,7 +412,18 @@ class AdaptiveModulationMLP(nn.Module):
                     FractalDimensionLayer(hidden_dim)
                 ]
             else:
-                self.custom_layers_list = [layer(hidden_dim=hidden_dim, window_size=window_size) for layer in custom_layers]
+                layer_mapping = {
+                    'KLinePatternLayer': KLinePatternLayer,
+                    'VolatilityTrackingLayer': VolatilityTrackingLayer,
+                    'TimeWarpLayer': TimeWarpLayer,
+                    'ExponentialMovingAverageLayer': ExponentialMovingAverageLayer,
+                    'FractalDimensionLayer': FractalDimensionLayer
+                }
+                for layer_name in custom_layers:
+                    if layer_name in layer_mapping:
+                         self.custom_layers_list.append(layer_mapping[layer_name](hidden_dim=hidden_dim, window_size=window_size))
+                    else:
+                        logger.warning(f"Custom layer '{layer_name}' is not recognized and will be ignored.")
 
             for cl in self.custom_layers_list:
                 cl.to(self.device_)
@@ -418,7 +440,7 @@ class AdaptiveModulationMLP(nn.Module):
                 norm_ = nn.LayerNorm(hidden_dim).to(self.device_)
                 self.norms.append(norm_)
                 self.modulations.append(nn.Parameter(torch.ones(hidden_dim, dtype=torch.float32)))
-                self.time_biases.append(TimeAwareBias(hidden_dim, time_encoding_dim).to(self.device_))
+                self.time_biases.append(TimeAwareBias(hidden_dim, time_encoding_dim, hidden_dim).to(self.device_))
 
         self.activation = APELU().to(self.device_)
         self.dropout = nn.Dropout(dropout_rate).to(self.device_)
@@ -471,7 +493,7 @@ class Attention(nn.Module):
         return self.out_proj(attn_output)
 
 class MetaSACActor(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: EnvironmentConfig):
         super().__init__()
         self.attention = Attention(config.state_dim, config.attention_dim).to(config.device)
         self.mlp = AdaptiveModulationMLP(
@@ -481,7 +503,7 @@ class MetaSACActor(nn.Module):
             config.num_mlp_layers,
             config.dropout_rate,
             config.time_encoding_dim,
-            use_custom_layers=(config.custom_layers is not None),
+            use_custom_layers=bool(config.custom_layers),
             window_size=config.window_size,
             custom_layers=config.custom_layers
         ).to(config.device)
@@ -502,7 +524,7 @@ class MetaSACActor(nn.Module):
         return torch.tanh(mu), log_sigma
 
 class MetaSACCritic(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: EnvironmentConfig):
         super().__init__()
         combined_dim = config.state_dim + config.action_dim
         self.attention = Attention(combined_dim, config.attention_dim).to(config.device)
@@ -513,7 +535,7 @@ class MetaSACCritic(nn.Module):
             config.num_mlp_layers,
             config.dropout_rate,
             config.time_encoding_dim,
-            use_custom_layers=(config.custom_layers is not None),
+            use_custom_layers=bool(config.custom_layers),
             window_size=config.window_size,
             custom_layers=config.custom_layers
         ).to(config.device)
@@ -530,12 +552,12 @@ class MetaSACCritic(nn.Module):
         return x
 
 class MetaController(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: EnvironmentConfig):
         super().__init__()
         self.mlp = ModernMLP(
             config.meta_input_dim + 2,
             config.hidden_dim,
-            config.num_hyperparams,
+            config.num_hyperparams + 3, # +3 for reward scaling factors
             config.num_mlp_layers,
             config.dropout_rate,
             use_custom_layers=False,
@@ -554,5 +576,47 @@ class MetaController(nn.Module):
         learning_rate_alpha = torch.sigmoid(hyperparameter_outputs[:, 2])
         tau = torch.sigmoid(hyperparameter_outputs[:, 3])
         gamma = 0.9 + 0.09 * torch.sigmoid(hyperparameter_outputs[:, 4])
+        
+        # Reward scaling factors, ensuring non-negative values
+        r_scaling_momentum = torch.sigmoid(hyperparameter_outputs[:, 5])
+        r_scaling_reversal = torch.sigmoid(hyperparameter_outputs[:, 6])
+        r_scaling_volatility = torch.sigmoid(hyperparameter_outputs[:, 7])
+        
+        return learning_rate_actor, learning_rate_critic, learning_rate_alpha, tau, gamma, r_scaling_momentum, r_scaling_reversal, r_scaling_volatility
 
-        return learning_rate_actor, learning_rate_critic, learning_rate_alpha, tau, gamma
+class PolicyDistiller(nn.Module):
+    def __init__(self, specialist_policies: List[nn.Module]):
+        super().__init__()
+        self.specialists = nn.ModuleList(specialist_policies)
+
+    def forward(self, state, time_step):
+        outputs = [policy(state, time_step) for policy in self.specialists]
+        mu_avg = torch.mean(torch.stack([out[0] for out in outputs]), dim=0)
+        log_sigma_avg = torch.mean(torch.stack([out[1] for out in outputs]), dim=0)
+        return mu_avg, log_sigma_avg
+
+class MarketModeClassifier(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim=3):  # 3 market modes
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim),
+            nn.Softmax(dim=-1)
+        )
+    
+    def forward(self, x):
+        return self.net(x)  # Returns probabilities for market modes
+
+class HighLevelPolicy(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
