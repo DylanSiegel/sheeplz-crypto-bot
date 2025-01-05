@@ -1,9 +1,18 @@
+# File: networks.py
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from typing import Tuple, List, Optional
+from torch_geometric.nn import GCNConv
+import math
+
 from config import EnvironmentConfig
+
+# ============================
+# Custom Activation Functions and Layers
+# ============================
 
 class APELU(nn.Module):
     def __init__(self, alpha_init: float = 0.01, beta_init: float = 1.0):
@@ -37,6 +46,10 @@ class VolatilityAdaptiveActivation(nn.Module):
         out = torch.nan_to_num(out)
         return out
 
+# ============================
+# Specialized Layers for Financial Data
+# ============================
+
 class KLinePatternLayer(nn.Module):
     def __init__(self, hidden_dim: int):
         super().__init__()
@@ -48,42 +61,42 @@ class KLinePatternLayer(nn.Module):
         return F.relu(self.linear(patterns))
 
     def detect_patterns(self, x: torch.Tensor) -> torch.Tensor:
-        batch_size, _ = x.shape
-        open_prices = x[:, 0]
-        high_prices = x[:, 1]
-        low_prices = x[:, 2]
-        close_prices = x[:, 3]
-        patterns = torch.zeros((batch_size, 5), device=x.device)
+        batch_size, seq_length, _ = x.shape
+        patterns = torch.zeros((batch_size, seq_length, 5), device=x.device)
 
-        if batch_size > 1:
-            # Bullish Engulfing: Current close > current open, previous close < previous open,
-            # current open < previous close, current close > previous open
-            bullish = (close_prices[1:] > open_prices[1:]) & (close_prices[:-1] < open_prices[:-1]) & \
-                      (open_prices[1:] < close_prices[:-1]) & (close_prices[1:] > open_prices[:-1])
+        if batch_size > 1 and seq_length > 1:
+            open_prices = x[:, :-1, 0]
+            high_prices = x[:, :-1, 1]
+            low_prices = x[:, :-1, 2]
+            close_prices = x[:, :-1, 3]
+            prev_open = x[:, 1:, 0]
+            prev_close = x[:, 1:, 3]
 
-            # Bearish Engulfing: Current close < current open, previous close > previous open,
-            # current open > previous close, current close < previous open
-            bearish = (close_prices[1:] < open_prices[1:]) & (close_prices[:-1] > open_prices[:-1]) & \
-                      (open_prices[1:] > close_prices[:-1]) & (close_prices[1:] < open_prices[:-1])
+            # Bullish Engulfing
+            bullish = (close_prices > open_prices) & (prev_close < prev_open) & \
+                      (open_prices < prev_close) & (close_prices > prev_open)
 
-            # Doji: Open and close prices are very close
-            doji = torch.abs(open_prices[1:] - close_prices[1:]) < (0.05 * (high_prices[1:] - low_prices[1:]))
+            # Bearish Engulfing
+            bearish = (close_prices < open_prices) & (prev_close > prev_open) & \
+                      (open_prices > prev_close) & (close_prices < prev_open)
 
-            # Hammer: Small body, long lower shadow, little to no upper shadow, appears at the bottom of a downtrend
-            hammer = (high_prices[1:] - torch.max(open_prices[1:], close_prices[1:])) < (0.1 * (high_prices[1:] - low_prices[1:])) & \
-                     (torch.min(open_prices[1:], close_prices[1:]) - low_prices[1:]) > (0.7 * (high_prices[1:] - low_prices[1:]))
+            # Doji
+            doji = torch.abs(open_prices - close_prices) < (0.05 * (high_prices - low_prices))
 
-            # Inverted Hammer: Small body, long upper shadow, little to no lower shadow, appears at the bottom of a downtrend
-            inv_hammer = (high_prices[1:] - torch.max(open_prices[1:], close_prices[1:])) > (0.7 * (high_prices[1:] - low_prices[1:])) & \
-                         (torch.min(open_prices[1:], close_prices[1:]) - low_prices[1:]) < (0.1 * (high_prices[1:] - low_prices[1:]))
+            # Hammer
+            hammer = ((high_prices - torch.max(open_prices, close_prices)) < (0.1 * (high_prices - low_prices))) & \
+                     ((torch.min(open_prices, close_prices) - low_prices) > (0.7 * (high_prices - low_prices)))
 
-            patterns[1:, 0] = bullish.float()
-            patterns[1:, 1] = bearish.float()
-            patterns[1:, 2] = doji.float()
-            patterns[1:, 3] = hammer.float()
-            patterns[1:, 4] = inv_hammer.float()
+            # Inverted Hammer
+            inv_hammer = ((high_prices - torch.max(open_prices, close_prices)) > (0.7 * (high_prices - low_prices))) & \
+                         ((torch.min(open_prices, close_prices) - low_prices) < (0.1 * (high_prices - low_prices)))
 
-        patterns[0, :5] = 0 # No pattern initially
+            patterns[:, 1:, 0] = bullish.float()
+            patterns[:, 1:, 1] = bearish.float()
+            patterns[:, 1:, 2] = doji.float()
+            patterns[:, 1:, 3] = hammer.float()
+            patterns[:, 1:, 4] = inv_hammer.float()
+
         return patterns
 
 class VolatilityTrackingLayer(nn.Module):
@@ -94,37 +107,57 @@ class VolatilityTrackingLayer(nn.Module):
         self.linear = nn.Linear(3, hidden_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        close_prices = x[:, 3].unsqueeze(-1)
+        close_prices = x[:, :, 3].unsqueeze(-1)  # (batch_size, seq_length, 1)
         volatility_measures = self.calculate_volatility_measures(close_prices, x)
         volatility_measures = torch.nan_to_num(volatility_measures)
         return F.relu(self.linear(volatility_measures))
 
     def calculate_volatility_measures(self, close_prices: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        window = min(self.window_size, close_prices.shape[1])
-        if window < 2:
-            return torch.zeros((close_prices.shape[0], 3), device=close_prices.device)
+        batch_size, seq_length, _ = close_prices.shape
+        measures = torch.zeros((batch_size, seq_length, 3), device=close_prices.device)
 
-        std_dev = torch.zeros((close_prices.shape[0],), device=close_prices.device)
-        garman_klass = torch.zeros((close_prices.shape[0],), device=close_prices.device)
-        parkinson = torch.zeros((close_prices.shape[0],), device=close_prices.device)
+        for i in range(batch_size):
+            for t in range(self.window_size, seq_length):
+                window = close_prices[i, t - self.window_size:t, 0]
+                log_returns = torch.log(window[1:] / window[:-1] + 1e-8)
+                std_dev = torch.std(log_returns)
 
-        for i in range(close_prices.shape[0]):
-            if close_prices.shape[1] >= window:
-                window_data = close_prices[i, -window:]
-                log_returns = torch.log(window_data[1:] / window_data[:-1] + 1e-8)
-                std_dev[i] = torch.std(log_returns)
-
-                # Assuming high and low prices are available as x[:, 1] and x[:, 2]
-                high = x[i, 1, -window:]
-                low = x[i, 2, -window:]
-
+                high = x[i, t, 1]
+                low = x[i, t, 2]
                 log_hl = torch.log(high / low + 1e-8)
-                log_cc = torch.log(window_data[1:] / window_data[:-1] + 1e-8)
-                garman_klass[i] = torch.sqrt(torch.mean(0.5 * log_hl**2 - (2 * torch.log(torch.tensor(2.0)) - 1) * log_cc**2))
+                log_cc = log_returns
+                garman_klass = torch.sqrt(torch.mean(0.5 * log_hl**2 - (2 * torch.log(torch.tensor(2.0)) - 1) * log_cc**2))
+                parkinson = torch.sqrt(torch.mean(log_hl**2) / (4 * torch.log(torch.tensor(2.0))))
 
-                parkinson[i] = torch.sqrt(torch.mean(log_hl**2) / (4 * torch.log(torch.tensor(2.0))))
+                measures[i, t, 0] = std_dev
+                measures[i, t, 1] = garman_klass
+                measures[i, t, 2] = parkinson
 
-        return torch.stack([std_dev, garman_klass, parkinson], dim=1)
+        return measures
+
+class TimeWarpLayer(nn.Module):
+    def __init__(self, hidden_dim: int, window_size: int):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.window_size = window_size
+        self.linear = nn.Linear(hidden_dim, hidden_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Implement time warping logic
+        # Placeholder implementation
+        return F.relu(self.linear(x))
+
+class ExponentialMovingAverageLayer(nn.Module):
+    def __init__(self, window_size: int, hidden_dim: int):
+        super().__init__()
+        self.window_size = window_size
+        self.hidden_dim = hidden_dim
+        self.linear = nn.Linear(hidden_dim, hidden_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Implement EMA logic
+        # Placeholder implementation
+        return F.relu(self.linear(x))
 
 class FractalDimensionLayer(nn.Module):
     def __init__(self, hidden_dim: int, max_k: int = 10, buffer_size: int = 50):
@@ -132,157 +165,331 @@ class FractalDimensionLayer(nn.Module):
         self.linear = nn.Linear(1, hidden_dim)
         self.max_k = max_k
         self.buffer_size = buffer_size
-        self.values_buffer = []
+        self.register_buffer('values_buffer', torch.zeros(buffer_size))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        close_prices = x[:, 3]
-        hfd_values = torch.zeros((close_prices.shape[0], 1), device=x.device)
+        close_prices = x[:, :, 3]  # (batch_size, seq_length)
+        batch_size, seq_length = close_prices.shape
+        hfd_values = torch.zeros((batch_size, seq_length, 1), device=x.device)
 
-        for i, price in enumerate(close_prices):
-            self.update_buffer(price.item())
-            if len(self.values_buffer) > self.max_k:
-                hfd_values[i, 0] = self.calculate_hfd_optimized()
+        for i in range(batch_size):
+            for t in range(seq_length):
+                # Update buffer: shift left and append new price
+                self.values_buffer = torch.roll(self.values_buffer, shifts=-1)
+                self.values_buffer[-1] = close_prices[i, t]
+
+                if t >= self.max_k:
+                    window = self.values_buffer[-self.max_k:]
+                    hfd_values[i, t, 0] = self.calculate_hfd_optimized(window)
+
         return F.relu(self.linear(hfd_values))
 
-    def update_buffer(self, value: float):
-        self.values_buffer.append(value)
-        if len(self.values_buffer) > self.buffer_size:
-            self.values_buffer.pop(0)
-
-    def calculate_hfd_optimized(self) -> float:
-        if len(self.values_buffer) < self.max_k + 1:
+    def calculate_hfd_optimized(self, arr: torch.Tensor) -> float:
+        n = len(arr)
+        if n < self.max_k + 1:
             return 0.0
 
-        arr = np.array(self.values_buffer)
-        n = len(arr)
-        lk_values = np.zeros(self.max_k)
-
+        lk_values = torch.zeros(self.max_k, device=arr.device)
         for k in range(1, self.max_k + 1):
             for m in range(k):
-                idxs = np.arange(m, n, k)
+                idxs = torch.arange(m, n, k, device=arr.device)
                 if len(idxs) >= 2:
-                    lengths = np.abs(np.diff(arr[idxs]))
-                    lk_values[k - 1] += np.sum(lengths) * (n - 1) / (len(idxs) * k)
+                    lengths = torch.abs(arr[idxs[1:]] - arr[idxs[:-1]])
+                    lk_values[k - 1] += torch.sum(lengths) * (n - 1) / (len(idxs) * k)
             lk_values[k - 1] /= k
 
-        valid_k_values = (lk_values > 0)
-        if np.sum(valid_k_values) > 1:
-            k_arr = np.arange(1, self.max_k + 1)[valid_k_values]
-            log_k = np.log(k_arr)
-            log_lk = np.log(lk_values[valid_k_values])
-            slope, _ = np.polyfit(log_k, log_lk, 1)
-            return -slope
+        valid_k_values = lk_values > 0
+        if torch.sum(valid_k_values) > 1:
+            k_arr = torch.arange(1, self.max_k + 1, device=arr.device)[valid_k_values]
+            log_k = torch.log(k_arr.float())
+            log_lk = torch.log(lk_values[valid_k_values])
+            slope, _ = torch.polyfit(log_k, log_lk, 1)
+            return -slope.item()
         else:
             return 0.0
 
-class MarketModeClassifier(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int = 3):
+# ============================
+# Residual Block
+# ============================
+
+class ResidualBlock(nn.Module):
+    """Residual block with two linear layers and a skip connection."""
+    def __init__(self, input_dim: int, hidden_dim: int, dropout_rate: float = 0.1):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim),
-            nn.Softmax(dim=-1)
-        )
+        self.linear1 = nn.Linear(input_dim, hidden_dim)
+        self.activation = APELU()
+        self.dropout = nn.Dropout(dropout_rate)
+        self.linear2 = nn.Linear(hidden_dim, input_dim)
+        self.norm = nn.LayerNorm(input_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        residual = x
+        out = self.linear1(x)
+        out = self.activation(out)
+        out = self.dropout(out)
+        out = self.linear2(out)
+        out = self.norm(out)
+        out += residual
+        out = self.activation(out)
+        return out
 
-class HighLevelPolicy(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int):
+# ============================
+# Transformer and Attention Layers
+# ============================
+
+class TransformerEncoderLayerCustom(nn.Module):
+    """Custom Transformer Encoder Layer with multi-headed attention and residual connections."""
+    def __init__(self, embed_dim: int, num_heads: int, dim_feedforward: int = 2048, dropout: float = 0.1):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-            nn.Sigmoid()
-        )
+        self.self_attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout)
+        # Implementation of Feedforward model
+        self.linear1 = nn.Linear(embed_dim, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, embed_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.activation = F.relu
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
 
-class MetaController(nn.Module):
-    def __init__(self, config: EnvironmentConfig):
+    def forward(self, src: torch.Tensor, src_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            src: the sequence to the encoder (S, N, E)
+            src_mask: the mask for the src sequence (S, S)
+        """
+        src2, _ = self.self_attn(src, src, src, attn_mask=src_mask)
+        src = src + self.dropout1(src2)
+        src = self.norm1(src)
+        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+        src = src + self.dropout2(src2)
+        src = self.norm2(src)
+        return src
+
+class TransformerEncoderCustom(nn.Module):
+    """Custom Transformer Encoder with multiple layers."""
+    def __init__(self, embed_dim: int, num_heads: int, num_layers: int, dim_feedforward: int = 2048, dropout: float = 0.1):
         super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(config.meta_input_dim + 2, config.hidden_dim),
-            nn.ReLU(),
-            nn.Linear(config.hidden_dim, config.num_hyperparams + 3),
-            nn.Sigmoid()
-        )
-        self.num_hyperparams = config.num_hyperparams
-        self.ema_smoothing = 0.9 # Smoothing factor
+        self.layers = nn.ModuleList([
+            TransformerEncoderLayerCustom(embed_dim, num_heads, dim_feedforward, dropout)
+            for _ in range(num_layers)
+        ])
+        self.norm = nn.LayerNorm(embed_dim)
 
-        self.ema_values = None
+    def forward(self, src: torch.Tensor, src_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        for layer in self.layers:
+            src = layer(src, src_mask)
+        src = self.norm(src)
+        return src
 
-    def forward(self, x: torch.Tensor, reward_stats: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-        cat_input = torch.cat([x, reward_stats], dim=-1)
-        out = self.mlp(cat_input)
+class MultiHeadAttentionCustom(nn.Module):
+    """Multi-Head Attention Layer."""
+    def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.1):
+        super().__init__()
+        self.multihead_attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout)
+        self.norm = nn.LayerNorm(embed_dim)
+        self.dropout = nn.Dropout(dropout)
 
-        if self.ema_values is None:
-            self.ema_values = list(out.split(1, dim=-1))
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        attn_output, _ = self.multihead_attn(x, x, x, attn_mask=attn_mask)
+        x = x + self.dropout(attn_output)
+        x = self.norm(x)
+        return x
+
+# ============================
+# MLP Classes with Enhancements
+# ============================
+
+class BaseMLP(nn.Module):
+    """Base MLP with support for custom layers, normalization, and residual connections."""
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        output_dim: int,
+        num_layers: int,
+        dropout_rate: float,
+        use_custom_layers: bool,
+        window_size: int,
+        custom_layers: Optional[List[str]] = None,
+        use_instance_norm: bool = False,
+        use_group_norm: bool = False,
+        num_groups: int = 8,
+        use_residual: bool = False,
+    ):
+        super().__init__()
+        self.use_custom_layers = use_custom_layers
+        self.use_instance_norm = use_instance_norm
+        self.use_group_norm = use_group_norm
+        self.use_residual = use_residual
+        self.activation = APELU()
+        self.dropout = nn.Dropout(dropout_rate)
+
+        # Custom Layers
+        self.custom_layers_list: List[nn.Module] = []
+        if use_custom_layers:
+            layer_mapping = {
+                "KLinePatternLayer": lambda: KLinePatternLayer(hidden_dim),
+                "VolatilityTrackingLayer": lambda: VolatilityTrackingLayer(hidden_dim, window_size),
+                "TimeWarpLayer": lambda: TimeWarpLayer(hidden_dim, window_size),
+                "ExponentialMovingAverageLayer": lambda: ExponentialMovingAverageLayer(window_size, hidden_dim),
+                "FractalDimensionLayer": lambda: FractalDimensionLayer(hidden_dim)
+            }
+            if custom_layers is None:
+                self.custom_layers_list = [
+                    KLinePatternLayer(hidden_dim),
+                    VolatilityTrackingLayer(hidden_dim, window_size),
+                    TimeWarpLayer(hidden_dim, window_size),
+                    ExponentialMovingAverageLayer(window_size, hidden_dim),
+                    FractalDimensionLayer(hidden_dim)
+                ]
+            else:
+                for layer_name in custom_layers:
+                    if layer_name in layer_mapping:
+                        self.custom_layers_list.append(layer_mapping[layer_name]())
+            in_features = hidden_dim * len(self.custom_layers_list)
         else:
-            for i, o in enumerate(out.split(1, dim=-1)):
-                self.ema_values[i] = self.ema_smoothing * self.ema_values[i] + (1 - self.ema_smoothing) * o
+            in_features = input_dim
 
-        return tuple(self.ema_values)
-    
-class TimeWarpLayer(nn.Module):
-    """Applies a time warping effect by averaging with last input."""
-    def __init__(self, hidden_dim: int, window_size: int = 10):
-        super().__init__()
-        self.linear = nn.Linear(4, hidden_dim)
-        self.last_x = None
+        # MLP Layers
+        self.layers = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        self.residual_blocks = nn.ModuleList() if use_residual else None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Applies time warping and linear layer."""
-        x = torch.where(torch.isnan(x), torch.tensor(0.0, device=x.device, dtype=x.dtype), x)
-        if self.last_x is None:
-            self.last_x = x
-        time_warped_x = (self.last_x + x) / 2
-        self.last_x = x.clone().detach()
-        return self.linear(time_warped_x)
+        prev_features = in_features
+        for i in range(num_layers):
+            out_features = output_dim if i == num_layers - 1 else hidden_dim
+            self.layers.append(nn.Linear(prev_features, out_features))
+            if self.use_instance_norm:
+                self.norms.append(nn.InstanceNorm1d(out_features))
+            elif self.use_group_norm:
+                self.norms.append(nn.GroupNorm(num_groups, out_features))
+            else:
+                self.norms.append(nn.LayerNorm(out_features))
+            if self.use_residual and i < num_layers - 1:
+                self.residual_blocks.append(ResidualBlock(out_features, hidden_dim, dropout_rate))
+            prev_features = out_features
 
-class ExponentialMovingAverageLayer(nn.Module):
-    """Calculates and applies EMA of close prices."""
-    def __init__(self, window_size: int, hidden_dim: int):
-        super().__init__()
-        self.window_size = window_size
-        self.alpha = 2/(window_size+1)
-        self.ema = None
-        self.linear = nn.Linear(1, hidden_dim)
+    def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        """Forward pass with optional custom layers."""
+        if self.use_custom_layers:
+            outputs = []
+            for cl in self.custom_layers_list:
+                out = cl(x)
+                outputs.append(out)
+            x = torch.cat(outputs, dim=-1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Calculates EMA and applies linear layer."""
-        x = torch.where(torch.isnan(x), torch.tensor(0.0, device=x.device), x)
-        close_prices = x[:, 3]
-        if self.ema is None:
-            self.ema = close_prices.clone()
-        else:
-            self.ema = (close_prices * self.alpha) + (self.ema * (1 - self.alpha))
-        ema_values = self.ema.unsqueeze(-1)
-        ema_values = torch.where(torch.isnan(ema_values), torch.tensor(0.0, device=x.device), ema_values)
-        return F.relu(self.linear(ema_values))
-    
+        for i, layer in enumerate(self.layers):
+            x = layer(x)
+            if i < len(self.norms):
+                if self.use_instance_norm:
+                    x = self.norms[i](x.unsqueeze(2)).squeeze(2)
+                elif self.use_group_norm:
+                    x = self.norms[i](x.unsqueeze(2)).squeeze(2)
+                else:
+                    x = self.norms[i](x)
+                x = self.activation(x)
+                x = self.dropout(x)
+                if self.use_residual and i < len(self.residual_blocks):
+                    x = self.residual_blocks[i](x)
+        return x
+
+class AdaptiveModulationMLP(BaseMLP):
+    """MLP with time-aware modulation, residual connections, and advanced normalization."""
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        output_dim: int,
+        num_layers: int,
+        dropout_rate: float,
+        time_encoding_dim: int,
+        use_custom_layers: bool,
+        window_size: int,
+        custom_layers: Optional[List[str]] = None,
+        use_instance_norm: bool = False,
+        use_group_norm: bool = False,
+        num_groups: int = 8,
+        use_residual: bool = False,
+    ):
+        super().__init__(
+            input_dim,
+            hidden_dim,
+            output_dim,
+            num_layers,
+            dropout_rate,
+            use_custom_layers,
+            window_size,
+            custom_layers,
+            use_instance_norm,
+            use_group_norm,
+            num_groups,
+            use_residual
+        )
+        self.sinusoidal_encoding = SinusoidalTimeEncoding(time_encoding_dim)
+        self.time_biases = nn.ModuleList([
+            TimeAwareBias(hidden_dim, time_encoding_dim, hidden_dim) for _ in range(num_layers - 1)
+        ])
+        self.modulations = nn.ParameterList([
+            nn.Parameter(torch.ones(hidden_dim)) for _ in range(num_layers - 1)
+        ])
+
+    def forward(self, x: torch.Tensor, time_step: torch.Tensor) -> torch.Tensor:
+        """Forward pass with time-aware modulation."""
+        time_encoding = self.sinusoidal_encoding(time_step)
+
+        if self.use_custom_layers:
+            outputs = []
+            for cl in self.custom_layers_list:
+                out = cl(x)
+                outputs.append(out)
+            x = torch.cat(outputs, dim=-1)
+
+        for i, layer in enumerate(self.layers):
+            x = layer(x)
+            if i < len(self.norms):
+                mod_factor = self.modulations[i] + self.time_biases[i](time_encoding)
+                x = x * mod_factor
+                if self.use_instance_norm:
+                    x = self.norms[i](x.unsqueeze(2)).squeeze(2)
+                elif self.use_group_norm:
+                    x = self.norms[i](x.unsqueeze(2)).squeeze(2)
+                else:
+                    x = self.norms[i](x)
+                x = self.activation(x)
+                x = self.dropout(x)
+                if self.use_residual and i < len(self.residual_blocks):
+                    x = self.residual_blocks[i](x)
+        return x
+
+# ============================
+# Sinusoidal Time Encoding
+# ============================
+
 class SinusoidalTimeEncoding(nn.Module):
     """Encodes time using sinusoidal functions."""
     def __init__(self, time_encoding_dim: int):
         super().__init__()
         self.time_encoding_dim = time_encoding_dim
-        self.frequencies = 10**(torch.arange(0, time_encoding_dim//2)*(-2/(time_encoding_dim//2)))
+        self.frequencies = 10**(torch.arange(0, time_encoding_dim//2) * (-2/(time_encoding_dim//2)))
 
     def forward(self, time_step: torch.Tensor) -> torch.Tensor:
         """Applies sinusoidal time encoding."""
-        time_step = time_step.float().unsqueeze(-1)
-        scaled_time = time_step * self.frequencies.to(time_step.device)
+        time_step = time_step.float().unsqueeze(-1)  # (batch_size, 1)
+        scaled_time = time_step * self.frequencies.to(time_step.device)  # (batch_size, time_encoding_dim//2)
         sin_enc = torch.sin(scaled_time)
         cos_enc = torch.cos(scaled_time)
         if self.time_encoding_dim % 2 == 0:
-            encoding = torch.cat([sin_enc, cos_enc], dim=-1)
+            encoding = torch.cat([sin_enc, cos_enc], dim=-1)  # (batch_size, time_encoding_dim)
         else:
-            zero_pad = torch.zeros_like(cos_enc[:, :1])
+            zero_pad = torch.zeros_like(cos_enc[:, :1], device=cos_enc.device)
             encoding = torch.cat([sin_enc, cos_enc, zero_pad], dim=-1)
         return encoding
+
+# ============================
+# Time-Aware Bias
+# ============================
 
 class TimeAwareBias(nn.Module):
     """Learns a bias that is a function of time encoding."""
@@ -298,233 +505,111 @@ class TimeAwareBias(nn.Module):
         x = self.activation(x)
         return self.time_projection(x)
 
-class ModernMLP(nn.Module):
-    """MLP with custom layers, layer norm, dropout, and APELU."""
-    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int,
-                 num_layers: int, dropout_rate: float, use_custom_layers: bool,
-                 window_size: int, custom_layers: Optional[List[str]] = None):
-        super().__init__()
-        self.layers = nn.ModuleList()
-        self.norms = nn.ModuleList()
-        self.use_custom_layers = use_custom_layers
-        self.hidden_dim = hidden_dim
-        self.activation = APELU()
-        self.dropout = nn.Dropout(dropout_rate)
+# ============================
+# Policy Distiller with Ensemble Methods
+# ============================
 
-        self.custom_layers_list: List[nn.Module] = []
-        if use_custom_layers:
-            layer_mapping = {
-                "KLinePatternLayer": lambda: KLinePatternLayer(hidden_dim),
-                "VolatilityTrackingLayer": lambda: VolatilityTrackingLayer(hidden_dim, window_size),
-                "TimeWarpLayer": lambda: TimeWarpLayer(hidden_dim, window_size),
-                "ExponentialMovingAverageLayer": lambda: ExponentialMovingAverageLayer(window_size, hidden_dim),
-                "FractalDimensionLayer": lambda: FractalDimensionLayer(hidden_dim)
-            }
-            if custom_layers is None:
-                self.custom_layers_list = [
-                    KLinePatternLayer(hidden_dim),
-                    VolatilityTrackingLayer(hidden_dim, window_size),
-                    TimeWarpLayer(hidden_dim, window_size),
-                    ExponentialMovingAverageLayer(window_size, hidden_dim),
-                    FractalDimensionLayer(hidden_dim)
-                ]
-            else:
-                for layer_name in custom_layers:
-                    if layer_name in layer_mapping:
-                        self.custom_layers_list.append(layer_mapping[layer_name]())
-            in_features = hidden_dim * len(self.custom_layers_list)
-        else:
-            in_features = input_dim
-
-        prev_features = in_features
-        for i in range(num_layers):
-            out_features = output_dim if i == num_layers - 1 else hidden_dim
-            self.layers.append(nn.Linear(prev_features, out_features))
-            if i != num_layers - 1:
-                self.norms.append(nn.LayerNorm(out_features))
-            prev_features = out_features
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Applies MLP with optional custom layers."""
-        if self.use_custom_layers:
-            outputs = []
-            for cl in self.custom_layers_list:
-                out = cl(x)
-                outputs.append(out)
-            x = torch.cat(outputs, dim=-1)
-
-        for i, layer in enumerate(self.layers):
-            x = layer(x)
-            if i != len(self.layers) - 1:
-                x = self.norms[i](x)
-                x = self.activation(x)
-                x = self.dropout(x)
-        return x
-
-class AdaptiveModulationMLP(nn.Module):
-    """MLP with time-aware modulation and custom layers."""
-    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int,
-                 num_layers: int, dropout_rate: float, time_encoding_dim: int,
-                 use_custom_layers: bool, window_size: int, custom_layers: Optional[List[str]]=None):
-        super().__init__()
-        self.layers = nn.ModuleList()
-        self.norms = nn.ModuleList()
-        self.modulations = nn.ParameterList()
-        self.time_biases = nn.ModuleList()
-        self.sinusoidal_encoding = SinusoidalTimeEncoding(time_encoding_dim)
-        self.use_custom_layers = use_custom_layers
-        self.activation = APELU()
-        self.dropout = nn.Dropout(dropout_rate)
-        self.num_layers = num_layers
-
-        self.custom_layers_list: List[nn.Module] = []
-        if use_custom_layers:
-            layer_mapping = {
-                "KLinePatternLayer": lambda: KLinePatternLayer(hidden_dim),
-                "VolatilityTrackingLayer": lambda: VolatilityTrackingLayer(hidden_dim, window_size),
-                "TimeWarpLayer": lambda: TimeWarpLayer(hidden_dim, window_size),
-                "ExponentialMovingAverageLayer": lambda: ExponentialMovingAverageLayer(window_size, hidden_dim),
-                "FractalDimensionLayer": lambda: FractalDimensionLayer(hidden_dim)
-            }
-            if custom_layers is None:
-                self.custom_layers_list = [
-                    KLinePatternLayer(hidden_dim),
-                    VolatilityTrackingLayer(hidden_dim, window_size),
-                    TimeWarpLayer(hidden_dim, window_size),
-                    ExponentialMovingAverageLayer(window_size, hidden_dim),
-                    FractalDimensionLayer(hidden_dim)
-                ]
-            else:
-                for layer_name in custom_layers:
-                    if layer_name in layer_mapping:
-                        self.custom_layers_list.append(layer_mapping[layer_name]())
-
-            in_features = hidden_dim * len(self.custom_layers_list)
-        else:
-            in_features = input_dim
-
-        prev_features = in_features
-        for i in range(num_layers):
-            out_features = output_dim if i == num_layers - 1 else hidden_dim
-            self.layers.append(nn.Linear(prev_features, out_features))
-            if i != num_layers - 1:
-                self.norms.append(nn.LayerNorm(out_features))
-                self.modulations.append(nn.Parameter(torch.ones(out_features)))
-                self.time_biases.append(TimeAwareBias(out_features, time_encoding_dim, out_features))
-            prev_features = out_features
-
-    def forward(self, x: torch.Tensor, time_step: torch.Tensor) -> torch.Tensor:
-        """Applies MLP with time-aware modulation."""
-        time_encoding = self.sinusoidal_encoding(time_step)
-
-        if self.use_custom_layers:
-            outputs = []
-            for cl in self.custom_layers_list:
-                out = cl(x)
-                outputs.append(out)
-            x = torch.cat(outputs, dim=-1)
-
-        for i, layer in enumerate(self.layers):
-            x = layer(x)
-            if i != self.num_layers - 1:
-                mod_factor = self.modulations[i] + self.time_biases[i](time_encoding)
-                x = x * mod_factor
-                x = self.norms[i](x)
-                x = self.activation(x)
-                x = self.dropout(x)
-        return x
-
-class Attention(nn.Module):
-    """Attention mechanism."""
-    def __init__(self, input_dim: int, attention_dim: int):
-        super().__init__()
-        self.query_proj = nn.Linear(input_dim, attention_dim)
-        self.key_proj = nn.Linear(input_dim, attention_dim)
-        self.value_proj = nn.Linear(input_dim, attention_dim)
-        self.out_proj = nn.Linear(attention_dim, input_dim)
-        nn.init.xavier_uniform_(self.query_proj.weight)
-        nn.init.xavier_uniform_(self.key_proj.weight)
-        nn.init.xavier_uniform_(self.value_proj.weight)
-        nn.init.xavier_uniform_(self.out_proj.weight)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Applies attention mechanism."""
-        x = torch.where(torch.isnan(x), torch.tensor(0.0, device=x.device, dtype=x.dtype), x)
-        query = self.query_proj(x)
-        key = self.key_proj(x)
-        value = self.value_proj(x)
-        attn_output = torch.nn.functional.scaled_dot_product_attention(query, key, value)
-        return self.out_proj(attn_output)
-
-class MetaSACActor(nn.Module):
-    """Actor network for MetaSAC."""
-    def __init__(self, config: EnvironmentConfig):
-        super().__init__()
-        self.attention = Attention(config.state_dim, config.attention_dim)
-        self.mlp = AdaptiveModulationMLP(
-            input_dim=config.state_dim,
-            hidden_dim=config.hidden_dim,
-            output_dim=2*config.action_dim,
-            num_layers=config.num_mlp_layers,
-            dropout_rate=config.dropout_rate,
-            time_encoding_dim=config.time_encoding_dim,
-            use_custom_layers=bool(config.custom_layers),
-            window_size=config.window_size,
-            custom_layers=config.custom_layers
-        )
-        self.action_dim = config.action_dim
-
-    def forward(self, x: torch.Tensor, time_step: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Outputs mean and log sigma for action sampling."""
-        if x.dim() == 2:
-            x = x.unsqueeze(1)
-        x = self.attention(x)
-        x = x.squeeze(1)
-        x = self.mlp(x, time_step)
-        mu = x[:, :self.action_dim]
-        log_sigma = x[:, self.action_dim:]
-        mu = torch.tanh(mu)
-        return mu, log_sigma
-
-class MetaSACCritic(nn.Module):
-    """Critic network for MetaSAC."""
-    def __init__(self, config: EnvironmentConfig):
-        super().__init__()
-        combined_dim = config.state_dim + config.action_dim
-        self.attention = Attention(combined_dim, config.attention_dim)
-        self.mlp = AdaptiveModulationMLP(
-            input_dim=combined_dim,
-            hidden_dim=config.hidden_dim,
-            output_dim=1,
-            num_layers=config.num_mlp_layers,
-            dropout_rate=config.dropout_rate,
-            time_encoding_dim=config.time_encoding_dim,
-            use_custom_layers=bool(config.custom_layers),
-            window_size=config.window_size,
-            custom_layers=config.custom_layers
-        )
-
-    def forward(self, state: torch.Tensor, action: torch.Tensor, time_step: torch.Tensor) -> torch.Tensor:
-        """Outputs Q-value estimate."""
-        x = torch.cat([state, action], dim=-1)
-        if x.dim() == 2:
-            x = x.unsqueeze(1)
-        x = self.attention(x)
-        x = x.squeeze(1)
-        x = self.mlp(x, time_step)
-        return x
-
-class PolicyDistiller(nn.Module):
-    """Combines outputs from multiple specialist policies."""
-    def __init__(self, specialist_policies: List[nn.Module]):
+class PolicyDistillerEnsemble(nn.Module):
+    """Combines outputs from multiple specialist policies using an ensemble approach."""
+    def __init__(self, specialist_policies: List[nn.Module], config: EnvironmentConfig):
         super().__init__()
         self.specialists = nn.ModuleList(specialist_policies)
+        self.ensemble_size = config.ensemble_size
+        self.mlp = nn.Linear(config.action_dim * self.ensemble_size * 2, config.action_dim * 2)  # For mu and log_sigma
 
-    def forward(self, state: torch.Tensor, time_step: torch.Tensor):
-        """Averages outputs from specialist policies."""
-        outputs = [spec(state, time_step) for spec in self.specialists]
-        mus = torch.stack([o[0] for o in outputs], dim=0)
-        log_sigmas = torch.stack([o[1] for o in outputs], dim=0)
-        mu_avg = torch.mean(mus, dim=0)
-        log_sigma_avg = torch.mean(log_sigmas, dim=0)
-        return mu_avg, log_sigma_avg
+    def forward(self, state: torch.Tensor, time_step: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            state: (batch_size, seq_length, state_dim)
+            time_step: (batch_size, )
+        Returns:
+            mu: (batch_size, action_dim)
+            log_sigma: (batch_size, action_dim)
+        """
+        outputs = [spec(state, time_step) for spec in self.specialists]  # List of (batch_size, 2 * action_dim)
+        mus = torch.stack([o[0] for o in outputs], dim=-1)  # (batch_size, action_dim, ensemble_size)
+        log_sigmas = torch.stack([o[1] for o in outputs], dim=-1)  # (batch_size, action_dim, ensemble_size)
+
+        # Concatenate along the ensemble dimension
+        mus = mus.view(mus.size(0), -1)  # (batch_size, action_dim * ensemble_size)
+        log_sigmas = log_sigmas.view(log_sigmas.size(0), -1)  # (batch_size, action_dim * ensemble_size)
+
+        # Pass through an MLP to aggregate
+        aggregated = self.mlp(torch.cat([mus, log_sigmas], dim=-1))  # (batch_size, action_dim * 2)
+        mu = torch.tanh(aggregated[:, :config.action_dim])
+        log_sigma = torch.clamp(aggregated[:, config.action_dim:], min=-20, max=2)
+        return mu, log_sigma
+
+    def compute_log_prob(self, mu: torch.Tensor, log_sigma: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        """Computes the log probability of actions under the current policy."""
+        sigma = torch.exp(log_sigma)
+        dist = torch.distributions.Normal(mu, sigma)
+        log_prob = dist.log_prob(actions).sum(dim=-1)
+        return log_prob
+
+# ============================
+# High-Level Policy
+# ============================
+
+class HighLevelPolicy(nn.Module):
+    """High-Level Policy Network for hierarchical decision-making."""
+    def __init__(self, state_dim: int, hidden_dim: int):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Outputs probability of selecting a high-level action."""
+        return self.mlp(x)
+
+# ============================
+# Market Mode Classifier
+# ============================
+
+class MarketModeClassifier(nn.Module):
+    """Classifies the current market mode."""
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Outputs market mode logits."""
+        return self.mlp(x)
+
+# ============================
+# Meta Controller
+# ============================
+
+class MetaController(nn.Module):
+    """Meta Controller for dynamic hyperparameter adjustment."""
+    def __init__(self, config: EnvironmentConfig):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(config.state_dim + 2, config.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(config.hidden_dim, config.num_hyperparams + 3),
+            nn.Sigmoid()
+        )
+        self.num_hyperparams = config.num_hyperparams
+        self.ema_smoothing = 0.9  # Smoothing factor
+
+        self.register_buffer('ema_values', torch.zeros(config.num_hyperparams + 3))
+
+    def forward(self, x: torch.Tensor, reward_stats: torch.Tensor) -> torch.Tensor:
+        cat_input = torch.cat([x, reward_stats], dim=-1)
+        out = self.mlp(cat_input)
+
+        if self.ema_values is None:
+            self.ema_values = out.detach()
+        else:
+            self.ema_values = self.ema_smoothing * self.ema_values + (1 - self.ema_smoothing) * out.detach()
+
+        return self.ema_values

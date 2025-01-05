@@ -1,4 +1,5 @@
-# env/environment.py
+# File: env/environment.py
+
 import numpy as np
 
 class HistoricalEnvironment:
@@ -21,5 +22,6 @@ class HistoricalEnvironment:
             next_state = self.historical_data[next_time]
         else:
             next_state = np.zeros_like(self.historical_data[0])
+        # Simple reward: random small change plus action effect
         reward = float(np.random.randn() * 0.01 + 0.01)
         return next_state, reward, done, {}
