@@ -39,6 +39,11 @@ from replay_buffer import ReplayBuffer
 from reward import calculate_reward
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+formatter = logging.Formatter('[%(asctime)s] %(levelname)s:%(name)s:%(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
 
 class SACLoss(nn.Module):
     """Soft Actor-Critic Loss Function."""
@@ -166,9 +171,9 @@ class MetaSACAgent(nn.Module):
         edge_index = edge_index.to(self.device)
 
         # Process graph data
-        graph_embedding = self.market_gnn(graph_node_features, edge_index)  # (num_nodes, state_dim)
-        graph_embedding = torch.mean(graph_embedding, dim=0, keepdim=True).repeat(state_tensor.size(0), 1, 1)  # (1, 1, state_dim)
-        state_tensor = torch.cat([state_tensor, graph_embedding], dim=1)  # (1, seq_length +1, state_dim)
+        graph_embedding = self.market_gnn(graph_node_features, edge_index)  # (num_nodes, hidden_dim)
+        graph_embedding = torch.mean(graph_embedding, dim=0, keepdim=True).repeat(state_tensor.size(0), 1, 1)  # (1, 1, hidden_dim)
+        state_tensor = torch.cat([state_tensor, graph_embedding], dim=1)  # (1, seq_length +1, hidden_dim)
 
         if eval:
             with torch.no_grad():
@@ -564,8 +569,9 @@ class MetaSACAgent(nn.Module):
                         for traj in all_trajectories:
                             search_trajectories.extend(traj)
                     else:
-                        best_traj = max(all_trajectories, key=lambda t: sum(step[2] for step in t))
-                        search_trajectories.extend(best_traj)
+                        if all_trajectories:
+                            best_traj = max(all_trajectories, key=lambda t: sum(step[2] for step in t))
+                            search_trajectories.extend(best_traj)
                 elif search_algorithm == "beam-search":
                     best_traj = self.perform_beam_search(
                         state, beam_width, search_depth, time_memory, exploration_noise_std
@@ -807,316 +813,11 @@ class MetaSACAgent(nn.Module):
             logger.error(f"Failed to load model: {e}")
             raise
 
-    def perform_best_of_n_search(
-        self,
-        initial_state: torch.Tensor,
-        num_samples: int,
-        search_depth: int,
-        time_memory: List[int],
-        exploration_noise_std: float = 0.0
-    ) -> List[List[Tuple[np.ndarray, np.ndarray, float, np.ndarray, bool, int]]]:
-        """
-        Samples trajectories using Best-of-N search.
-
-        Args:
-            initial_state (torch.Tensor): Initial state tensor.
-            num_samples (int): Number of samples.
-            search_depth (int): Depth of search.
-            time_memory (List[int]): Historical time steps.
-            exploration_noise_std (float): Standard deviation for exploration noise.
-
-        Returns:
-            List[List[Tuple]]: List of trajectories.
-        """
-        all_trajectories = []
-        for _ in range(num_samples):
-            state = initial_state.clone()
-            trajectory = []
-            time_idx = time_memory[-1]
-            for _step in range(search_depth):
-                with torch.no_grad():
-                    mu, log_sigma = self.actor(state.unsqueeze(0), torch.tensor([time_idx], device=self.device))
-                    sigma = torch.exp(log_sigma)
-                    dist = torch.distributions.Normal(mu, sigma)
-                    z = dist.rsample()
-                    action = torch.tanh(z).squeeze(0)
-                    if exploration_noise_std > 0.0:
-                        noise = torch.randn_like(action) * exploration_noise_std
-                        action = torch.clamp(action + noise, -1.0, 1.0)
-
-                action_np = action.cpu().numpy()
-                next_state_np, reward, done, _info = self.env.step(action_np, time_idx)
-                next_state = torch.FloatTensor(next_state_np).to(self.device)
-                trajectory.append((state.cpu().numpy(), action_np, reward, next_state_np, done, time_idx))
-
-                state = next_state
-                time_idx += 1
-                if done:
-                    break
-            all_trajectories.append(trajectory)
-        return all_trajectories
-
-    def perform_beam_search(
-        self,
-        initial_state: torch.Tensor,
-        beam_width: int,
-        search_depth: int,
-        time_memory: List[int],
-        exploration_noise_std: float = 0.0
-    ) -> List[Tuple[np.ndarray, np.ndarray, float, np.ndarray, bool, int]]:
-        """
-        Performs Beam Search to find the best trajectory.
-
-        Args:
-            initial_state (torch.Tensor): Initial state tensor.
-            beam_width (int): Beam width.
-            search_depth (int): Depth of search.
-            time_memory (List[int]): Historical time steps.
-            exploration_noise_std (float): Standard deviation for exploration noise.
-
-        Returns:
-            List[Tuple]: Best trajectory.
-        """
-        beam = [(initial_state.clone(), [], 0.0, time_memory[-1])]
-        final_trajs = []
-
-        for _ in range(search_depth):
-            new_beam = []
-            for current_state, partial_traj, cum_reward, t_step in beam:
-                if partial_traj and partial_traj[-1][4] is True:
-                    final_trajs.append((current_state, partial_traj, cum_reward, t_step))
-                    continue
-                with torch.no_grad():
-                    mu, log_sigma = self.actor(current_state.unsqueeze(0), torch.tensor([t_step], device=self.device))
-                    sigma = torch.exp(log_sigma)
-                    dist = torch.distributions.Normal(mu, sigma)
-                    candidate_actions = []
-                    for _i in range(beam_width):
-                        z = dist.rsample()
-                        a = torch.tanh(z).squeeze(0)
-                        if exploration_noise_std > 0.0:
-                            noise = torch.randn_like(a) * exploration_noise_std
-                            a = torch.clamp(a + noise, -1.0, 1.0)
-                        candidate_actions.append(a)
-
-                for a_tensor in candidate_actions:
-                    a_np = a_tensor.cpu().numpy()
-                    ns_np, r, d, _info = self.env.step(a_np, t_step)
-                    ns = torch.FloatTensor(ns_np).to(self.device)
-                    new_traj = partial_traj.copy()
-                    new_traj.append((current_state.cpu().numpy(), a_np, r, ns_np, d, t_step))
-                    new_beam.append((ns, new_traj, cum_reward + r, t_step + 1))
-
-            new_beam.sort(key=lambda x: x[2], reverse=True)
-            beam = new_beam[:beam_width]
-
-        final_trajs.extend(beam)
-        if final_trajs:
-            best_traj = max(final_trajs, key=lambda x: x[2])[1]
-            return best_traj
-        else:
-            return []
-
-    def update_params_with_training_time_search(
-        self,
-        replay_buffer: ReplayBuffer,
-        meta_input: np.ndarray,
-        time_memory: List[int],
-        update_steps: int =1,
-        search_algorithm: str = "best-of-n",
-        num_samples: int = 4,
-        beam_width: int = 3,
-        search_depth: int = 5,
-        use_d_search: bool = False,
-        exploration_noise_std_fn: Callable[[int], float] = lambda step: 0.0
-    ) -> Dict[str, float]:
-        """
-        Updates parameters using search-generated data.
-
-        Args:
-            replay_buffer (ReplayBuffer): Experience replay buffer.
-            meta_input (np.ndarray): Input for the meta-controller.
-            time_memory (List[int]): Historical time steps.
-            update_steps (int): Number of update iterations.
-            search_algorithm (str): Search algorithm type ("best-of-n" or "beam-search").
-            num_samples (int): Number of samples for best-of-n search.
-            beam_width (int): Beam width for beam search.
-            search_depth (int): Depth of search.
-            use_d_search (bool): Whether to use depth-based search.
-            exploration_noise_std_fn (Callable[[int], float]): Function to determine exploration noise.
-
-        Returns:
-            Dict[str, float]: Dictionary of loss values for logging.
-        """
-        final_info = {}
-        for _ in range(update_steps):
-            if len(replay_buffer) < self.config.batch_size:
-                logger.warning("Not enough samples in replay buffer.")
-                continue
-
-            batch = replay_buffer.sample(self.config.batch_size)
-            sampled_states = torch.FloatTensor([b[0] for b in batch]).to(self.device)
-
-            search_trajectories = []
-            for state in sampled_states:
-                exploration_noise_std = exploration_noise_std_fn(self.train_steps)
-                if search_algorithm == "best-of-n":
-                    all_trajectories = self.perform_best_of_n_search(
-                        state, num_samples, search_depth, time_memory, exploration_noise_std
-                    )
-                    if use_d_search:
-                        for traj in all_trajectories:
-                            search_trajectories.extend(traj)
-                    else:
-                        best_traj = max(all_trajectories, key=lambda t: sum(step[2] for step in t))
-                        search_trajectories.extend(best_traj)
-                elif search_algorithm == "beam-search":
-                    best_traj = self.perform_beam_search(
-                        state, beam_width, search_depth, time_memory, exploration_noise_std
-                    )
-                    search_trajectories.extend(best_traj)
-                else:
-                    logger.error(f"Unknown search algorithm: {search_algorithm}")
-                    continue
-
-            if not search_trajectories:
-                logger.warning("No trajectories found during search.")
-                continue
-
-            # Extract search trajectory data
-            states_search = torch.FloatTensor([traj[0] for traj in search_trajectories]).to(self.device)
-            actions_search = torch.FloatTensor([traj[1] for traj in search_trajectories]).to(self.device)
-            rewards_search = torch.FloatTensor([traj[2] for traj in search_trajectories]).unsqueeze(1).to(self.device)
-            next_states_search = torch.FloatTensor([traj[3] for traj in search_trajectories]).to(self.device)
-            dones_search = torch.FloatTensor([traj[4] for traj in search_trajectories]).unsqueeze(1).to(self.device)
-            time_steps_search = torch.FloatTensor([traj[5] for traj in search_trajectories]).to(self.device)
-
-            # Market mode classification (using existing classifier)
-            random_modes = torch.randint(0, self.config.num_market_modes, (states_search.shape[0],)).to(self.device)
-            market_mode_loss = self.update_market_mode_classifier(states_search, random_modes)
-
-            # Meta-Controller update
-            meta_input_tensor = torch.FloatTensor(meta_input).to(self.device)
-            with torch.no_grad():
-                mu, log_sigma = self.actor(states_search, time_steps_search)
-                sigma = torch.exp(log_sigma)
-                dist = torch.distributions.Normal(mu, sigma)
-                z = dist.rsample()
-                actions_ = torch.tanh(z)
-                log_probs = dist.log_prob(z) - torch.log(1 - actions_.pow(2) + self.config.epsilon)
-                log_probs = log_probs.sum(-1, keepdim=True)
-
-            meta_loss_val, r_scaling = self.update_meta_controller(meta_input_tensor, log_probs, rewards_search)
-            market_mode_probs = self.market_mode_classifier(states_search)
-
-            # Compute Q targets
-            q_targets = self.compute_q_targets(rewards_search, next_states_search, time_steps_search, dones_search, r_scaling, market_mode_probs)
-
-            # Update Critic Networks
-            critic1_loss, critic2_loss = self.update_critics(states_search, actions_search, time_steps_search, q_targets)
-
-            # Update Actor Network
-            actor_loss_val = self.update_actor(states_search, time_steps_search)
-
-            # Update Policy Distiller
-            distiller_loss_val = self.update_distiller(states_search, time_steps_search)
-
-            # Update High-Level Policy
-            advantages = q_targets - torch.mean(q_targets, dim=0, keepdim=True)
-            high_level_loss_val = self.update_high_level_policy(states_search, advantages)
-
-            # Soft-update target critics
-            self.soft_update(self.critic_target1, self.critic1)
-            self.soft_update(self.critic_target2, self.critic2)
-
-            # Update Learning Rate Schedulers
-            self.actor_scheduler.step(actor_loss_val)
-            self.critic1_scheduler.step(critic1_loss)
-            self.critic2_scheduler.step(critic2_loss)
-            self.high_level_scheduler.step(high_level_loss_val)
-            self.meta_scheduler.step(meta_loss_val)
-            self.distiller_scheduler.step(distiller_loss_val)
-
-            self.train_steps += 1
-
-            # Logging
-            self.writer.add_scalar("Loss/actor", actor_loss_val, self.train_steps)
-            self.writer.add_scalar("Loss/critic1", critic1_loss, self.train_steps)
-            self.writer.add_scalar("Loss/critic2", critic2_loss, self.train_steps)
-            self.writer.add_scalar("Loss/meta", meta_loss_val, self.train_steps)
-            self.writer.add_scalar("Loss/distiller", distiller_loss_val, self.train_steps)
-            self.writer.add_scalar("Loss/market_mode", market_mode_loss, self.train_steps)
-            self.writer.add_scalar("Loss/high_level_policy", high_level_loss_val, self.train_steps)
-            self.writer.add_scalar("Params/alpha", self.alpha.item(), self.train_steps)
-
-            final_info = {
-                "actor_loss": actor_loss_val,
-                "critic1_loss": critic1_loss,
-                "critic2_loss": critic2_loss,
-                "meta_loss": meta_loss_val,
-                "distiller_loss": distiller_loss_val,
-                "market_mode_loss": market_mode_loss,
-                "high_level_loss": high_level_loss_val,
-                "alpha": self.alpha.item()
-            }
-
-        return final_info
-
-    def save(self, path: str) -> None:
-        """
-        Saves the agent's state dictionaries.
-
-        Args:
-            path (str): Path to save the model.
-        """
-        try:
-            torch.save({
-                "actor": self.actor.state_dict(),
-                "critic1": self.critic1.state_dict(),
-                "critic2": self.critic2.state_dict(),
-                "critic_target1": self.critic_target1.state_dict(),
-                "critic_target2": self.critic_target2.state_dict(),
-                "meta_controller": self.meta_controller.state_dict(),
-                "policy_distiller": self.policy_distiller.state_dict(),
-                "market_mode_classifier": self.market_mode_classifier.state_dict(),
-                "high_level_policy": self.high_level_policy.state_dict(),
-                "alpha": self.alpha.detach().cpu().numpy(),
-                "train_steps": self.train_steps
-            }, path)
-            logger.info(f"Model saved to {path}")
-        except Exception as e:
-            logger.error(f"Failed to save model: {e}")
-            raise
-
-    def load(self, path: str) -> None:
-        """
-        Loads the agent's state dictionaries.
-
-        Args:
-            path (str): Path from which to load the model.
-        """
-        try:
-            ckpt = torch.load(path, map_location=self.device)
-            self.actor.load_state_dict(ckpt["actor"])
-            self.critic1.load_state_dict(ckpt["critic1"])
-            self.critic2.load_state_dict(ckpt["critic2"])
-            self.critic_target1.load_state_dict(ckpt["critic_target1"])
-            self.critic_target2.load_state_dict(ckpt["critic_target2"])
-            self.meta_controller.load_state_dict(ckpt["meta_controller"])
-            self.policy_distiller.load_state_dict(ckpt["policy_distiller"])
-            self.market_mode_classifier.load_state_dict(ckpt["market_mode_classifier"])
-            self.high_level_policy.load_state_dict(ckpt["high_level_policy"])
-            self.alpha.data.copy_(torch.tensor(ckpt["alpha"], dtype=torch.float32, device=self.device))
-            self.train_steps = ckpt["train_steps"]
-            logger.info(f"Model loaded from {path}")
-        except Exception as e:
-            logger.error(f"Failed to load model: {e}")
-            raise
-
 
 // File: config.py
 # File: config.py
 
+import torch  # Added import
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -1124,16 +825,16 @@ from typing import List, Optional
 class EnvironmentConfig:
     """Configuration for environment, training, and hyperparameters."""
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    action_dim: int = 2
-    state_dim: int = 8
+    action_dim: int = 5  # Updated to match sample_batch
+    state_dim: int = 50  # Updated from 8 to 50 for consistency
     hidden_dim: int = 256
     attention_dim: int = 64
-    num_mlp_layers: int = 2
+    num_mlp_layers: int = 3
     dropout_rate: float = 0.1
     time_encoding_dim: int = 16
     custom_layers: Optional[List[str]] = None
-    window_size: int = 10
-    num_hyperparams: int = 5
+    window_size: int = 20
+    num_hyperparams: int = 10  # Updated for testing consistency
     num_market_modes: int = 3
     graph_input_dim: int = 10
     graph_hidden_dim: int = 32
@@ -1150,6 +851,7 @@ class EnvironmentConfig:
     buffer_capacity: int = 100000
     batch_size: int = 64
     meta_input_dim: int = 10
+    weight_decay: float = 1e-5  # Added weight_decay for optimizers
 
 
 // File: conftest.py
@@ -1168,13 +870,46 @@ sys.path.append(".")
 
 @pytest.fixture
 def agent():
-    config = EnvironmentConfig()
-    mock_data = np.random.randn(1000, config.state_dim).astype(np.float32)
+    """
+    Fixture to initialize the MetaSACAgent with mock data.
+    """
+    config = EnvironmentConfig(
+        state_dim=50,
+        action_dim=5,
+        hidden_dim=128,
+        attention_dim=64,
+        num_mlp_layers=3,
+        dropout_rate=0.1,
+        time_encoding_dim=16,
+        custom_layers=["KLinePatternLayer", "VolatilityTrackingLayer", "FractalDimensionLayer"],
+        window_size=20,
+        num_hyperparams=10,
+        graph_input_dim=10,
+        graph_hidden_dim=32,
+        num_graph_layers=2,
+        ensemble_size=3,
+        weight_decay=1e-5
+    )
+    mock_data = np.random.randn(2000, config.state_dim).astype(np.float32)  # Increased data points for better simulation
     env = HistoricalEnvironment(mock_data)
-    return MetaSACAgent(config, env)
+    agent = MetaSACAgent(config, env)
+    # Populate replay buffer with random data
+    for _ in range(config.buffer_capacity // 10):  # Add a fraction to avoid filling it up
+        state = env.reset()
+        for step in range(10):
+            action = np.random.uniform(-1, 1, config.action_dim)
+            next_state, reward, done, _ = env.step(action, step)
+            agent.replay_buffer.add(state, action, reward, next_state, done, step)
+            if done:
+                break
+            state = next_state
+    return agent
 
 @pytest.fixture
 def sample_batch():
+    """
+    Fixture to provide a sample batch of data for testing.
+    """
     return {
         'states': np.random.randn(32, 20, 50).astype(np.float32),  # (batch_size, seq_length, state_dim)
         'actions': np.random.randn(32, 5).astype(np.float32),     # (batch_size, action_dim)
@@ -1193,10 +928,8 @@ def sample_batch():
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 from typing import Tuple, List, Optional
 from torch_geometric.nn import GCNConv
-import math
 
 from config import EnvironmentConfig
 
@@ -1717,8 +1450,8 @@ class PolicyDistillerEnsemble(nn.Module):
             log_sigma: (batch_size, action_dim)
         """
         outputs = [spec(state, time_step) for spec in self.specialists]  # List of (batch_size, 2 * action_dim)
-        mus = torch.stack([o[0] for o in outputs], dim=-1)  # (batch_size, action_dim, ensemble_size)
-        log_sigmas = torch.stack([o[1] for o in outputs], dim=-1)  # (batch_size, action_dim, ensemble_size)
+        mus = torch.stack([o[:, :self.specialists[0].action_dim] for o in outputs], dim=-1)  # (batch_size, action_dim, ensemble_size)
+        log_sigmas = torch.stack([o[:, self.specialists[0].action_dim:] for o in outputs], dim=-1)  # (batch_size, action_dim, ensemble_size)
 
         # Concatenate along the ensemble dimension
         mus = mus.view(mus.size(0), -1)  # (batch_size, action_dim * ensemble_size)
@@ -1726,8 +1459,8 @@ class PolicyDistillerEnsemble(nn.Module):
 
         # Pass through an MLP to aggregate
         aggregated = self.mlp(torch.cat([mus, log_sigmas], dim=-1))  # (batch_size, action_dim * 2)
-        mu = torch.tanh(aggregated[:, :config.action_dim])
-        log_sigma = torch.clamp(aggregated[:, config.action_dim:], min=-20, max=2)
+        mu = torch.tanh(aggregated[:, :self.config.action_dim])
+        log_sigma = torch.clamp(aggregated[:, self.config.action_dim:], min=-20, max=2)
         return mu, log_sigma
 
     def compute_log_prob(self, mu: torch.Tensor, log_sigma: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
@@ -1797,10 +1530,7 @@ class MetaController(nn.Module):
         cat_input = torch.cat([x, reward_stats], dim=-1)
         out = self.mlp(cat_input)
 
-        if self.ema_values is None:
-            self.ema_values = out.detach()
-        else:
-            self.ema_values = self.ema_smoothing * self.ema_values + (1 - self.ema_smoothing) * out.detach()
+        self.ema_values = self.ema_smoothing * self.ema_values + (1 - self.ema_smoothing) * out.detach()
 
         return self.ema_values
 
@@ -1809,13 +1539,13 @@ class MetaController(nn.Module):
 # File: replay_buffer.py
 
 import random
-from typing import List, Tuple
+from typing import List, Tuple, Any
 
 class ReplayBuffer:
     """Stores transitions for training."""
     def __init__(self, capacity: int):
         self.capacity = capacity
-        self.buffer: List[Tuple] = []
+        self.buffer: List[Tuple[Any, ...]] = []
         self.position: int = 0
 
     def add(self, state, action, reward, next_state, done, time_step):
@@ -1827,7 +1557,7 @@ class ReplayBuffer:
             self.buffer[self.position] = transition
         self.position = (self.position + 1) % self.capacity
 
-    def sample(self, batch_size: int) -> List[Tuple]:
+    def sample(self, batch_size: int) -> List[Tuple[Any, ...]]:
         """Samples a batch of transitions."""
         return random.sample(self.buffer, batch_size)
 
@@ -1836,10 +1566,33 @@ class ReplayBuffer:
 
 
 // File: reward.py
-#reward.py
+# File: reward.py
+
+import numpy as np
+
+def calculate_reward(current_price: float, previous_price: float, action: np.ndarray) -> float:
+    """
+    Calculates the reward based on the change in price and the agent's action.
+
+    Args:
+        current_price (float): The current price of the asset.
+        previous_price (float): The previous price of the asset.
+        action (np.ndarray): The action taken by the agent.
+
+    Returns:
+        float: Calculated reward.
+    """
+    price_change = current_price - previous_price
+    # Assuming action[0] controls position size (e.g., buy/sell)
+    position = action[0]
+    # Reward is profit from position minus penalty for action magnitude
+    profit = price_change * position
+    penalty = np.linalg.norm(action) * 0.01  # Adjust penalty coefficient as needed
+    return profit - penalty
+
 
 // File: train.py
-# File: train.py
+# File: train.py (Optimized Training Loop)
 
 import numpy as np
 import torch
@@ -1847,6 +1600,10 @@ from config import EnvironmentConfig
 from env.environment import HistoricalEnvironment
 from agent import MetaSACAgent
 from reward import calculate_reward
+
+from typing import Callable
+import random
+import logging
 
 def get_noise_schedule(initial_noise: float, final_noise: float, decay_steps: int) -> Callable[[int], float]:
     """
@@ -1867,6 +1624,10 @@ def get_noise_schedule(initial_noise: float, final_noise: float, decay_steps: in
     return noise_fn
 
 def main():
+    # Initialize logging
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger("MetaSACTrainer")
+
     # Initialize configuration
     config = EnvironmentConfig(
         state_dim=50,
@@ -1882,7 +1643,8 @@ def main():
         graph_input_dim=10,
         graph_hidden_dim=32,
         num_graph_layers=2,
-        ensemble_size=3
+        ensemble_size=3,
+        weight_decay=1e-5
     )
 
     # Set random seeds for reproducibility
@@ -1919,8 +1681,9 @@ def main():
     updates_per_epoch = 100
 
     for epoch in range(num_epochs):
+        epoch_losses = {}
         for _update in range(updates_per_epoch):
-            # Example meta input: random or based on market indicators
+            # Example meta input: could be based on market indicators
             meta_input = np.random.randn(config.batch_size, config.meta_input_dim).astype(np.float32)
             time_memory = list(range(config.window_size))  # Example time memory
 
@@ -1929,21 +1692,36 @@ def main():
                 meta_input=meta_input,
                 time_memory=time_memory,
                 update_steps=1,
-                search_algorithm="best-of-n",
+                search_algorithm="best-of-n",  # or "beam-search"
                 num_samples=4,
                 beam_width=3,
                 search_depth=5,
                 use_d_search=False,
                 exploration_noise_std_fn=noise_schedule
             )
-        print(f"Epoch {epoch+1}/{num_epochs} completed, total steps={agent.train_steps}.")
+
+            # Aggregate losses for the epoch
+            for key, value in losses.items():
+                if key not in epoch_losses:
+                    epoch_losses[key] = []
+                epoch_losses[key].append(value)
+
+        # Compute average losses for the epoch
+        avg_losses = {k: np.mean(v) for k, v in epoch_losses.items()}
+        logger.info(f"Epoch {epoch+1}/{num_epochs} completed, Total Steps={agent.train_steps}")
+        for loss_name, loss_value in avg_losses.items():
+            logger.info(f"  {loss_name}: {loss_value:.4f}")
+            agent.writer.add_scalar(f"Epoch/Loss/{loss_name}", loss_value, epoch+1)
 
         # Save model checkpoints periodically
         if (epoch + 1) % 10 == 0:
-            agent.save(f"metasac_epoch_{epoch+1}.pth")
+            checkpoint_path = f"metasac_epoch_{epoch+1}.pth"
+            agent.save(checkpoint_path)
+            logger.info(f"Model checkpoint saved at {checkpoint_path}")
 
     # Final model save
     agent.save("metasac_final.pth")
+    logger.info("Final model saved as metasac_final.pth")
 
     # Close the TensorBoard writer
     agent.writer.close()
@@ -1956,6 +1734,8 @@ if __name__ == "__main__":
 # File: env/environment.py
 
 import numpy as np
+from typing import Tuple
+from reward import calculate_reward
 
 class HistoricalEnvironment:
     """Simulates stepping through historical data."""
@@ -1969,7 +1749,7 @@ class HistoricalEnvironment:
         self.current_time = 0
         return self.historical_data[self.current_time]
 
-    def step(self, action: np.ndarray, current_time: int):
+    def step(self, action: np.ndarray, current_time: int) -> Tuple[np.ndarray, float, bool, dict]:
         """Steps to next time, returns next_state, reward, done, info."""
         next_time = current_time + 1
         done = next_time >= self.max_time
@@ -1977,13 +1757,17 @@ class HistoricalEnvironment:
             next_state = self.historical_data[next_time]
         else:
             next_state = np.zeros_like(self.historical_data[0])
-        # Simple reward: random small change plus action effect
-        reward = float(np.random.randn() * 0.01 + 0.01)
+        
+        # Calculate reward using the reward function
+        previous_price = self.historical_data[current_time, 3]  # Assuming close price is at index 3
+        current_price = self.historical_data[next_time, 3] if not done else previous_price
+        reward = calculate_reward(current_price, previous_price, action)
+        
         return next_state, reward, done, {}
 
 
 // File: tests\test_agent.py
-# File: test_agent.py
+# File: tests/test_agent.py
 
 import pytest
 import torch
@@ -1994,6 +1778,9 @@ from agent import MetaSACAgent
 
 @pytest.fixture
 def agent_instance():
+    """
+    Fixture to initialize the MetaSACAgent with mock data.
+    """
     config = EnvironmentConfig(
         state_dim=50,
         action_dim=5,
@@ -2008,12 +1795,39 @@ def agent_instance():
         graph_input_dim=10,
         graph_hidden_dim=32,
         num_graph_layers=2,
-        ensemble_size=3
+        ensemble_size=3,
+        weight_decay=1e-5
     )
     mock_data = np.random.randn(1000, config.state_dim).astype(np.float32)
     env = HistoricalEnvironment(mock_data)
     agent = MetaSACAgent(config, env)
+    # Populate replay buffer with random data
+    for _ in range(config.buffer_capacity // 10):  # Add a fraction to avoid filling it up
+        state = env.reset()
+        for step in range(10):
+            action = np.random.uniform(-1, 1, config.action_dim)
+            next_state, reward, done, _ = env.step(action, step)
+            agent.replay_buffer.add(state, action, reward, next_state, done, step)
+            if done:
+                break
+            state = next_state
     return agent
+
+@pytest.fixture
+def sample_batch():
+    """
+    Fixture to provide a sample batch of data for testing.
+    """
+    return {
+        'states': np.random.randn(32, 20, 50).astype(np.float32),  # (batch_size, seq_length, state_dim)
+        'actions': np.random.randn(32, 5).astype(np.float32),     # (batch_size, action_dim)
+        'rewards': np.random.randn(32, 1).astype(np.float32),     # (batch_size, 1)
+        'next_states': np.random.randn(32, 20, 50).astype(np.float32),  # (batch_size, seq_length, state_dim)
+        'dones': np.random.randint(0, 2, (32, 1)).astype(np.float32),    # (batch_size, 1)
+        'time_steps': np.random.randint(0, 1000, (32,)),                 # (batch_size,)
+        'edge_index': torch.tensor([[0, 1, 2], [1, 2, 0]], dtype=torch.long),  # Example edge index
+        'graph_node_features': torch.randn(3, 10)                        # (num_nodes, graph_input_dim)
+    }
 
 def test_select_action(agent_instance):
     state = np.random.randn(20, 50).astype(np.float32)  # (seq_length, state_dim)
@@ -2022,6 +1836,7 @@ def test_select_action(agent_instance):
     graph_node_features = torch.randn(3, 10)  # (num_nodes, graph_input_dim)
     action = agent_instance.select_action(state, time_step, edge_index, graph_node_features, eval=True)
     assert action.shape == (5,), "Action shape mismatch"
+    assert np.all(action >= -1) and np.all(action <= 1), "Action values out of bounds"
 
 def test_update_params(agent_instance, sample_batch):
     states = torch.FloatTensor(sample_batch['states']).to(agent_instance.device)
@@ -2030,8 +1845,6 @@ def test_update_params(agent_instance, sample_batch):
     next_states = torch.FloatTensor(sample_batch['next_states']).to(agent_instance.device)
     dones = torch.FloatTensor(sample_batch['dones']).to(agent_instance.device)
     time_steps = torch.FloatTensor(sample_batch['time_steps']).to(agent_instance.device)
-    edge_index = sample_batch['edge_index'].to(agent_instance.device)
-    graph_node_features = sample_batch['graph_node_features'].to(agent_instance.device)
 
     # Add to replay buffer
     for i in range(states.shape[0]):
@@ -2062,5 +1875,51 @@ def test_update_params(agent_instance, sample_batch):
     assert 'market_mode_loss' in losses, "Missing market_mode_loss in losses"
     assert 'high_level_loss' in losses, "Missing high_level_loss in losses"
     assert 'alpha' in losses, "Missing alpha in losses"
+
+    # Additional Assertions
+    assert isinstance(losses['actor_loss'], float), "actor_loss should be a float"
+    assert isinstance(losses['critic1_loss'], float), "critic1_loss should be a float"
+    assert isinstance(losses['critic2_loss'], float), "critic2_loss should be a float"
+    assert isinstance(losses['meta_loss'], float), "meta_loss should be a float"
+    assert isinstance(losses['distiller_loss'], float), "distiller_loss should be a float"
+    assert isinstance(losses['market_mode_loss'], float), "market_mode_loss should be a float"
+    assert isinstance(losses['high_level_loss'], float), "high_level_loss should be a float"
+    assert isinstance(losses['alpha'], float), "alpha should be a float"
+
+def test_model_save_load(agent_instance, tmp_path):
+    """
+    Test saving and loading of the agent model.
+    """
+    save_path = tmp_path / "metasac_test.pth"
+    agent_instance.save(str(save_path))
+
+    # Create a new agent instance and load the saved state
+    config = EnvironmentConfig(
+        state_dim=50,
+        action_dim=5,
+        hidden_dim=128,
+        attention_dim=64,
+        num_mlp_layers=3,
+        dropout_rate=0.1,
+        time_encoding_dim=16,
+        custom_layers=["KLinePatternLayer", "VolatilityTrackingLayer", "FractalDimensionLayer"],
+        window_size=20,
+        num_hyperparams=10,
+        graph_input_dim=10,
+        graph_hidden_dim=32,
+        num_graph_layers=2,
+        ensemble_size=3,
+        weight_decay=1e-5
+    )
+    mock_data = np.random.randn(1000, config.state_dim).astype(np.float32)
+    env = HistoricalEnvironment(mock_data)
+    new_agent = MetaSACAgent(config, env)
+
+    # Load the saved state
+    new_agent.load(str(save_path))
+
+    # Verify that parameters match
+    for param1, param2 in zip(agent_instance.parameters(), new_agent.parameters()):
+        assert torch.allclose(param1, param2), "Model parameters do not match after loading."
 
 
