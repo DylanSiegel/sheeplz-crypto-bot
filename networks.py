@@ -3,10 +3,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 from typing import Tuple, List, Optional
 from torch_geometric.nn import GCNConv
-import math
 
 from config import EnvironmentConfig
 
@@ -527,8 +525,8 @@ class PolicyDistillerEnsemble(nn.Module):
             log_sigma: (batch_size, action_dim)
         """
         outputs = [spec(state, time_step) for spec in self.specialists]  # List of (batch_size, 2 * action_dim)
-        mus = torch.stack([o[0] for o in outputs], dim=-1)  # (batch_size, action_dim, ensemble_size)
-        log_sigmas = torch.stack([o[1] for o in outputs], dim=-1)  # (batch_size, action_dim, ensemble_size)
+        mus = torch.stack([o[:, :self.specialists[0].action_dim] for o in outputs], dim=-1)  # (batch_size, action_dim, ensemble_size)
+        log_sigmas = torch.stack([o[:, self.specialists[0].action_dim:] for o in outputs], dim=-1)  # (batch_size, action_dim, ensemble_size)
 
         # Concatenate along the ensemble dimension
         mus = mus.view(mus.size(0), -1)  # (batch_size, action_dim * ensemble_size)
@@ -536,8 +534,8 @@ class PolicyDistillerEnsemble(nn.Module):
 
         # Pass through an MLP to aggregate
         aggregated = self.mlp(torch.cat([mus, log_sigmas], dim=-1))  # (batch_size, action_dim * 2)
-        mu = torch.tanh(aggregated[:, :config.action_dim])
-        log_sigma = torch.clamp(aggregated[:, config.action_dim:], min=-20, max=2)
+        mu = torch.tanh(aggregated[:, :self.config.action_dim])
+        log_sigma = torch.clamp(aggregated[:, self.config.action_dim:], min=-20, max=2)
         return mu, log_sigma
 
     def compute_log_prob(self, mu: torch.Tensor, log_sigma: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
@@ -607,9 +605,6 @@ class MetaController(nn.Module):
         cat_input = torch.cat([x, reward_stats], dim=-1)
         out = self.mlp(cat_input)
 
-        if self.ema_values is None:
-            self.ema_values = out.detach()
-        else:
-            self.ema_values = self.ema_smoothing * self.ema_values + (1 - self.ema_smoothing) * out.detach()
+        self.ema_values = self.ema_smoothing * self.ema_values + (1 - self.ema_smoothing) * out.detach()
 
         return self.ema_values

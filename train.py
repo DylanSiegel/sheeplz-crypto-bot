@@ -1,8 +1,39 @@
-# File: train.py (continued)
+# File: train.py (Optimized Training Loop)
 
+import numpy as np
+import torch
+from config import EnvironmentConfig
+from env.environment import HistoricalEnvironment
+from agent import MetaSACAgent
+from reward import calculate_reward
+
+from typing import Callable
 import random
+import logging
+
+def get_noise_schedule(initial_noise: float, final_noise: float, decay_steps: int) -> Callable[[int], float]:
+    """
+    Creates a linear noise schedule.
+
+    Args:
+        initial_noise: Initial noise value.
+        final_noise: Final noise value.
+        decay_steps: Number of steps to decay noise over.
+
+    Returns:
+        A function that takes the current step and returns the noise value.
+    """
+    def noise_fn(step: int) -> float:
+        if step > decay_steps:
+            return final_noise
+        return initial_noise - (initial_noise - final_noise) * (step / decay_steps)
+    return noise_fn
 
 def main():
+    # Initialize logging
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger("MetaSACTrainer")
+
     # Initialize configuration
     config = EnvironmentConfig(
         state_dim=50,
@@ -56,8 +87,9 @@ def main():
     updates_per_epoch = 100
 
     for epoch in range(num_epochs):
+        epoch_losses = {}
         for _update in range(updates_per_epoch):
-            # Example meta input: random or based on market indicators
+            # Example meta input: could be based on market indicators
             meta_input = np.random.randn(config.batch_size, config.meta_input_dim).astype(np.float32)
             time_memory = list(range(config.window_size))  # Example time memory
 
@@ -73,14 +105,29 @@ def main():
                 use_d_search=False,
                 exploration_noise_std_fn=noise_schedule
             )
-        print(f"Epoch {epoch+1}/{num_epochs} completed, total steps={agent.train_steps}.")
+
+            # Aggregate losses for the epoch
+            for key, value in losses.items():
+                if key not in epoch_losses:
+                    epoch_losses[key] = []
+                epoch_losses[key].append(value)
+
+        # Compute average losses for the epoch
+        avg_losses = {k: np.mean(v) for k, v in epoch_losses.items()}
+        logger.info(f"Epoch {epoch+1}/{num_epochs} completed, Total Steps={agent.train_steps}")
+        for loss_name, loss_value in avg_losses.items():
+            logger.info(f"  {loss_name}: {loss_value:.4f}")
+            agent.writer.add_scalar(f"Epoch/Loss/{loss_name}", loss_value, epoch+1)
 
         # Save model checkpoints periodically
         if (epoch + 1) % 10 == 0:
-            agent.save(f"metasac_epoch_{epoch+1}.pth")
+            checkpoint_path = f"metasac_epoch_{epoch+1}.pth"
+            agent.save(checkpoint_path)
+            logger.info(f"Model checkpoint saved at {checkpoint_path}")
 
     # Final model save
     agent.save("metasac_final.pth")
+    logger.info("Final model saved as metasac_final.pth")
 
     # Close the TensorBoard writer
     agent.writer.close()

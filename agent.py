@@ -25,6 +25,11 @@ from replay_buffer import ReplayBuffer
 from reward import calculate_reward
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+formatter = logging.Formatter('[%(asctime)s] %(levelname)s:%(name)s:%(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
 
 class SACLoss(nn.Module):
     """Soft Actor-Critic Loss Function."""
@@ -152,9 +157,9 @@ class MetaSACAgent(nn.Module):
         edge_index = edge_index.to(self.device)
 
         # Process graph data
-        graph_embedding = self.market_gnn(graph_node_features, edge_index)  # (num_nodes, state_dim)
-        graph_embedding = torch.mean(graph_embedding, dim=0, keepdim=True).repeat(state_tensor.size(0), 1, 1)  # (1, 1, state_dim)
-        state_tensor = torch.cat([state_tensor, graph_embedding], dim=1)  # (1, seq_length +1, state_dim)
+        graph_embedding = self.market_gnn(graph_node_features, edge_index)  # (num_nodes, hidden_dim)
+        graph_embedding = torch.mean(graph_embedding, dim=0, keepdim=True).repeat(state_tensor.size(0), 1, 1)  # (1, 1, hidden_dim)
+        state_tensor = torch.cat([state_tensor, graph_embedding], dim=1)  # (1, seq_length +1, hidden_dim)
 
         if eval:
             with torch.no_grad():
@@ -550,8 +555,9 @@ class MetaSACAgent(nn.Module):
                         for traj in all_trajectories:
                             search_trajectories.extend(traj)
                     else:
-                        best_traj = max(all_trajectories, key=lambda t: sum(step[2] for step in t))
-                        search_trajectories.extend(best_traj)
+                        if all_trajectories:
+                            best_traj = max(all_trajectories, key=lambda t: sum(step[2] for step in t))
+                            search_trajectories.extend(best_traj)
                 elif search_algorithm == "beam-search":
                     best_traj = self.perform_beam_search(
                         state, beam_width, search_depth, time_memory, exploration_noise_std
@@ -704,312 +710,6 @@ class MetaSACAgent(nn.Module):
             # Update High-Level Policy
             advantages = q_targets - torch.mean(q_targets, dim=0, keepdim=True)
             high_level_loss_val = self.update_high_level_policy(states, advantages)
-
-            # Soft-update target critics
-            self.soft_update(self.critic_target1, self.critic1)
-            self.soft_update(self.critic_target2, self.critic2)
-
-            # Update Learning Rate Schedulers
-            self.actor_scheduler.step(actor_loss_val)
-            self.critic1_scheduler.step(critic1_loss)
-            self.critic2_scheduler.step(critic2_loss)
-            self.high_level_scheduler.step(high_level_loss_val)
-            self.meta_scheduler.step(meta_loss_val)
-            self.distiller_scheduler.step(distiller_loss_val)
-
-            self.train_steps += 1
-
-            # Logging
-            self.writer.add_scalar("Loss/actor", actor_loss_val, self.train_steps)
-            self.writer.add_scalar("Loss/critic1", critic1_loss, self.train_steps)
-            self.writer.add_scalar("Loss/critic2", critic2_loss, self.train_steps)
-            self.writer.add_scalar("Loss/meta", meta_loss_val, self.train_steps)
-            self.writer.add_scalar("Loss/distiller", distiller_loss_val, self.train_steps)
-            self.writer.add_scalar("Loss/market_mode", market_mode_loss, self.train_steps)
-            self.writer.add_scalar("Loss/high_level_policy", high_level_loss_val, self.train_steps)
-            self.writer.add_scalar("Params/alpha", self.alpha.item(), self.train_steps)
-
-            final_info = {
-                "actor_loss": actor_loss_val,
-                "critic1_loss": critic1_loss,
-                "critic2_loss": critic2_loss,
-                "meta_loss": meta_loss_val,
-                "distiller_loss": distiller_loss_val,
-                "market_mode_loss": market_mode_loss,
-                "high_level_loss": high_level_loss_val,
-                "alpha": self.alpha.item()
-            }
-
-        return final_info
-
-    def save(self, path: str) -> None:
-        """
-        Saves the agent's state dictionaries.
-
-        Args:
-            path (str): Path to save the model.
-        """
-        try:
-            torch.save({
-                "actor": self.actor.state_dict(),
-                "critic1": self.critic1.state_dict(),
-                "critic2": self.critic2.state_dict(),
-                "critic_target1": self.critic_target1.state_dict(),
-                "critic_target2": self.critic_target2.state_dict(),
-                "meta_controller": self.meta_controller.state_dict(),
-                "policy_distiller": self.policy_distiller.state_dict(),
-                "market_mode_classifier": self.market_mode_classifier.state_dict(),
-                "high_level_policy": self.high_level_policy.state_dict(),
-                "alpha": self.alpha.detach().cpu().numpy(),
-                "train_steps": self.train_steps
-            }, path)
-            logger.info(f"Model saved to {path}")
-        except Exception as e:
-            logger.error(f"Failed to save model: {e}")
-            raise
-
-    def load(self, path: str) -> None:
-        """
-        Loads the agent's state dictionaries.
-
-        Args:
-            path (str): Path from which to load the model.
-        """
-        try:
-            ckpt = torch.load(path, map_location=self.device)
-            self.actor.load_state_dict(ckpt["actor"])
-            self.critic1.load_state_dict(ckpt["critic1"])
-            self.critic2.load_state_dict(ckpt["critic2"])
-            self.critic_target1.load_state_dict(ckpt["critic_target1"])
-            self.critic_target2.load_state_dict(ckpt["critic_target2"])
-            self.meta_controller.load_state_dict(ckpt["meta_controller"])
-            self.policy_distiller.load_state_dict(ckpt["policy_distiller"])
-            self.market_mode_classifier.load_state_dict(ckpt["market_mode_classifier"])
-            self.high_level_policy.load_state_dict(ckpt["high_level_policy"])
-            self.alpha.data.copy_(torch.tensor(ckpt["alpha"], dtype=torch.float32, device=self.device))
-            self.train_steps = ckpt["train_steps"]
-            logger.info(f"Model loaded from {path}")
-        except Exception as e:
-            logger.error(f"Failed to load model: {e}")
-            raise
-
-    def perform_best_of_n_search(
-        self,
-        initial_state: torch.Tensor,
-        num_samples: int,
-        search_depth: int,
-        time_memory: List[int],
-        exploration_noise_std: float = 0.0
-    ) -> List[List[Tuple[np.ndarray, np.ndarray, float, np.ndarray, bool, int]]]:
-        """
-        Samples trajectories using Best-of-N search.
-
-        Args:
-            initial_state (torch.Tensor): Initial state tensor.
-            num_samples (int): Number of samples.
-            search_depth (int): Depth of search.
-            time_memory (List[int]): Historical time steps.
-            exploration_noise_std (float): Standard deviation for exploration noise.
-
-        Returns:
-            List[List[Tuple]]: List of trajectories.
-        """
-        all_trajectories = []
-        for _ in range(num_samples):
-            state = initial_state.clone()
-            trajectory = []
-            time_idx = time_memory[-1]
-            for _step in range(search_depth):
-                with torch.no_grad():
-                    mu, log_sigma = self.actor(state.unsqueeze(0), torch.tensor([time_idx], device=self.device))
-                    sigma = torch.exp(log_sigma)
-                    dist = torch.distributions.Normal(mu, sigma)
-                    z = dist.rsample()
-                    action = torch.tanh(z).squeeze(0)
-                    if exploration_noise_std > 0.0:
-                        noise = torch.randn_like(action) * exploration_noise_std
-                        action = torch.clamp(action + noise, -1.0, 1.0)
-
-                action_np = action.cpu().numpy()
-                next_state_np, reward, done, _info = self.env.step(action_np, time_idx)
-                next_state = torch.FloatTensor(next_state_np).to(self.device)
-                trajectory.append((state.cpu().numpy(), action_np, reward, next_state_np, done, time_idx))
-
-                state = next_state
-                time_idx += 1
-                if done:
-                    break
-            all_trajectories.append(trajectory)
-        return all_trajectories
-
-    def perform_beam_search(
-        self,
-        initial_state: torch.Tensor,
-        beam_width: int,
-        search_depth: int,
-        time_memory: List[int],
-        exploration_noise_std: float = 0.0
-    ) -> List[Tuple[np.ndarray, np.ndarray, float, np.ndarray, bool, int]]:
-        """
-        Performs Beam Search to find the best trajectory.
-
-        Args:
-            initial_state (torch.Tensor): Initial state tensor.
-            beam_width (int): Beam width.
-            search_depth (int): Depth of search.
-            time_memory (List[int]): Historical time steps.
-            exploration_noise_std (float): Standard deviation for exploration noise.
-
-        Returns:
-            List[Tuple]: Best trajectory.
-        """
-        beam = [(initial_state.clone(), [], 0.0, time_memory[-1])]
-        final_trajs = []
-
-        for _ in range(search_depth):
-            new_beam = []
-            for current_state, partial_traj, cum_reward, t_step in beam:
-                if partial_traj and partial_traj[-1][4] is True:
-                    final_trajs.append((current_state, partial_traj, cum_reward, t_step))
-                    continue
-                with torch.no_grad():
-                    mu, log_sigma = self.actor(current_state.unsqueeze(0), torch.tensor([t_step], device=self.device))
-                    sigma = torch.exp(log_sigma)
-                    dist = torch.distributions.Normal(mu, sigma)
-                    candidate_actions = []
-                    for _i in range(beam_width):
-                        z = dist.rsample()
-                        a = torch.tanh(z).squeeze(0)
-                        if exploration_noise_std > 0.0:
-                            noise = torch.randn_like(a) * exploration_noise_std
-                            a = torch.clamp(a + noise, -1.0, 1.0)
-                        candidate_actions.append(a)
-
-                for a_tensor in candidate_actions:
-                    a_np = a_tensor.cpu().numpy()
-                    ns_np, r, d, _info = self.env.step(a_np, t_step)
-                    ns = torch.FloatTensor(ns_np).to(self.device)
-                    new_traj = partial_traj.copy()
-                    new_traj.append((current_state.cpu().numpy(), a_np, r, ns_np, d, t_step))
-                    new_beam.append((ns, new_traj, cum_reward + r, t_step + 1))
-
-            new_beam.sort(key=lambda x: x[2], reverse=True)
-            beam = new_beam[:beam_width]
-
-        final_trajs.extend(beam)
-        if final_trajs:
-            best_traj = max(final_trajs, key=lambda x: x[2])[1]
-            return best_traj
-        else:
-            return []
-
-    def update_params_with_training_time_search(
-        self,
-        replay_buffer: ReplayBuffer,
-        meta_input: np.ndarray,
-        time_memory: List[int],
-        update_steps: int =1,
-        search_algorithm: str = "best-of-n",
-        num_samples: int = 4,
-        beam_width: int = 3,
-        search_depth: int = 5,
-        use_d_search: bool = False,
-        exploration_noise_std_fn: Callable[[int], float] = lambda step: 0.0
-    ) -> Dict[str, float]:
-        """
-        Updates parameters using search-generated data.
-
-        Args:
-            replay_buffer (ReplayBuffer): Experience replay buffer.
-            meta_input (np.ndarray): Input for the meta-controller.
-            time_memory (List[int]): Historical time steps.
-            update_steps (int): Number of update iterations.
-            search_algorithm (str): Search algorithm type ("best-of-n" or "beam-search").
-            num_samples (int): Number of samples for best-of-n search.
-            beam_width (int): Beam width for beam search.
-            search_depth (int): Depth of search.
-            use_d_search (bool): Whether to use depth-based search.
-            exploration_noise_std_fn (Callable[[int], float]): Function to determine exploration noise.
-
-        Returns:
-            Dict[str, float]: Dictionary of loss values for logging.
-        """
-        final_info = {}
-        for _ in range(update_steps):
-            if len(replay_buffer) < self.config.batch_size:
-                logger.warning("Not enough samples in replay buffer.")
-                continue
-
-            batch = replay_buffer.sample(self.config.batch_size)
-            sampled_states = torch.FloatTensor([b[0] for b in batch]).to(self.device)
-
-            search_trajectories = []
-            for state in sampled_states:
-                exploration_noise_std = exploration_noise_std_fn(self.train_steps)
-                if search_algorithm == "best-of-n":
-                    all_trajectories = self.perform_best_of_n_search(
-                        state, num_samples, search_depth, time_memory, exploration_noise_std
-                    )
-                    if use_d_search:
-                        for traj in all_trajectories:
-                            search_trajectories.extend(traj)
-                    else:
-                        best_traj = max(all_trajectories, key=lambda t: sum(step[2] for step in t))
-                        search_trajectories.extend(best_traj)
-                elif search_algorithm == "beam-search":
-                    best_traj = self.perform_beam_search(
-                        state, beam_width, search_depth, time_memory, exploration_noise_std
-                    )
-                    search_trajectories.extend(best_traj)
-                else:
-                    logger.error(f"Unknown search algorithm: {search_algorithm}")
-                    continue
-
-            if not search_trajectories:
-                logger.warning("No trajectories found during search.")
-                continue
-
-            # Extract search trajectory data
-            states_search = torch.FloatTensor([traj[0] for traj in search_trajectories]).to(self.device)
-            actions_search = torch.FloatTensor([traj[1] for traj in search_trajectories]).to(self.device)
-            rewards_search = torch.FloatTensor([traj[2] for traj in search_trajectories]).unsqueeze(1).to(self.device)
-            next_states_search = torch.FloatTensor([traj[3] for traj in search_trajectories]).to(self.device)
-            dones_search = torch.FloatTensor([traj[4] for traj in search_trajectories]).unsqueeze(1).to(self.device)
-            time_steps_search = torch.FloatTensor([traj[5] for traj in search_trajectories]).to(self.device)
-
-            # Market mode classification (using existing classifier)
-            random_modes = torch.randint(0, self.config.num_market_modes, (states_search.shape[0],)).to(self.device)
-            market_mode_loss = self.update_market_mode_classifier(states_search, random_modes)
-
-            # Meta-Controller update
-            meta_input_tensor = torch.FloatTensor(meta_input).to(self.device)
-            with torch.no_grad():
-                mu, log_sigma = self.actor(states_search, time_steps_search)
-                sigma = torch.exp(log_sigma)
-                dist = torch.distributions.Normal(mu, sigma)
-                z = dist.rsample()
-                actions_ = torch.tanh(z)
-                log_probs = dist.log_prob(z) - torch.log(1 - actions_.pow(2) + self.config.epsilon)
-                log_probs = log_probs.sum(-1, keepdim=True)
-
-            meta_loss_val, r_scaling = self.update_meta_controller(meta_input_tensor, log_probs, rewards_search)
-            market_mode_probs = self.market_mode_classifier(states_search)
-
-            # Compute Q targets
-            q_targets = self.compute_q_targets(rewards_search, next_states_search, time_steps_search, dones_search, r_scaling, market_mode_probs)
-
-            # Update Critic Networks
-            critic1_loss, critic2_loss = self.update_critics(states_search, actions_search, time_steps_search, q_targets)
-
-            # Update Actor Network
-            actor_loss_val = self.update_actor(states_search, time_steps_search)
-
-            # Update Policy Distiller
-            distiller_loss_val = self.update_distiller(states_search, time_steps_search)
-
-            # Update High-Level Policy
-            advantages = q_targets - torch.mean(q_targets, dim=0, keepdim=True)
-            high_level_loss_val = self.update_high_level_policy(states_search, advantages)
 
             # Soft-update target critics
             self.soft_update(self.critic_target1, self.critic1)
