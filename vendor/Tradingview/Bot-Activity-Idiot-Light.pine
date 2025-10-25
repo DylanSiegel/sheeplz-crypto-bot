@@ -1,0 +1,33 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © JeepingMike (MO-Jeep'n)
+//@version=6
+indicator("Bot Activity Idiot Light v3", overlay=true)
+
+// Inputs
+cvd_thresh = input.float(3000, title="CVD Delta Threshold")
+vol_mult = input.float(2.5, title="Volume Spike Multiplier")
+cooldown_bars = input.int(8, title="Cooldown Bars")
+
+// Internal calculations
+vol_sma = ta.sma(volume, 20)
+volume_spike = volume > vol_sma * vol_mult
+
+// Dummy CVD calculation (replace with real CVD data if subscribed)
+var float cvd = 0.0
+cvd += close > open ? volume : -volume
+cvd_delta = cvd - cvd[1]
+
+// Conditions
+bot_selling = cvd_delta <= -cvd_thresh and volume_spike
+bot_exhausted = ta.barssince(bot_selling) >= cooldown_bars and math.abs(cvd_delta) < cvd_thresh / 2
+bot_bidding = cvd_delta >= cvd_thresh and volume_spike
+
+// Plot signals
+plotshape(bot_selling, title="Bot Selling", color=color.red, style=shape.circle, location=location.abovebar, size=size.tiny)
+plotshape(bot_exhausted, title="Bots Exhausted", color=color.green, style=shape.circle, location=location.belowbar, size=size.tiny)
+plotshape(bot_bidding, title="Bot Bidding", color=color.aqua, style=shape.triangleup, location=location.belowbar, size=size.small)
+
+// Alerts
+alertcondition(bot_selling, title="Bot Selling Active", message="Bot-driven selling detected!")
+alertcondition(bot_exhausted, title="Bot Selling Exhausted", message="Bot-driven selling appears exhausted.")
+alertcondition(bot_bidding, title="Bot Bidding Active", message="Bot-driven buying activity detected!")

@@ -1,0 +1,140 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © JeepingMike
+
+//@version=6
+indicator("705 Fib Guide v5-Alerts", overlay=true)
+
+// === Inputs (numerically sorted: 0.236 → 0.886)
+daysBack = input.int(4, "Days Back", minval=1)
+color236 = input.color(color.aqua,   "0.236 Color")
+color386 = input.color(color.yellow, "0.386 Color")
+color50  = input.color(color.gray,   "0.5 Color")
+color618 = input.color(color.orange, "0.618 Color")
+color705 = input.color(color.blue,   "0.705 Color")
+color886 = input.color(color.maroon, "0.886 Color")
+color0   = input.color(color.silver, "Base Line")
+fontSize = input.string("normal", "Font Size", options=["tiny", "small", "normal", "large", "huge"])
+
+// === Bar Count Logic
+isDaily = timeframe.isdaily
+barsToLookBack = isDaily ? daysBack : math.round(daysBack * (24 * 60 / timeframe.multiplier))
+
+// === Initialize
+var float loLevel = na
+var float hiLevel = na
+var int anchorBar = na
+
+// === Find hi/lo and anchor bar
+if barstate.islastconfirmedhistory
+    loLevel := low
+    hiLevel := high
+    anchorBar := bar_index
+    for i = 1 to barsToLookBack - 1
+        if low[i] < loLevel
+            loLevel := low[i]
+        if high[i] > hiLevel
+            hiLevel := high[i]
+        if low[i] < loLevel or high[i] > hiLevel
+            anchorBar := bar_index[i]
+
+// === Fib levels
+fibSpan = hiLevel - loLevel
+y236 = hiLevel - fibSpan * 0.236
+y386 = hiLevel - fibSpan * 0.386
+y50  = hiLevel - fibSpan * 0.5
+y618 = hiLevel - fibSpan * 0.618
+y705 = hiLevel - fibSpan * 0.705
+y886 = hiLevel - fibSpan * 0.886
+
+extendBars = 100
+textOffset = 4
+
+// === Scoring Function
+calcScore(level) =>
+    priceDelta = close - close[1]
+    volDelta = volume - volume[1]
+    momentum = priceDelta + (volDelta / volume)
+    distance = math.abs(close - level)
+    invProx = 1.0 - (distance / fibSpan)
+    unclamped = momentum * invProx
+    math.min(math.max(unclamped, 0.0), 1.0)
+
+// === Visual Strength Lines
+plotSignalLine(level, baseColor) =>
+    score = calcScore(level)
+    len = math.round(score * 25)
+    line.new(anchorBar + extendBars / 2, level + syminfo.mintick * 4, anchorBar + extendBars / 2 + len, level + syminfo.mintick * 4, color=baseColor, width=2)
+
+// === Draw once logic
+var bool drawn = false
+
+alertcondition(ta.crossover(close, y236), title="0.236 Cross Up", message="0.236 crossed up at {{close}} on {{ticker}}")
+alertcondition(ta.crossunder(close, y236), title="0.236 Cross Down", message="0.236 crossed down at {{close}} on {{ticker}}")
+
+alertcondition(ta.crossover(close, y386), title="0.386 Cross Up", message="0.386 crossed up at {{close}} on {{ticker}}")
+alertcondition(ta.crossunder(close, y386), title="0.386 Cross Down", message="0.386 crossed down at {{close}} on {{ticker}}")
+
+alertcondition(ta.crossover(close, y50), title="0.5 Cross Up", message="0.5 crossed up at {{close}} on {{ticker}}")
+alertcondition(ta.crossunder(close, y50), title="0.5 Cross Down", message="0.5 crossed down at {{close}} on {{ticker}}")
+
+alertcondition(ta.crossover(close, y618), title="0.618 Cross Up", message="0.618 crossed up at {{close}} on {{ticker}}")
+alertcondition(ta.crossunder(close, y618), title="0.618 Cross Down", message="0.618 crossed down at {{close}} on {{ticker}}")
+
+alertcondition(ta.crossover(close, y705), title="0.705 Cross Up", message="0.705 crossed up at {{close}} on {{ticker}}")
+alertcondition(ta.crossunder(close, y705), title="0.705 Cross Down", message="0.705 crossed down at {{close}} on {{ticker}}")
+
+alertcondition(ta.crossover(close, y886), title="0.886 Cross Up", message="0.886 crossed up at {{close}} on {{ticker}}")
+alertcondition(ta.crossunder(close, y886), title="0.886 Cross Down", message="0.886 crossed down at {{close}} on {{ticker}}")
+
+alertcondition(ta.crossover(close, loLevel), title="0.000 Cross Up", message="0.000 crossed up at {{close}} on {{ticker}}")
+alertcondition(ta.crossunder(close, loLevel), title="0.000 Cross Down", message="0.000 crossed down at {{close}} on {{ticker}}")
+
+alertcondition(ta.crossover(close, hiLevel), title="1.000 Cross Up", message="1.000 crossed up at {{close}} on {{ticker}}")
+alertcondition(ta.crossunder(close, hiLevel), title="1.000 Cross Down", message="1.000 crossed down at {{close}} on {{ticker}}")
+//ayFibCross = ta.cross(close, y236) or ta.cross(close, y386) or ta.cross(close, y50) or ta.cross(close, y618) or ta.cross(close, y705) or ta.cross(close, y886) or ta.cross(close, loLevel) or ta.cross(close, hiLevel)
+//anyFibCross = ta.cross(close, nz(y236)) or ta.cross(close, nz(y386)) or ta.cross(close, nz(y50)) or ta.cross(close, nz(y618)) or ta.cross(close, nz(y705)) or ta.cross(close, nz(y886)) or ta.cross(close, nz(loLevel)) or ta.cross(close, nz(hiLevel))
+fibCross236 = ta.cross(close, y236)
+fibCross386 = ta.cross(close, y386)
+fibCross50  = ta.cross(close, y50)
+fibCross618 = ta.cross(close, y618)
+fibCross705 = ta.cross(close, y705)
+fibCross886 = ta.cross(close, y886)
+fibCross000 = ta.cross(close, loLevel)
+fibCross100 = ta.cross(close, hiLevel)
+
+anyFibCross = fibCross236 or fibCross386 or fibCross50 or fibCross618 or fibCross705 or fibCross886 or fibCross000 or fibCross100
+
+//create a fake plot so the Any Fib displays on the chart alert menu
+plotAnyFibCross = anyFibCross ? 1 : na
+plot(plotAnyFibCross, title="Any Fib Level Cross", display=display.none)
+
+alertcondition(anyFibCross, title="Any Fib Level Cross", message="Price crossed a Fibonacci level at {{close}} on {{ticker}}")
+if not drawn and barstate.islast
+    // Fib lines
+    line.new(anchorBar, y886, anchorBar + extendBars, y886, color=color886, width=1)
+    line.new(anchorBar, y705, anchorBar + extendBars, y705, color=color705, width=1)
+    line.new(anchorBar, y618, anchorBar + extendBars, y618, color=color618, width=1)
+    line.new(anchorBar, y50,  anchorBar + extendBars, y50,  color=color50,  width=1)
+    line.new(anchorBar, y386, anchorBar + extendBars, y386, color=color386, width=1)
+    line.new(anchorBar, y236, anchorBar + extendBars, y236, color=color.new(color236, 50), width=1)
+    line.new(anchorBar - barsToLookBack + 1, loLevel, anchorBar + extendBars, loLevel, color=color0, width=3, style=line.style_dotted)
+    line.new(anchorBar, hiLevel, anchorBar + extendBars, hiLevel, color=color50, width=2, style=line.style_dotted)
+
+    // Signal lines
+    plotSignalLine(y236, color.new(color236, 50))
+    plotSignalLine(y386, color386)
+    plotSignalLine(y50,  color50)
+    plotSignalLine(y618, color618)
+    plotSignalLine(y705, color705)
+    plotSignalLine(y886, color886)
+
+    // Labels
+    label.new(anchorBar + textOffset, y236 - syminfo.mintick * 2, "0.236 (" + str.tostring(y236, format.mintick) + ")", style=label.style_label_left, size=fontSize, textcolor=color236, color=color.new(color.black, 100), textalign=text.align_left)
+    label.new(anchorBar + textOffset, y386 - syminfo.mintick * 2, "0.386 (" + str.tostring(y386, format.mintick) + ")", style=label.style_label_left, size=fontSize, textcolor=color386, color=color.new(color.black, 100), textalign=text.align_left)
+    label.new(anchorBar + textOffset, y50  - syminfo.mintick * 2, "0.5 ("   + str.tostring(y50, format.mintick)  + ")", style=label.style_label_left, size=fontSize, textcolor=color50,  color=color.new(color.black, 100), textalign=text.align_left)
+    label.new(anchorBar + textOffset, y618 - syminfo.mintick * 2, "0.618 (" + str.tostring(y618, format.mintick) + ")", style=label.style_label_left, size=fontSize, textcolor=color618, color=color.new(color.black, 100), textalign=text.align_left)
+    label.new(anchorBar + textOffset, y705 - syminfo.mintick * 2, "0.705 (" + str.tostring(y705, format.mintick) + ")", style=label.style_label_left, size=fontSize, textcolor=color705, color=color.new(color.black, 100), textalign=text.align_left)
+    label.new(anchorBar + textOffset, y886 - syminfo.mintick * 2, "0.886 (" + str.tostring(y886, format.mintick) + ")", style=label.style_label_left, size=fontSize, textcolor=color886, color=color.new(color.black, 100), textalign=text.align_left)
+    label.new(anchorBar - barsToLookBack + textOffset, loLevel - syminfo.mintick * 2, "0 (" + str.tostring(loLevel, format.mintick) + ")", style=label.style_label_left, size=fontSize, textcolor=color50, color=color.new(color.black, 100), textalign=text.align_left)
+
+    drawn := true

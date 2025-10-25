@@ -1,0 +1,32 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// ©JeepingMike
+
+//@version=6
+indicator("Believe-It Indicator", overlay=false)
+
+// === INPUTS ===
+length = input.int(14, title="RSI/Volume Length")
+volMultiplier = input.float(1.5, title="Volume Spike Multiplier", step=0.1)
+rsiThreshold = input.int(50, title="RSI Neutral Threshold")
+
+// === PRICE ACTION CONFIDENCE ===
+// Using RSI as a proxy for trend momentum
+rsi = ta.rsi(close, length)
+rsiScore = math.abs(rsi - rsiThreshold) / 50 * 100  // Normalized to 0–100
+
+// === VOLUME CONFIDENCE ===
+avgVolume = ta.sma(volume, length)
+volumeSpike = volume > avgVolume * volMultiplier
+volScore = volumeSpike ? 100 : (volume / avgVolume) * 100
+volScore := math.min(volScore, 100)  // Cap at 100
+
+// === BELIEF SCORE ===
+beliefScore = (rsiScore + volScore) / 2
+
+// === PLOT ===
+plot(beliefScore, title="Believe-It Score", color=color.new(color.green, 0), linewidth=2)
+hline(70, "Strong Belief", color=color.teal, linestyle=hline.style_dashed)
+hline(30, "Weak Belief", color=color.red, linestyle=hline.style_dashed)
+hline(50, "Neutral", color=color.gray, linestyle=hline.style_dotted)
+
+bgcolor(beliefScore > 70 ? color.new(color.green, 85) : beliefScore < 30 ? color.new(color.red, 85) : na)

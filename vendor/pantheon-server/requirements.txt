@@ -1,0 +1,40 @@
+# Core dependencies
+pantheon-legends==0.4.0
+
+# Web frameworks
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+streamlit==1.28.2
+
+# HTTP client and async support
+httpx==0.25.2
+aiofiles==23.2.1
+
+# Data processing and visualization
+pandas==2.1.4
+plotly==5.17.0
+numpy==1.25.2
+
+# API models and validation
+pydantic==2.5.2
+pydantic-settings==2.1.0
+
+# Logging
+loguru==0.7.2
+
+# Environment and configuration
+python-dotenv==1.0.0
+
+# Caching and data storage
+redis>=5.0.0
+
+# Development dependencies
+pytest==7.4.3
+pytest-asyncio==0.21.1
+black==23.11.0
+flake8==6.1.0
+mypy==1.7.1
+
+# Additional utilities
+python-multipart==0.0.6
+websockets==12.0

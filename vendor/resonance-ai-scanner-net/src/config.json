@@ -1,0 +1,100 @@
+{
+  "scanner": {
+    "candleIntervalSec": 60,
+    "lookbackCandles": 10,
+    "absVolumeMinUsd": 2000,
+    "simpleMode": false,
+    "sleepSecBetweenCycles": 5
+  },
+  "markets": {
+    "us": {
+      "bands": {
+        "counts": { "fast": 10, "medium": 15, "slow": 20 },
+        "thresholds": { "fast": 0.013, "medium": 0.018, "slow": 0.024 },
+        "volumeSpikeRatios": { "fast": 1.3, "medium": 1.7, "slow": 2.2 }
+      },
+      "coins": []
+      
+    },
+    "real-world-assets": {
+      "discordWebhookEnvironmentVariable":"RWA_DISCORD_WEBHOOK_URL",
+      "bands": {
+        "counts": { "fast": 10, "medium": 15, "slow": 20 },
+        "thresholds": { "fast": 0.013, "medium": 0.018, "slow": 0.024 },
+        "volumeSpikeRatios": { "fast": 1.3, "medium": 1.7, "slow": 2.2 }
+      },
+       "coins": [
+        "ONDO-USD",
+        "PENDLE-USD",
+        "GFI-USD",
+        "WCFG-USD",
+        "PRO-USD",
+        "TRU-USD",
+        "POLYX-USD",
+        "OM-USD",
+        "RIO-USD",
+        "PAXG-USD",
+        "LINK-USD",
+        "XLM-USD",
+        "ALGO-USD",
+        "QNT-USD",
+        "MKR-USD",
+        "RSR-USD"
+      ]
+    },
+    "eu": {
+      "bands": {
+        "counts": { "fast": 10, "medium": 15, "slow": 20 },
+        "thresholds": { "fast": 0.013, "medium": 0.018, "slow": 0.024 },
+        "volumeSpikeRatios": { "fast": 1.3, "medium": 1.7, "slow": 2.2 }
+      },
+      "coins": []
+    },
+    "asia": {
+      "bands": {
+        "counts": { "fast": 12, "medium": 18, "slow": 24 },
+        "thresholds": { "fast": 0.014, "medium": 0.018, "slow": 0.026 },
+        "volumeSpikeRatios": { "fast": 1.5, "medium": 1.8, "slow": 2.6 }
+      },
+      "coins": []
+    }
+  },
+  "baseCoins": [
+    "00-USD","1INCH-USD","A8-USD","AAVE-USD","ABT-USD","ACH-USD","ACS-USD","ACX-USD","ADA-USD",
+    "AERGO-USD","AERO-USD","AGLD-USD","AIOZ-USD","AKT-USD","ALCX-USD","ALEO-USD","ALEPH-USD",
+    "ALGO-USD","ALICE-USD","ALT-USD","AMP-USD","ANKR-USD","APE-USD","API3-USD","APT-USD",
+    "ARB-USD","ARKM-USD","ARPA-USD","ASM-USD","AST-USD","ATH-USD","ATOM-USD","AUCTION-USD",
+    "AUDIO-USD","AURORA-USD","AVAX-USD","AVT-USD","AXL-USD","AXS-USD","B3-USD","BADGER-USD",
+    "BAL-USD","BAND-USD","BAT-USD","BCH-USD","BERA-USD","BICO-USD","BIGTIME-USD","BIO-USD",
+    "BLAST-USD","BLUR-USD","BLZ-USD","BNKR-USD","BNT-USD","BOBA-USD","BONK-USD","BTC-USD",
+    "BTRST-USD","C98-USD","CAKE-USD","CBETH-USD","CELR-USD","CGLD-USD","CHZ-USD","CLANKER-USD",
+    "CLV-USD","COMP-USD","COOKIE-USD","CORECHAIN-USD","COTI-USD","COW-USD","CRO-USD","CRV-USD",
+    "CTSI-USD","CTX-USD","CVC-USD","CVX-USD","DAI-USD","DASH-USD","DEGEN-USD","DEXT-USD",
+    "DIA-USD","DIMO-USD","DNT-USD","DOGE-USD","DOGINME-USD","DOT-USD","DRIFT-USD","EDGE-USD",
+    "EGLD-USD","EIGEN-USD","ELA-USD","ENA-USD","ENS-USD","EOS-USD","ERA-USD","ERN-USD","ETC-USD",
+    "ETH-USD","ETHFI-USD","FAI-USD","FARM-USD","FARTCOIN-USD","FET-USD","FIDA-USD","FIL-USD",
+    "FIS-USD","FLOKI-USD","FLOW-USD","FLR-USD","FORT-USD","FORTH-USD","FOX-USD","FX-USD","G-USD",
+    "GFI-USD","GHST-USD","GIGA-USD","GLM-USD","GMT-USD","GNO-USD","GODS-USD","GRT-USD","GST-USD",
+    "GTC-USD","HBAR-USD","HFT-USD","HIGH-USD","HNT-USD","HOME-USD","HONEY-USD","HOPR-USD","ICP-USD",
+    "IDEX-USD","ILV-USD","IMX-USD","INDEX-USD","INJ-USD","INV-USD","IO-USD","IOTX-USD","IP-USD",
+    "JASMY-USD","JITOSOL-USD","JTO-USD","KAITO-USD","KARRAT-USD","KAVA-USD","KERNEL-USD","KEYCAT-USD",
+    "KNC-USD","KRL-USD","KSM-USD","L3-USD","LA-USD","LCX-USD","LDO-USD","LINK-USD","LOKA-USD",
+    "LPT-USD","LQTY-USD","LRC-USD","LRDS-USD","LSETH-USD","LTC-USD","MAGIC-USD","MANA-USD",
+    "MANTLE-USD","MASK-USD","MATH-USD","MATIC-USD","MDT-USD","ME-USD","METIS-USD","MINA-USD",
+    "MKR-USD","MLN-USD","MNDE-USD","MOG-USD","MOODENG-USD","MORPHO-USD","MPLX-USD","MSOL-USD",
+    "MUSE-USD","NCT-USD","NEAR-USD","NEON-USD","NEWT-USD","NKN-USD","NMR-USD","OCEAN-USD","OGN-USD",
+    "OMNI-USD","ONDO-USD","OP-USD","ORCA-USD","OSMO-USD","OXT-USD","PAXG-USD","PENDLE-USD",
+    "PENGU-USD","PEPE-USD","PERP-USD","PIRATE-USD","PLU-USD","PNG-USD","PNUT-USD","POL-USD",
+    "POLS-USD","POND-USD","POPCAT-USD","POWR-USD","PRCL-USD","PRIME-USD","PRO-USD","PROMPT-USD",
+    "PUMP-USD","PUNDIX-USD","PYR-USD","PYTH-USD","QI-USD","QNT-USD","RAD-USD","RARE-USD","RARI-USD",
+    "RED-USD","RENDER-USD","REQ-USD","REZ-USD","RLC-USD","RONIN-USD","ROSE-USD","RPL-USD","RSC-USD",
+    "RSR-USD","S-USD","SAFE-USD","SAND-USD","SD-USD","SEAM-USD","SEI-USD","SHDW-USD","SHIB-USD",
+    "SHPING-USD","SKL-USD","SKY-USD","SNX-USD","SOL-USD","SPA-USD","SPELL-USD","SPK-USD","SQD-USD",
+    "STG-USD","STORJ-USD","STRK-USD","STX-USD","SUI-USD","SUKU-USD","SUPER-USD","SUSHI-USD",
+    "SWELL-USD","SWFTC-USD","SXT-USD","SYRUP-USD","T-USD","TAO-USD","TIA-USD","TIME-USD","TNSR-USD",
+    "TOSHI-USD","TRAC-USD","TRB-USD","TREE-USD","TRU-USD","TRUMP-USD","TURBO-USD","UMA-USD","UNI-USD",
+    "USDS-USD","USDT-USD","VARA-USD","VELO-USD","VET-USD","VOXEL-USD","VTHO-USD","VVV-USD","W-USD",
+    "WAXL-USD","WCFG-USD","WELL-USD","WIF-USD","WLD-USD","XCN-USD","XLM-USD","XRP-USD","XTZ-USD",
+    "XYO-USD","YFI-USD","ZEC-USD","ZEN-USD","ZETA-USD","ZETACHAIN-USD","ZK-USD","ZORA-USD","ZRO-USD","ZRX-USD"
+  ]
+}

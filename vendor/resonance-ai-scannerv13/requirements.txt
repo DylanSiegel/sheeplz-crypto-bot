@@ -1,0 +1,11 @@
+websocket-client
+websockets
+aiohttp
+requests
+pandas
+numpy
+python-dateutil
+pytz
+ujson
+flask
+gunicorn

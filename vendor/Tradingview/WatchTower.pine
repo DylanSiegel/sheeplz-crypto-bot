@@ -1,0 +1,41 @@
+//@version=6
+// ╔═══════════════════════════════════════════════════════════╗
+// ║                  KandleKings™ WatchTower v1.0             ║
+// ║       Tactical Market Monitoring & Alert System           ║
+// ║    Breakouts • VWAP Zones • RSI Threshold Reactions       ║
+// ║       Designed with precision by ChatGPT + @JeepingMike   ║
+// ╚═══════════════════════════════════════════════════════════╝
+
+indicator("KandleKings™ WatchTower v1.0", overlay=true, shorttitle="WatchTower")
+
+// === INPUTS ===
+showBreakouts = input.bool(true, "Breakout Alerts")
+showVWAP      = input.bool(true, "VWAP Alerts")
+showRSIAlerts = input.bool(true, "RSI Threshold Alerts")
+
+// === PRICE + VOLUME ===
+price   = close
+vol     = volume
+vwap    = ta.vwap
+avgVol  = ta.sma(vol, 20)
+
+// === BREAKOUT LOGIC ===
+isBreakout = price > vwap and vol > avgVol * 1.5
+if showBreakouts and isBreakout
+    label.new(bar_index, high, "Breakout", style=label.style_label_down, color=color.orange, textcolor=color.white, size=size.normal)
+
+// === VWAP ALERTS ===
+nearVWAP = math.abs(price - vwap) / vwap < 0.01
+if showVWAP and nearVWAP
+    label.new(bar_index, price, "Near VWAP", style=label.style_label_left, color=color.new(color.blue, 50), textcolor=color.white, size=size.small)
+
+// === RSI ALERTS ===
+rsi = ta.rsi(price, 14)
+rsiCrossAbove60 = ta.crossover(rsi, 60)
+rsiCrossBelow40 = ta.crossunder(rsi, 40)
+
+if showRSIAlerts
+    if rsiCrossBelow40
+        label.new(bar_index, low, "RSI < 40", style=label.style_label_down, color=color.red, textcolor=color.white, size=size.small)
+    if rsiCrossAbove60
+        label.new(bar_index, high, "RSI > 60", style=label.style_label_up, color=color.green, textcolor=color.black, size=size.small)

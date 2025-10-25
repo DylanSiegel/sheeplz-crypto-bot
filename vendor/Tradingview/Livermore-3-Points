@@ -1,0 +1,154 @@
+// © MO-Jeep'n / SpartanDigital LLC. Livermore "Three Points" Risk Bands — Pine v6
+//@version=6
+indicator("Livermore 'Three Points' Risk Bands v1.3.1", overlay=true, max_lines_count=60, max_labels_count=40)
+
+//---------------- Inputs
+entry_price_input = input.float(0.0, "Entry Price (0 = use Last)", step=0.0000001)
+side = input.string("Long", "Side", options=["Long", "Short"])
+profile = input.string("Micro/Meme (TOSHI/low-liq)", "Asset Profile", options=["Major (BTC/ETH)", "Midcap (XRP/SYRUP)", "Micro/Meme (TOSHI/low-liq)"])
+use_custom_stop = input.bool(false, "Use Custom Stop %")
+custom_stop_pct = input.float(6.0, "Custom Stop %", step=0.1, minval=0.1)
+use_atr = input.bool(false, "Use ATR-Based Stop")
+atr_len = input.int(14, "ATR Length", minval=1)
+atr_mult = input.float(1.0, "ATR Multiplier", step=0.1, minval=0.1)
+atr_min_pct = input.float(2.0, "ATR Floor % (min)", step=0.1, minval=0.1)
+atr_max_pct = input.float(15.0, "ATR Cap % (max)", step=0.1, minval=0.5)
+r_targets = input.string("1,2,3", "R Targets (comma-separated)")
+table_pos_opt = input.string("Top Right", "Table Position", options=["Top Left", "Top Right", "Bottom Left", "Bottom Right"])
+draw_obj_lines = input.bool(false, "Also draw extend-right line objects")
+
+//---------------- Colors
+colEntry = color.new(color.blue, 0)
+colStop  = color.new(color.red, 0)
+colTgt   = color.new(color.green, 0)
+
+//---------------- Defaults / mapping
+default_stop_pct = profile == "Major (BTC/ETH)" ? 2.5 : profile == "Midcap (XRP/SYRUP)" ? 4.0 : 6.0
+atr_val = ta.atr(atr_len)
+price_ref = nz(close, 1.0)
+atr_pct = atr_val / price_ref * 100.0
+atr_pct_scaled = atr_pct * atr_mult
+atr_pct_clamped = math.min(math.max(atr_pct_scaled, atr_min_pct), atr_max_pct)
+stop_pct_base = use_custom_stop ? custom_stop_pct : default_stop_pct
+stop_pct = use_atr ? atr_pct_clamped : stop_pct_base
+
+//---------------- Core levels
+entry = entry_price_input > 0.0 ? entry_price_input : close
+is_long = side == "Long"
+dist = entry * (stop_pct / 100.0)
+stop_price = is_long ? entry - dist : entry + dist
+
+//---------------- Targets list (parse once per bar)
+var float[] r_list = array.new_float()
+parse_targets(txt) =>
+    array.clear(r_list)
+    t = str.replace_all(txt, " ", "")
+    parts = str.split(t, ",")
+    for i = 0 to array.size(parts) - 1
+        s = array.get(parts, i)
+        v = str.tonumber(s)
+        if not na(v) and v > 0
+            array.push(r_list, v)
+parse_targets(r_targets)
+
+get_target(px, d, r, longside) =>
+    longside ? px + d * r : px - d * r
+
+// Build up to 3 concrete series (no plots in loops)
+rm1 = array.size(r_list) >= 1 ? array.get(r_list, 0) : na
+rm2 = array.size(r_list) >= 2 ? array.get(r_list, 1) : na
+rm3 = array.size(r_list) >= 3 ? array.get(r_list, 2) : na
+tgt1 = na(rm1) ? na : get_target(entry, dist, rm1, is_long)
+tgt2 = na(rm2) ? na : get_target(entry, dist, rm2, is_long)
+tgt3 = na(rm3) ? na : get_target(entry, dist, rm3, is_long)
+
+//---------------- Plots (must be top-level)
+plot(entry,      title="Entry", color=colEntry, linewidth=2)
+plot(stop_price, title="Stop",  color=colStop,  linewidth=2)
+plot(tgt1, title="T1R", color=colTgt, linewidth=2)
+plot(tgt2, title="T2R", color=colTgt, linewidth=2)
+plot(tgt3, title="T3R", color=colTgt, linewidth=2)
+
+//---------------- Optional extend-right line objects
+var line ln_entry = na
+var line ln_stop  = na
+var line ln_t1 = na
+var line ln_t2 = na
+var line ln_t3 = na
+
+make_or_update_line(l, y, col, style) =>
+    if na(l)
+        line.new(bar_index, y, bar_index + 1, y, xloc=xloc.bar_index, extend=extend.right, color=col, style=style, width=2)
+    else
+        line.set_xy1(l, bar_index, y)
+        line.set_xy2(l, bar_index + 1, y)
+        line.set_extend(l, extend.right)
+        line.set_color(l, col)
+        line.set_style(l, style)
+        l
+
+if draw_obj_lines
+    ln_entry := make_or_update_line(ln_entry, entry, colEntry, line.style_solid)
+    ln_stop  := make_or_update_line(ln_stop,  stop_price, colStop, line.style_dotted)
+    if not na(tgt1)
+        ln_t1 := make_or_update_line(ln_t1, tgt1, colTgt, line.style_solid)
+    if not na(tgt2)
+        ln_t2 := make_or_update_line(ln_t2, tgt2, colTgt, line.style_solid)
+    if not na(tgt3)
+        ln_t3 := make_or_update_line(ln_t3, tgt3, colTgt, line.style_solid)
+
+//---------------- Table (recreate when position changes)
+pos_from_opt(opt) =>
+    p = position.top_right
+    if opt == "Top Left"
+        p := position.top_left
+    if opt == "Top Right"
+        p := position.top_right
+    if opt == "Bottom Left"
+        p := position.bottom_left
+    if opt == "Bottom Right"
+        p := position.bottom_right
+    p
+
+var table t = na
+var string last_pos = ""
+cols = 4
+rows = 6
+cur_pos_str = table_pos_opt
+cur_pos = pos_from_opt(cur_pos_str)
+
+// Recreate table if first time or position string changed
+if na(t) or cur_pos_str != last_pos
+    t := table.new(cur_pos, cols, rows, border_width=1)
+    last_pos := cur_pos_str
+
+// Clear full region: start_col,start_row,end_col,end_row
+table.clear(t, 0, 0, cols - 1, rows - 1)
+
+// Header
+table.cell(t, 0, 0, "Livermore Mapper", text_color=color.white, bgcolor=color.new(color.black, 0))
+table.cell(t, 1, 0, "", text_color=color.white, bgcolor=color.new(color.black, 0))
+table.cell(t, 2, 0, "", text_color=color.white, bgcolor=color.new(color.black, 0))
+table.cell(t, 3, 0, "", text_color=color.white, bgcolor=color.new(color.black, 0))
+
+// Left labels
+table.cell(t, 0, 1, "Side",   text_color=color.gray,  bgcolor=color.new(color.black, 0))
+table.cell(t, 0, 2, "Entry",  text_color=color.gray,  bgcolor=color.new(color.black, 0))
+table.cell(t, 0, 3, "Stop %", text_color=color.gray,  bgcolor=color.new(color.black, 0))
+table.cell(t, 0, 4, "Stop Px",text_color=color.gray,  bgcolor=color.new(color.black, 0))
+table.cell(t, 0, 5, "Δ (1R)", text_color=color.gray,  bgcolor=color.new(color.black, 0))
+
+// Values
+table.cell(t, 1, 1, side, text_color=color.white)
+table.cell(t, 1, 2, str.tostring(entry, format.mintick), text_color=color.white)
+table.cell(t, 1, 3, str.tostring(stop_pct, format.mintick) + "%", text_color=color.white)
+table.cell(t, 1, 4, str.tostring(stop_price, format.mintick), text_color=color.white)
+table.cell(t, 1, 5, str.tostring(dist, format.mintick), text_color=color.white)
+
+// Right side
+table.cell(t, 2, 1, "Profile", text_color=color.gray, bgcolor=color.new(color.black, 0))
+table.cell(t, 3, 1, profile,  text_color=color.white)
+table.cell(t, 2, 2, "ATR%",   text_color=color.gray, bgcolor=color.new(color.black, 0))
+table.cell(t, 3, 2, str.tostring(atr_pct_clamped, format.mintick) + "%", text_color=color.white)
+table.cell(t, 2, 3, "Targets",text_color=color.gray, bgcolor=color.new(color.black, 0))
+table.cell(t, 3, 3, r_targets, text_color=color.white)

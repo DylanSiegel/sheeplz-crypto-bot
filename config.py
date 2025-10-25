@@ -35,3 +35,9 @@ class EnvironmentConfig:
     batch_size: int = 64
     meta_input_dim: int = 10
     weight_decay: float = 1e-5  # Added weight_decay for optimizers
+    # Runtime / exchange settings (read from env when creating an instance in code)
+    kraken_api_key: Optional[str] = None
+    kraken_api_secret: Optional[str] = None
+    kraken_dry_run: bool = True
+    kraken_symbol: str = "XBT/USD"
+    kraken_max_order_usd: float = 10.0
